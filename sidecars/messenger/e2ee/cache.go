@@ -262,13 +262,20 @@ func (s *Store) Get(ctx context.Context, messageID string) (api.Message, bool, e
 	return m, found, err
 }
 
-// ApplyEdit sets the text and Edited on a cached message.
+// ErrDenied means an edit or unsend did not come from the stored sender of the message.
+var ErrDenied = errors.New("e2ee store: sender may not change this message")
+
+// ApplyEdit sets the text and Edited on a cached message sent by e.SenderID in e.ThreadID.
+// A stored message from another sender or thread is left alone: found is true and the error ErrDenied.
 func (s *Store) ApplyEdit(ctx context.Context, e api.Edit) (api.Message, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	m, ts, found, err := s.load(ctx, e.MessageID)
 	if err != nil || !found {
 		return api.Message{}, false, err
+	}
+	if m.ThreadID != e.ThreadID || e.SenderID == "" || m.Sender.ID != e.SenderID {
+		return api.Message{}, true, ErrDenied
 	}
 	text := e.Text
 	m.Text = &text
@@ -280,12 +287,16 @@ func (s *Store) ApplyEdit(ctx context.Context, e api.Edit) (api.Message, bool, e
 }
 
 // ApplyRemoval blanks an unsent message and keeps its row, or deletes a delete-for-me message with its media.
+// An unsend needs the stored sender (or ByAdmin) in its thread; a delete-for-me is local and not checked.
 func (s *Store) ApplyRemoval(ctx context.Context, r api.Removal) (api.Message, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	m, ts, found, err := s.load(ctx, r.MessageID)
 	if err != nil || !found {
 		return api.Message{}, false, err
+	}
+	if r.Unsent && (m.ThreadID != r.ThreadID || r.SenderID == "" || (m.Sender.ID != r.SenderID && !r.ByAdmin)) {
+		return api.Message{}, true, ErrDenied
 	}
 	if r.Unsent {
 		m.Text = nil

@@ -233,3 +233,105 @@ func TestThreadIDFromJID(t *testing.T) {
 		t.Fatalf("got %q", got)
 	}
 }
+
+func editEvt(chat, sender types.JID, key *waCommon.MessageKey) *events.FBMessage {
+	return &events.FBMessage{
+		Info: types.MessageInfo{MessageSource: types.MessageSource{Chat: chat, Sender: sender}, ID: "E", Timestamp: evtTime},
+		Message: &waConsumerApplication.ConsumerApplication{
+			Payload: &waConsumerApplication.ConsumerApplication_Payload{
+				Payload: &waConsumerApplication.ConsumerApplication_Payload_Content{Content: &waConsumerApplication.ConsumerApplication_Content{
+					Content: &waConsumerApplication.ConsumerApplication_Content_EditMessage{EditMessage: &waConsumerApplication.ConsumerApplication_EditMessage{
+						Key: key, Message: &waCommon.MessageText{Text: proto.String("t")},
+					}},
+				}},
+			},
+		},
+	}
+}
+
+func revokeEvt(chat, sender types.JID, key *waCommon.MessageKey) *events.FBMessage {
+	return &events.FBMessage{
+		Info: types.MessageInfo{MessageSource: types.MessageSource{Chat: chat, Sender: sender}, ID: "R", Timestamp: evtTime},
+		Message: &waConsumerApplication.ConsumerApplication{
+			Payload: &waConsumerApplication.ConsumerApplication_Payload{
+				Payload: &waConsumerApplication.ConsumerApplication_Payload_ApplicationData{
+					ApplicationData: &waConsumerApplication.ConsumerApplication_ApplicationData{
+						ApplicationContent: &waConsumerApplication.ConsumerApplication_ApplicationData_Revoke{
+							Revoke: &waConsumerApplication.ConsumerApplication_RevokeMessage{Key: key},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+// M1: edits and unsends carry the authenticated sender of the event and the sender named by the key.
+func TestFBMessageEditAndRevokeCarryBothSenders(t *testing.T) {
+	grp := types.JID{User: "9000", Server: types.GroupServer}
+	me := types.JID{User: "9999", Device: 4, Server: types.MessengerServer}
+	cases := []struct {
+		name       string
+		chat, from types.JID
+		key        *waCommon.MessageKey
+		sender     string
+		target     string
+		id         string
+	}{
+		{"own message in a dm", chatJID, senderJID, &waCommon.MessageKey{ID: proto.String("X"), FromMe: proto.Bool(true)}, "5678", "5678", "wa:1234@msgr:5678@msgr:X"},
+		{"counterparty names the owner's message", chatJID, senderJID, &waCommon.MessageKey{ID: proto.String("X")}, "5678", "9999", "wa:1234@msgr:9999@msgr:X"},
+		{"owner on another device names the peer's message", chatJID, me, &waCommon.MessageKey{ID: proto.String("X")}, "9999", "1234", "wa:1234@msgr:1234@msgr:X"},
+		{"owner on another device names an own message", chatJID, me, &waCommon.MessageKey{ID: proto.String("X"), FromMe: proto.Bool(true)}, "9999", "9999", "wa:1234@msgr:9999@msgr:X"},
+		{"group member names another participant", grp, senderJID, &waCommon.MessageKey{ID: proto.String("X"), Participant: proto.String("222@msgr")}, "5678", "222", "wa:9000@g.us:222@msgr:X"},
+		{"group member names an own message", grp, senderJID, &waCommon.MessageKey{ID: proto.String("X"), FromMe: proto.Bool(true), RemoteJID: proto.String("9000@g.us")}, "5678", "5678", "wa:9000@g.us:5678@msgr:X"},
+	}
+	for _, c := range cases {
+		edit := FBMessage(editEvt(c.chat, c.from, c.key), e2eeCtxFor()).Edit
+		rev := FBMessage(revokeEvt(c.chat, c.from, c.key), e2eeCtxFor()).Removal
+		if edit == nil || edit.MessageID != c.id || edit.SenderID != c.sender || edit.TargetSenderID != c.target || edit.ThreadID != ThreadIDFromJID(c.chat) {
+			t.Fatalf("%s: edit %+v", c.name, edit)
+		}
+		if rev == nil || !rev.Unsent || rev.MessageID != c.id || rev.SenderID != c.sender || rev.TargetSenderID != c.target || rev.ByAdmin {
+			t.Fatalf("%s: revoke %+v", c.name, rev)
+		}
+	}
+}
+
+func TestFBMessageKeysThatCannotBeTrustedResolveToNothing(t *testing.T) {
+	grp := types.JID{User: "9000", Server: types.GroupServer}
+	other := types.JID{User: "9001", Server: types.GroupServer}
+	cases := []struct {
+		name       string
+		chat, from types.JID
+		key        *waCommon.MessageKey
+	}{
+		{"remote group differs from the event chat", grp, senderJID, &waCommon.MessageKey{ID: proto.String("X"), Participant: proto.String("222@msgr"), RemoteJID: proto.String(other.String())}},
+		{"remote group in a dm", chatJID, senderJID, &waCommon.MessageKey{ID: proto.String("X"), FromMe: proto.Bool(true), RemoteJID: proto.String(grp.String())}},
+		{"group key without a participant", grp, senderJID, &waCommon.MessageKey{ID: proto.String("X")}},
+		{"empty id", chatJID, senderJID, &waCommon.MessageKey{FromMe: proto.Bool(true)}},
+		{"unparsable participant", grp, senderJID, &waCommon.MessageKey{ID: proto.String("X"), Participant: proto.String("@@")}},
+	}
+	for _, c := range cases {
+		if res := FBMessage(editEvt(c.chat, c.from, c.key), e2eeCtxFor()); res.Edit != nil {
+			t.Fatalf("%s: edit %+v", c.name, res.Edit)
+		}
+		if res := FBMessage(revokeEvt(c.chat, c.from, c.key), e2eeCtxFor()); res.Removal != nil {
+			t.Fatalf("%s: revoke %+v", c.name, res.Removal)
+		}
+		react := e2eeEvt("RX", &waConsumerApplication.ConsumerApplication_Content{
+			Content: &waConsumerApplication.ConsumerApplication_Content_ReactionMessage{ReactionMessage: &waConsumerApplication.ConsumerApplication_ReactionMessage{Key: c.key, Text: proto.String("x")}},
+		})
+		react.Info.Chat = c.chat
+		if res := FBMessage(react, e2eeCtxFor()); res.Reaction != nil {
+			t.Fatalf("%s: reaction %+v", c.name, res.Reaction)
+		}
+	}
+}
+
+func TestFBMessageNonNumericSenderResolvesToNothing(t *testing.T) {
+	odd := types.JID{User: "abc", Server: types.MessengerServer}
+	res := FBMessage(editEvt(chatJID, odd, &waCommon.MessageKey{ID: proto.String("X"), FromMe: proto.Bool(true)}), e2eeCtxFor())
+	if res.Edit != nil {
+		t.Fatalf("edit %+v", res.Edit)
+	}
+}

@@ -17,6 +17,11 @@ type fakeFactory struct {
 	sink     api.Sink
 	openErr  error
 
+	wipes       []string
+	wipeErr     error
+	openPanic   bool
+	logout      func(ctx context.Context) error
+	closeHook   func()
 	validate    func(ctx context.Context) (api.Account, error)
 	listThreads func(ctx context.Context, p api.ListThreadsParams) (api.ListThreadsResult, error)
 	sendText    func(ctx context.Context, p api.SendTextParams) (api.SendResult, error)
@@ -25,6 +30,9 @@ type fakeFactory struct {
 func (f *fakeFactory) Open(st api.State, dataDir string, sink api.Sink) (api.Session, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.openPanic {
+		panic("SECRET open panic")
+	}
 	if f.openErr != nil {
 		return nil, f.openErr
 	}
@@ -34,6 +42,19 @@ func (f *fakeFactory) Open(st api.State, dataDir string, sink api.Sink) (api.Ses
 	f.sessions = append(f.sessions, s)
 	f.sink = sink
 	return s, nil
+}
+
+func (f *fakeFactory) Wipe(dataDir string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.wipes = append(f.wipes, dataDir)
+	return f.wipeErr
+}
+
+func (f *fakeFactory) wipeCalls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.wipes...)
 }
 
 func (f *fakeFactory) lastSession() *fakeSession {
@@ -53,11 +74,13 @@ func (f *fakeFactory) emit(name string, data any) {
 }
 
 type fakeSession struct {
-	f            *fakeFactory
-	st           api.State
-	closed       atomic.Int32
-	disconnected atomic.Int32
-	loggedOut    atomic.Int32
+	f             *fakeFactory
+	st            api.State
+	closed        atomic.Int32
+	disconnected  atomic.Int32
+	loggedOut     atomic.Int32
+	closeSeq      atomic.Int64
+	disconnectSeq atomic.Int64
 }
 
 func (s *fakeSession) Validate(ctx context.Context) (api.Account, error) {
@@ -68,12 +91,29 @@ func (s *fakeSession) Validate(ctx context.Context) (api.Account, error) {
 }
 
 func (s *fakeSession) Connect(context.Context) error { return nil }
-func (s *fakeSession) Disconnect()                   { s.disconnected.Add(1) }
-func (s *fakeSession) Close()                        { s.closed.Add(1) }
-func (s *fakeSession) State() api.State              { return s.st }
+func (s *fakeSession) Disconnect() {
+	s.disconnected.Add(1)
+	s.disconnectSeq.Store(fakeSeq.Add(1))
+}
 
-func (s *fakeSession) Logout(context.Context) error {
+func (s *fakeSession) Close() {
+	if hook := s.f.closeHook; hook != nil {
+		hook()
+	}
+	s.closed.Add(1)
+	s.closeSeq.Store(fakeSeq.Add(1))
+}
+
+func (s *fakeSession) State() api.State { return s.st }
+
+// fakeSeq orders Close and Disconnect calls across sessions.
+var fakeSeq atomic.Int64
+
+func (s *fakeSession) Logout(ctx context.Context) error {
 	s.loggedOut.Add(1)
+	if s.f.logout != nil {
+		return s.f.logout(ctx)
+	}
 	return nil
 }
 

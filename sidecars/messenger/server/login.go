@@ -41,6 +41,9 @@ func (s *server) loginStart(req ipc.Request) ipc.Reply {
 	if s.login == loginFinishing {
 		return fail(req.ID, api.CodeBadParams, "login in progress")
 	}
+	if s.loggingOut > 0 {
+		return fail(req.ID, api.CodeBadParams, "logout in progress")
+	}
 	s.login = loginAwaiting
 	return ok(req.ID, map[string]any{
 		"needs":        []string{"cookies"},
@@ -171,21 +174,40 @@ func (s *server) finishFailed(id uint64, gen uint64, sess api.Session, err error
 	return failErr(id, err)
 }
 
+// logout forgets the session and deletes the local session data through the factory, even without a live
+// session, and refuses a new login meanwhile. A failed deletion still clears the daemon's state but answers io.
 func (s *server) logout(ctx context.Context, req ipc.Request) ipc.Reply {
 	s.mu.Lock()
 	sess := s.sess
 	s.sess = nil
 	s.abortLoginLocked()
 	s.login = loginNone
+	s.loggingOut++
+	dataDir := s.dataDir
 	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.loggingOut--
+		s.mu.Unlock()
+	}()
+	failed := false
 	if sess != nil {
 		if err := sess.Logout(ctx); err != nil {
 			s.log.Warn().Str("code", api.AsError(err).Code).Msg("logout failed")
+			failed = true
 		}
 		sess.Disconnect()
 		sess.Close()
 	}
+	s.waitDropped()
+	if err := s.f.Wipe(dataDir); err != nil {
+		s.log.Warn().Str("code", api.AsError(err).Code).Msg("wiping the data dir failed")
+		failed = true
+	}
 	s.emit(api.EvStateUpdated, api.StateUpdatedEvent{State: nil})
+	if failed {
+		return fail(req.ID, api.CodeIO, "failed to delete local session data")
+	}
 	return ok(req.ID, struct{}{})
 }
 

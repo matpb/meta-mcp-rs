@@ -14,8 +14,10 @@ type State struct {
 type Sink func(event string, data any)
 
 // Factory builds sessions. Open does no network I/O; dataDir is the hello data_dir.
+// Wipe deletes the local session data under dataDir with or without a live session.
 type Factory interface {
 	Open(state State, dataDir string, sink Sink) (Session, error)
+	Wipe(dataDir string) error
 }
 
 // Session is one account. Methods return *Error for every failure the client should see.
@@ -25,7 +27,7 @@ type Session interface {
 	// Connect starts the realtime and E2EE connections; progress arrives as connection events.
 	Connect(ctx context.Context) error
 	Disconnect()
-	// Logout disconnects and deletes local session data under dataDir (E2EE device, cache).
+	// Logout disconnects and deletes local session data under dataDir (E2EE device, caches, thread map).
 	Logout(ctx context.Context) error
 	// Close releases resources without deleting data.
 	Close()

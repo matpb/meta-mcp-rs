@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"context"
+	"encoding/json"
 	"slices"
 	"time"
 
@@ -8,7 +10,14 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/metaid"
 
 	"github.com/matpb/meta-mcp-rs/sidecars/messenger/api"
+	"github.com/matpb/meta-mcp-rs/sidecars/messenger/e2ee"
 	"github.com/matpb/meta-mcp-rs/sidecars/messenger/normalize"
+)
+
+// A history event carries at most this many messages and about this many bytes of JSON.
+const (
+	maxHistoryBatch      = 200
+	maxHistoryBatchBytes = 4 << 20
 )
 
 type tableMode int
@@ -98,6 +107,7 @@ func (s *session) processTable(tbl *table.LSTable, mode tableMode) {
 	}
 	history := map[string][]api.Message{}
 	forCollector := map[string][]cachedMsg{}
+	var attachments []e2ee.FBAttachments
 	for _, m := range b.Messages {
 		ts := b.TSMS[m.ID]
 		isHistory := mode != modeLive || upserted[m.ID]
@@ -107,6 +117,9 @@ func (s *session) processTable(tbl *table.LSTable, mode tableMode) {
 		if !s.hist.put(m, ts, !isHistory) {
 			continue
 		}
+		if row, ok := attachmentRow(m, ts); ok {
+			attachments = append(attachments, row)
+		}
 		if isHistory {
 			history[m.ThreadID] = append(history[m.ThreadID], m)
 			continue
@@ -114,6 +127,8 @@ func (s *session) processTable(tbl *table.LSTable, mode tableMode) {
 		s.reg.touch(m.ThreadID, ts, previewOf(m), m.Sender.IsMe)
 		s.emitMessage(m)
 	}
+
+	s.indexAttachments(attachments)
 
 	complete := map[string]bool{}
 	for _, r := range tbl.LSInsertNewMessageRange {
@@ -152,7 +167,10 @@ func (s *session) processTable(tbl *table.LSTable, mode tableMode) {
 		if s.collectorFor(tid) != nil {
 			continue
 		}
-		s.emit(api.EvHistory, api.HistoryEvent{ThreadID: tid, Messages: history[tid], Complete: complete[tid]})
+		batches := splitHistory(history[tid])
+		for i, batch := range batches {
+			s.emit(api.EvHistory, api.HistoryEvent{ThreadID: tid, Messages: batch, Complete: complete[tid] && i == len(batches)-1})
+		}
 	}
 
 	for _, e := range b.Edits {
@@ -196,6 +214,7 @@ func (s *session) applyEdit(e api.Edit) {
 }
 
 func (s *session) applyRemoval(r api.Removal) {
+	s.dropAttachments(r.MessageID)
 	m, _, ok := s.hist.get(r.MessageID)
 	if !r.Unsent {
 		s.hist.remove(r.MessageID)
@@ -224,4 +243,76 @@ func (s *session) applyReactionEvent(r api.ReactionEvent) {
 		r.TS = time.Now().Unix()
 	}
 	s.emit(api.EvReaction, r)
+}
+
+// splitHistory cuts one thread's messages into batches within the count and size caps of a history event.
+func splitHistory(msgs []api.Message) [][]api.Message {
+	var out [][]api.Message
+	var cur []api.Message
+	size := 0
+	for _, m := range msgs {
+		n := messageSize(m)
+		if len(cur) > 0 && (len(cur) >= maxHistoryBatch || size+n > maxHistoryBatchBytes) {
+			out = append(out, cur)
+			cur, size = nil, 0
+		}
+		cur = append(cur, m)
+		size += n
+	}
+	if len(cur) > 0 {
+		out = append(out, cur)
+	}
+	return out
+}
+
+// messageSize is the serialised size of a message; an unencodable one counts as a full batch.
+func messageSize(m api.Message) int {
+	b, err := json.Marshal(m)
+	if err != nil {
+		return maxHistoryBatchBytes
+	}
+	return len(b)
+}
+
+// attachmentRow is the persistent download record of a message, if it carries downloadable media.
+func attachmentRow(m api.Message, ts int64) (e2ee.FBAttachments, bool) {
+	var atts []api.Attachment
+	for _, a := range m.Attachments {
+		if downloadable(a) == nil {
+			atts = append(atts, a)
+		}
+	}
+	if len(atts) == 0 {
+		return e2ee.FBAttachments{}, false
+	}
+	return e2ee.FBAttachments{MessageID: m.ID, ThreadID: m.ThreadID, TSMS: ts, Attachments: atts}, true
+}
+
+// indexAttachments persists download records so download_attachment survives a restart; failures only cost that.
+func (s *session) indexAttachments(rows []e2ee.FBAttachments) {
+	if len(rows) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), e2eeOpTimeout)
+	defer cancel()
+	st, err := s.ensureStore(ctx)
+	if err != nil {
+		return
+	}
+	if err := st.PutFBAttachments(ctx, rows); err != nil {
+		s.log.Warn().Msg("indexing attachments failed")
+	}
+}
+
+// dropAttachments forgets the download record of a message that was unsent or deleted.
+func (s *session) dropAttachments(messageID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), e2eeOpTimeout)
+	defer cancel()
+	st, err := s.ensureStore(ctx)
+	if err != nil {
+		return
+	}
+	if err := st.DropFBAttachments(ctx, messageID); err != nil {
+		s.log.Warn().Msg("dropping an attachment record failed")
+	}
 }

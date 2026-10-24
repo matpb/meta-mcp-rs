@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"slices"
 	"strconv"
 	"time"
 
@@ -23,7 +24,7 @@ const (
 	e2eeOpTimeout       = 30 * time.Second
 )
 
-// ensureStore opens the E2EE database on first use.
+// ensureStore opens the E2EE database on first use, bound to this account.
 func (s *session) ensureStore(ctx context.Context) (*e2ee.Store, error) {
 	s.e2mu.Lock()
 	defer s.e2mu.Unlock()
@@ -33,9 +34,13 @@ func (s *session) ensureStore(ctx context.Context) (*e2ee.Store, error) {
 	if s.st != nil {
 		return s.st, nil
 	}
-	st, err := e2ee.Open(ctx, s.dataDir, s.log.With().Str("component", "e2ee").Logger())
+	st, wiped, err := e2ee.OpenFor(ctx, s.dataDir, s.fbid, s.log.With().Str("component", "e2ee").Logger())
 	if err != nil {
 		return nil, api.AsError(err)
+	}
+	if wiped {
+		s.log.Warn().Msg("e2ee data of another account was wiped")
+		s.setE2EERegistered(false)
 	}
 	s.st = st
 	return st, nil
@@ -82,17 +87,23 @@ func (s *session) e2eeActive() bool {
 }
 
 // startE2EE runs once per connect cycle; a fail-closed verdict logs the account out, other failures leave the unencrypted side untouched.
+// It does nothing after a fatal account signal, and a panic inside is contained.
 func (s *session) startE2EE(cyc *cycle) {
-	err := s.connectE2EE(cyc)
-	if err == nil || cyc.ctx.Err() != nil {
+	if s.blockedReason() != "" {
 		return
 	}
-	if f := classify(err); f.kind == fatalLoggedOut {
-		s.failClosed(f)
-		return
-	}
-	s.log.Warn().Msg("e2ee connect failed")
-	s.emit(api.EvError, api.ErrorEvent{Code: codeE2EEUnavailable, Message: "encrypted chats are unavailable"})
+	s.guard("e2ee start", func() {
+		err := s.connectE2EE(cyc)
+		if err == nil || cyc.ctx.Err() != nil {
+			return
+		}
+		if f := classify(err); f.kind == fatalLoggedOut {
+			s.failClosed(f)
+			return
+		}
+		s.log.Warn().Msg("e2ee connect failed")
+		s.emit(api.EvError, api.ErrorEvent{Code: codeE2EEUnavailable, Message: "encrypted chats are unavailable"})
+	})
 }
 
 func (s *session) connectE2EE(cyc *cycle) error {
@@ -139,7 +150,17 @@ func (s *session) connectE2EE(cyc *cycle) error {
 		s.e2mu.Unlock()
 		return err
 	}
+	if s.e2eeStale(ctx, wa) {
+		wa.Disconnect()
+	}
 	return nil
+}
+
+// e2eeStale reports that wa was replaced, its cycle ended or sending got blocked while it was connecting.
+func (s *session) e2eeStale(ctx context.Context, wa *whatsmeow.Client) bool {
+	s.e2mu.Lock()
+	defer s.e2mu.Unlock()
+	return s.wa != wa || ctx.Err() != nil || s.blockedReason() != ""
 }
 
 // e2eeHandler returns whatsmeow's handler; false (no ack) asks for redelivery, also after a panic.
@@ -147,7 +168,8 @@ func (s *session) e2eeHandler(cyc *cycle) func(evt any) bool {
 	return func(raw any) (ok bool) {
 		defer func() {
 			if r := recover(); r != nil {
-				s.log.Error().Msg("panic in e2ee handler")
+				s.log.Error().Str("op", "e2ee handler").Msg("panic contained")
+				s.emit(api.EvError, api.ErrorEvent{Code: api.CodeInternal, Message: "an internal error was contained"})
 				ok = false
 			}
 		}()
@@ -159,13 +181,56 @@ func (s *session) e2eeHandler(cyc *cycle) func(evt any) bool {
 		case *events.ConnectFailure:
 			s.onConnectFailure(cyc, evt)
 		case *events.LoggedOut:
-			s.log.Warn().Msg("e2ee logged out")
 			s.emit(api.EvError, api.ErrorEvent{Code: codeE2EELoggedOut, Message: "the encrypted chat session was logged out"})
-			go s.stopE2EE()
+			s.setE2EERegistered(false)
+			s.onE2EEFatal("device_removed")
+		case *events.GroupInfo:
+			s.onGroupInfo(evt)
+		case *events.TemporaryBan:
+			s.onE2EEFatal("temporary_ban")
+		case *events.StreamReplaced:
+			s.onE2EEFatal("stream_replaced")
+		case *events.ClientOutdated:
+			s.onE2EEFatal("client_outdated")
 		case *events.CATRefreshError:
 			s.onCATError(evt)
 		}
 		return true
+	}
+}
+
+// onGroupInfo keeps the admin list of an encrypted group current from promotions, demotions and departures.
+func (s *session) onGroupInfo(evt *events.GroupInfo) {
+	if len(evt.Promote) == 0 && len(evt.Demote) == 0 && len(evt.Leave) == 0 {
+		return
+	}
+	gone := append(slices.Clone(evt.Demote), evt.Leave...)
+	s.reg.updateAdmins(normalize.ThreadIDFromJID(evt.JID), userIDs(evt.Promote), userIDs(gone))
+}
+
+// userIDs lists the numeric user ids of JIDs, skipping any that are not numeric.
+func userIDs(jids []types.JID) []int64 {
+	out := make([]int64, 0, len(jids))
+	for _, j := range jids {
+		if n := int64(j.UserInt()); n != 0 {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// onE2EEFatal reports a fatal account signal of the encrypted side once, stops that client for good and blocks sending.
+func (s *session) onE2EEFatal(reason string) {
+	s.mu.Lock()
+	first := s.blocked == ""
+	if first {
+		s.blocked = reason
+	}
+	s.mu.Unlock()
+	go s.guard("e2ee stop", s.stopE2EE)
+	if first {
+		s.log.Warn().Str("reason", reason).Msg("e2ee fatal signal")
+		s.emitConn(api.ConnFatal, reason, api.ActionNone)
 	}
 }
 
@@ -184,7 +249,7 @@ func (s *session) onCATError(evt *events.CATRefreshError) {
 func (s *session) onConnectFailure(cyc *cycle, evt *events.ConnectFailure) {
 	switch evt.Reason {
 	case events.ConnectFailureNotFound, events.ConnectFailureClientUnknown:
-		go s.recoverE2EE(cyc, evt.Reason)
+		go s.guard("e2ee recover", func() { s.recoverE2EE(cyc, evt.Reason) })
 	case events.ConnectFailureGeneric:
 		s.requestRecycle(false)
 	default:
@@ -193,6 +258,9 @@ func (s *session) onConnectFailure(cyc *cycle, evt *events.ConnectFailure) {
 }
 
 func (s *session) recoverE2EE(cyc *cycle, reason events.ConnectFailureReason) {
+	if s.blockedReason() != "" {
+		return
+	}
 	s.mu.Lock()
 	first := s.e2eeRecoveries == 0
 	s.e2eeRecoveries++
@@ -241,37 +309,71 @@ func (s *session) onFBMessage(evt *events.FBMessage) bool {
 		}
 		s.emit(api.EvReaction, r)
 	case res.Edit != nil:
-		e := *res.Edit
-		m, found, err := st.ApplyEdit(ctx, e)
-		if err != nil {
-			s.log.Warn().Msg("applying an e2ee edit failed")
-			return false
-		}
-		if found {
-			s.emitMessage(m)
-			break
-		}
+		return s.onE2EEEdit(ctx, st, *res.Edit)
+	case res.Removal != nil:
+		return s.onE2EERemoval(ctx, st, *res.Removal)
+	}
+	return true
+}
+
+// ignoredChange logs a refused edit or unsend with ids only.
+func (s *session) ignoredChange(kind, threadID, messageID string) {
+	s.log.Info().Str("op", kind).Str("thread", threadID).Str("id", messageID).Msg("ignored a change from a different sender")
+}
+
+// onE2EEEdit applies an edit only when its authenticated sender wrote the target message.
+func (s *session) onE2EEEdit(ctx context.Context, st *e2ee.Store, e api.Edit) bool {
+	if e.SenderID == "" || e.SenderID != e.TargetSenderID {
+		s.ignoredChange("edit", e.ThreadID, e.MessageID)
+		return true
+	}
+	m, found, err := st.ApplyEdit(ctx, e)
+	switch {
+	case errors.Is(err, e2ee.ErrDenied):
+		s.ignoredChange("edit", e.ThreadID, e.MessageID)
+	case err != nil:
+		s.log.Warn().Msg("applying an e2ee edit failed")
+		return false
+	case found:
+		s.emitMessage(m)
+	default:
 		text := e.Text
 		s.emitMessage(api.Message{
 			ID: e.MessageID, ThreadID: e.ThreadID, TS: e.TS, Text: &text, Attachments: []api.Attachment{},
 			Reactions: []api.Reaction{}, Edited: true, Encrypted: true, Kind: api.MsgText,
 		})
-	case res.Removal != nil:
-		r := *res.Removal
-		m, found, err := st.ApplyRemoval(ctx, r)
-		if err != nil {
-			s.log.Warn().Msg("applying an e2ee removal failed")
-			return false
+	}
+	return true
+}
+
+// onE2EERemoval applies an unsend only for the sender of the target message or a known admin of the group.
+func (s *session) onE2EERemoval(ctx context.Context, st *e2ee.Store, r api.Removal) bool {
+	if r.SenderID == "" {
+		s.ignoredChange("unsend", r.ThreadID, r.MessageID)
+		return true
+	}
+	if r.SenderID != r.TargetSenderID {
+		sender, _ := strconv.ParseInt(r.SenderID, 10, 64)
+		if !s.reg.isAdmin(r.ThreadID, sender) {
+			s.ignoredChange("unsend", r.ThreadID, r.MessageID)
+			return true
 		}
-		switch {
-		case found && r.Unsent:
-			s.emitMessage(m)
-		case !found && r.Unsent:
-			s.emitMessage(api.Message{
-				ID: r.MessageID, ThreadID: r.ThreadID, Attachments: []api.Attachment{}, Reactions: []api.Reaction{},
-				Unsent: true, Encrypted: true, Kind: api.MsgUnsupported,
-			})
-		}
+		r.ByAdmin = true
+	}
+	m, found, err := st.ApplyRemoval(ctx, r)
+	switch {
+	case errors.Is(err, e2ee.ErrDenied):
+		s.ignoredChange("unsend", r.ThreadID, r.MessageID)
+	case err != nil:
+		s.log.Warn().Msg("applying an e2ee removal failed")
+		return false
+	case found && r.Unsent:
+		s.emitMessage(m)
+	case !found && r.Unsent:
+		s.emitMessage(api.Message{
+			ID: r.MessageID, ThreadID: r.ThreadID, Attachments: []api.Attachment{}, Reactions: []api.Reaction{},
+			Unsent: true, Encrypted: true, Kind: api.MsgUnsupported,
+		})
 	}
 	return true
 }
@@ -296,7 +398,7 @@ func (s *session) onE2EEMessage(ctx context.Context, st *e2ee.Store, evt *events
 		s.emitThreads([]string{id})
 	}
 	if created && evt.Info.Chat.Server == types.GroupServer {
-		go s.refreshGroup(evt.Info.Chat)
+		go s.guard("e2ee group", func() { s.refreshGroup(evt.Info.Chat) })
 	}
 	s.emitMessage(m)
 	return true
@@ -315,11 +417,16 @@ func (s *session) refreshGroup(chat types.JID) {
 		return
 	}
 	members := make([]int64, 0, len(info.Participants))
+	var admins []int64
 	for _, p := range info.Participants {
-		members = append(members, int64(p.JID.UserInt()))
+		member := int64(p.JID.UserInt())
+		members = append(members, member)
+		if p.IsAdmin || p.IsSuperAdmin {
+			admins = append(admins, member)
+		}
 	}
 	id := normalize.ThreadIDFromJID(chat)
-	if s.reg.setGroupInfo(id, info.Name, members) {
+	if s.reg.setGroupInfo(id, info.Name, members, admins) {
 		s.emitThreads([]string{id})
 	}
 }

@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -54,6 +53,7 @@ type hybridEntry struct {
 
 type threadsFile struct {
 	Version int                    `json:"version"`
+	FBID    string                 `json:"fbid,omitempty"`
 	Hybrid  map[string]hybridEntry `json:"hybrid"`
 }
 
@@ -71,6 +71,7 @@ type threadEntry struct {
 	ThreadType     table.ThreadType
 	FBThreadKey    int64
 	WAServer       string
+	Admins         []int64
 }
 
 func (e *threadEntry) encrypted() bool { return e.E2EE || e.ThreadType.IsWhatsApp() }
@@ -79,6 +80,7 @@ func (e *threadEntry) encrypted() bool { return e.E2EE || e.ThreadType.IsWhatsAp
 type registry struct {
 	mu      sync.Mutex
 	me      int64
+	fbid    string
 	path    string
 	loaded  bool
 	threads map[string]*threadEntry
@@ -86,9 +88,10 @@ type registry struct {
 	names   func(int64) string
 }
 
-func newRegistry(dataDir string, me int64, names func(int64) string) *registry {
+func newRegistry(dataDir, fbid string, me int64, names func(int64) string) *registry {
 	return &registry{
 		me:      me,
+		fbid:    fbid,
 		path:    filepath.Join(dataDir, threadsFileName),
 		threads: map[string]*threadEntry{},
 		hybrid:  map[int64]hybridEntry{},
@@ -112,7 +115,7 @@ func (r *registry) loadLocked() {
 		return
 	}
 	var f threadsFile
-	if json.Unmarshal(b, &f) != nil {
+	if json.Unmarshal(b, &f) != nil || (f.FBID != "" && f.FBID != r.fbid) {
 		return
 	}
 	for k, v := range f.Hybrid {
@@ -123,7 +126,7 @@ func (r *registry) loadLocked() {
 }
 
 func (r *registry) saveLocked() error {
-	f := threadsFile{Version: 1, Hybrid: map[string]hybridEntry{}}
+	f := threadsFile{Version: 1, FBID: r.fbid, Hybrid: map[string]hybridEntry{}}
 	for k, v := range r.hybrid {
 		f.Hybrid[strconv.FormatInt(k, 10)] = v
 	}
@@ -152,19 +155,13 @@ func (r *registry) saveLocked() error {
 	return nil
 }
 
-// wipe forgets every thread and removes threads.json.
-func (r *registry) wipe() error {
+// forget drops every thread and the hybrid map from memory; the file is removed by factory.Wipe.
+func (r *registry) forget() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.threads = map[string]*threadEntry{}
 	r.hybrid = map[int64]hybridEntry{}
 	r.loaded = true
-	err := os.Remove(r.path)
-	_ = os.Remove(r.path + ".tmp")
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	return nil
 }
 
 func (r *registry) canonLocked(fbKey int64) int64 {
@@ -252,6 +249,7 @@ func (r *registry) entry(id string) (threadEntry, bool) {
 	}
 	c := *e
 	c.Members = slices.Clone(e.Members)
+	c.Admins = slices.Clone(e.Admins)
 	return c, true
 }
 
@@ -525,7 +523,7 @@ func (r *registry) noteE2EE(chat types.JID, sender int64, tsMS int64, preview st
 }
 
 // setGroupInfo fills a group thread from the encrypted group info and reports whether it changed.
-func (r *registry) setGroupInfo(id, name string, members []int64) bool {
+func (r *registry) setGroupInfo(id, name string, members, admins []int64) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	e, ok := r.threads[id]
@@ -539,7 +537,33 @@ func (r *registry) setGroupInfo(id, name string, members []int64) bool {
 	if len(members) > 0 {
 		e.Members = members
 	}
+	e.Admins = admins
 	return !reflect.DeepEqual(before, r.snapLocked(e))
+}
+
+// updateAdmins applies the promotions and the demotions or departures of a group-info change to the admin list.
+func (r *registry) updateAdmins(id string, promote, demote []int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.threads[id]
+	if !ok || e.Kind != api.KindGroup {
+		return
+	}
+	admins := slices.DeleteFunc(slices.Clone(e.Admins), func(a int64) bool { return slices.Contains(demote, a) })
+	for _, u := range promote {
+		if u != 0 && !slices.Contains(admins, u) {
+			admins = append(admins, u)
+		}
+	}
+	e.Admins = admins
+}
+
+// isAdmin reports whether user is a known admin of the group thread id.
+func (r *registry) isAdmin(id string, user int64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.threads[id]
+	return ok && e.Kind == api.KindGroup && user != 0 && slices.Contains(e.Admins, user)
 }
 
 type pageCursor struct {

@@ -1,4 +1,5 @@
-// Package e2ee owns the on-disk E2EE state: the whatsmeow device store and the encrypted-message cache.
+// Package e2ee owns the on-disk E2EE state: the whatsmeow device store, the encrypted-message cache
+// and the attachment index of unencrypted messages.
 package e2ee
 
 import (
@@ -29,7 +30,10 @@ var (
 	ringCap    = 200
 )
 
-const schemaVersion = 1
+const schemaVersion = 2
+
+// ErrForeignAccount means the database holds data of another Facebook account.
+var ErrForeignAccount = errors.New("e2ee store: database belongs to another account")
 
 // Store is the E2EE database handle plus the message cache. Safe for concurrent use.
 type Store struct {
@@ -42,6 +46,64 @@ type Store struct {
 
 func ioErr(op string) *api.Error {
 	return &api.Error{Code: api.CodeIO, Msg: "e2ee store: " + op + " failed"}
+}
+
+// OpenFor opens the database for one account. Data of another account is wiped first and
+// wiped reports it; the device store and the caches then start empty.
+func OpenFor(ctx context.Context, dataDir, fbid string, log zerolog.Logger) (st *Store, wiped bool, err error) {
+	if st, err = Open(ctx, dataDir, log); err != nil {
+		return nil, false, err
+	}
+	err = st.bind(ctx, fbid)
+	if err == nil {
+		return st, false, nil
+	}
+	_ = st.Close()
+	if !errors.Is(err, ErrForeignAccount) {
+		return nil, false, err
+	}
+	if werr := Wipe(dataDir); werr != nil {
+		return nil, false, ioErr("wipe")
+	}
+	if st, err = Open(ctx, dataDir, log); err != nil {
+		return nil, false, err
+	}
+	if err = st.bind(ctx, fbid); err != nil {
+		_ = st.Close()
+		return nil, false, err
+	}
+	return st, true, nil
+}
+
+// bind records fbid on a database that has none and refuses one bound to, or holding a device of, another account.
+func (s *Store) bind(ctx context.Context, fbid string) error {
+	if fbid == "" {
+		return ioErr("account")
+	}
+	var stored string
+	err := s.db.QueryRowContext(ctx, `SELECT fbid FROM sidecar_account WHERE id = 1`).Scan(&stored)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+	case err != nil:
+		return ioErr("account")
+	case stored != fbid:
+		return ErrForeignAccount
+	}
+	devs, err := s.container.GetAllDevices(ctx)
+	if err != nil {
+		return ioErr("account")
+	}
+	for _, d := range devs {
+		if d.ID != nil && d.ID.User != fbid {
+			return ErrForeignAccount
+		}
+	}
+	if stored == "" {
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO sidecar_account (id, fbid) VALUES (1, ?)`, fbid); err != nil {
+			return ioErr("account")
+		}
+	}
+	return nil
 }
 
 // Open creates or opens dataDir/e2ee.db (0600), runs whatsmeow and cache upgrades.
@@ -133,6 +195,28 @@ func upgradeCache(ctx context.Context, db *sql.DB) error {
 				return ioErr("cache upgrade")
 			}
 		}
+	}
+	if version < 2 {
+		stmts := []string{
+			`CREATE TABLE sidecar_account (
+				id INTEGER PRIMARY KEY CHECK (id = 1),
+				fbid TEXT NOT NULL
+			)`,
+			`CREATE TABLE sidecar_fb_attachments (
+				message_id TEXT PRIMARY KEY,
+				thread_id TEXT NOT NULL,
+				ts_ms INTEGER NOT NULL,
+				attachments BLOB NOT NULL
+			)`,
+			`CREATE INDEX sidecar_fb_attachments_ts ON sidecar_fb_attachments (ts_ms, message_id)`,
+		}
+		for _, s := range stmts {
+			if _, err := tx.ExecContext(ctx, s); err != nil {
+				return ioErr("cache upgrade")
+			}
+		}
+	}
+	if version != schemaVersion {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM sidecar_version`); err != nil {
 			return ioErr("cache upgrade")
 		}

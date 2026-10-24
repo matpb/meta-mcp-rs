@@ -252,15 +252,17 @@ func TestSendTextValidation(t *testing.T) {
 	}
 }
 
-func TestSendTextKnownContactWithoutThread(t *testing.T) {
+// A contact id without a registry thread could be an encrypted chat that is not listed yet, so it is never sent to.
+func TestSendTextKnownContactWithoutThreadIsNotFound(t *testing.T) {
 	s, fc := sendSession(t)
 	fc.exec = replyWith("mid.$c")
 	s.names.set(777, "New Friend")
-	if _, err := s.SendText(t.Context(), api.SendTextParams{ThreadID: "777", Text: "hi"}); err != nil {
-		t.Fatal(err)
-	}
-	if got := lastSend(t, fc).ThreadId; got != 777 {
-		t.Fatalf("thread %d", got)
+	_, err := s.SendText(t.Context(), api.SendTextParams{ThreadID: "777", Text: "hi"})
+	wantCode(t, err, api.CodeThreadNotFound)
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	if len(fc.tasks) != 0 {
+		t.Fatalf("%d tasks executed for an unknown thread", len(fc.tasks))
 	}
 }
 

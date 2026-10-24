@@ -2,19 +2,26 @@ package api
 
 // The types below are shared by normalize, e2ee and engine; they never go on the wire.
 
-// Edit replaces the text of an existing message.
+// Edit replaces the text of an existing message. SenderID is the authenticated sender of the
+// edit event and TargetSenderID the sender named by the message key; both are decimal ids.
 type Edit struct {
-	ThreadID  string
-	MessageID string
-	Text      string
-	TS        int64
+	ThreadID       string
+	MessageID      string
+	Text           string
+	TS             int64
+	SenderID       string
+	TargetSenderID string
 }
 
-// Removal is an unsend (Unsent true, for everyone) or a delete for this account only.
+// Removal is an unsent message (Unsent true, for everyone) or a delete for this account only.
+// ByAdmin is set by the engine when the sender is a known admin of the group.
 type Removal struct {
-	ThreadID  string
-	MessageID string
-	Unsent    bool
+	ThreadID       string
+	MessageID      string
+	Unsent         bool
+	SenderID       string
+	TargetSenderID string
+	ByAdmin        bool
 }
 
 // E2EEMedia is what download_attachment needs to fetch one encrypted attachment later.

@@ -233,7 +233,7 @@ func TestApplyEditRemovalReaction(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, ok, err := s.ApplyEdit(ctx, api.Edit{ThreadID: "t", MessageID: m2.ID, Text: "new"})
+	got, ok, err := s.ApplyEdit(ctx, api.Edit{ThreadID: "t", MessageID: m2.ID, Text: "new", SenderID: "s"})
 	if err != nil || !ok || *got.Text != "new" || !got.Edited {
 		t.Fatalf("edit: %+v %v %v", got, ok, err)
 	}
@@ -281,7 +281,7 @@ func TestApplyEditRemovalReaction(t *testing.T) {
 		t.Fatalf("get lost updates: %+v", disk)
 	}
 
-	got, ok, err = s.ApplyRemoval(ctx, api.Removal{ThreadID: "t", MessageID: m1.ID, Unsent: true})
+	got, ok, err = s.ApplyRemoval(ctx, api.Removal{ThreadID: "t", MessageID: m1.ID, Unsent: true, SenderID: "s"})
 	if err != nil || !ok || got.Text != nil || len(got.Attachments) != 0 || got.Attachments == nil || !got.Unsent {
 		t.Fatalf("unsend: %+v %v %v", got, ok, err)
 	}

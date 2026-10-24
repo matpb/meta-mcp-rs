@@ -78,32 +78,51 @@ func (s *session) usable() error {
 	return nil
 }
 
-// resolveThread routes a thread id to the encrypted or unencrypted side.
-func (s *session) resolveThread(id string) (threadTarget, error) {
+// writable is usable plus the stop after a fatal account signal; reads and downloads keep using usable.
+func (s *session) writable() error {
+	if err := s.usable(); err != nil {
+		return err
+	}
+	if r := s.blockedReason(); r != "" {
+		return api.Errorf(api.CodeNotConnected, "sending is blocked (%s); restart the sidecar after the cause is resolved", r)
+	}
+	return nil
+}
+
+// canonicalThreadID parses a numeric thread id and returns its decimal form, so "0333" and "+333" are thread 333.
+func canonicalThreadID(id string) (key int64, canon string, ok bool) {
 	key, err := strconv.ParseInt(id, 10, 64)
 	if err != nil || key <= 0 {
+		return 0, "", false
+	}
+	return key, strconv.FormatInt(key, 10), true
+}
+
+// resolveThread routes a thread id to the encrypted or unencrypted side.
+// An id missing from the registry is thread_not_found, never a contact id sent as plaintext.
+func (s *session) resolveThread(id string) (threadTarget, error) {
+	key, canon, ok := canonicalThreadID(id)
+	if !ok {
 		return threadTarget{}, api.Errorf(api.CodeThreadNotFound, "thread not found")
 	}
-	if e, ok := s.threadInfo(id); ok {
-		t := threadTarget{id: id, entry: e, known: true, fbKey: key, tt: e.ThreadType, enc: e.encrypted()}
-		if e.FBThreadKey > 0 {
-			t.fbKey = e.FBThreadKey
-		}
-		if t.tt == table.UNKNOWN_THREAD_TYPE {
-			t.tt = table.GROUP_THREAD
-			if e.Kind == api.KindDM {
-				t.tt = table.ONE_TO_ONE
-			}
-		}
-		if t.enc {
-			t.chat = chatJIDFor(e)
-		}
-		return t, nil
+	e, found := s.threadInfo(canon)
+	if !found {
+		return threadTarget{}, api.Errorf(api.CodeThreadNotFound, "thread not found")
 	}
-	if s.names.get(key) != "" {
-		return threadTarget{id: id, fbKey: key, tt: table.ONE_TO_ONE}, nil
+	t := threadTarget{id: canon, entry: e, known: true, fbKey: key, tt: e.ThreadType, enc: e.encrypted()}
+	if e.FBThreadKey > 0 {
+		t.fbKey = e.FBThreadKey
 	}
-	return threadTarget{}, api.Errorf(api.CodeThreadNotFound, "thread not found")
+	if t.tt == table.UNKNOWN_THREAD_TYPE {
+		t.tt = table.GROUP_THREAD
+		if e.Kind == api.KindDM {
+			t.tt = table.ONE_TO_ONE
+		}
+	}
+	if t.enc {
+		t.chat = chatJIDFor(e)
+	}
+	return t, nil
 }
 
 var errWrongThread = api.Errorf(api.CodeBadParams, "message id does not belong to this thread")
@@ -212,7 +231,7 @@ func validText(text string) error {
 
 // SendText sends a text message to a Messenger or encrypted thread.
 func (s *session) SendText(ctx context.Context, p api.SendTextParams) (api.SendResult, error) {
-	if err := s.usable(); err != nil {
+	if err := s.writable(); err != nil {
 		return api.SendResult{}, err
 	}
 	if err := validText(p.Text); err != nil {
@@ -466,7 +485,7 @@ func e2eeReactionApp(key *waCommon.MessageKey, emoji string, tsMS int64) *waCons
 
 // SendReaction sets or removes the account's reaction on a message.
 func (s *session) SendReaction(ctx context.Context, p api.SendReactionParams) error {
-	if err := s.usable(); err != nil {
+	if err := s.writable(); err != nil {
 		return err
 	}
 	t, err := s.resolveThread(p.ThreadID)
@@ -538,7 +557,7 @@ func (s *session) recordReaction(t threadTarget, msgID, emoji string, at time.Ti
 
 // MarkRead marks a thread read up to a timestamp (default now).
 func (s *session) MarkRead(ctx context.Context, p api.MarkReadParams) error {
-	if err := s.usable(); err != nil {
+	if err := s.writable(); err != nil {
 		return err
 	}
 	t, err := s.resolveThread(p.ThreadID)
@@ -612,7 +631,7 @@ func groupUnread(msgs []api.Message, upToMS *int64) map[types.JID][]types.Messag
 
 // SetTyping toggles the typing indicator of one thread only.
 func (s *session) SetTyping(ctx context.Context, p api.SetTypingParams) error {
-	if err := s.usable(); err != nil {
+	if err := s.writable(); err != nil {
 		return err
 	}
 	t, err := s.resolveThread(p.ThreadID)

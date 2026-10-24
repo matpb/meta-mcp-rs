@@ -54,6 +54,8 @@ type fakeClient struct {
 	exec        func(ctx context.Context, tasks ...socket.Task) (*table.LSTable, error)
 	fetchMore   func(ctx context.Context, group int64) (*socket.KeyStoreData, *table.LSTable, error)
 	posted      []*table.LSTable
+	loadSeq     func(n int) error
+	setDevice   func()
 }
 
 func newFakeClient(jar *cookies.Cookies) *fakeClient {
@@ -62,12 +64,18 @@ func newFakeClient(jar *cookies.Cookies) *fakeClient {
 
 func (f *fakeClient) LoadMessagesPage(context.Context) (types.UserInfo, *table.LSTable, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.loads++
-	if f.loadErr != nil {
-		return nil, nil, f.loadErr
+	n, seq, loadErr, user, page := f.loads, f.loadSeq, f.loadErr, f.user, f.page
+	f.mu.Unlock()
+	if seq != nil {
+		if err := seq(n); err != nil {
+			return nil, nil, err
+		}
 	}
-	return f.user, f.page, nil
+	if loadErr != nil {
+		return nil, nil, loadErr
+	}
+	return user, page, nil
 }
 
 func (f *fakeClient) Connect(context.Context) error {
@@ -143,8 +151,15 @@ func (f *fakeClient) PostHandlePublishResponse(t *table.LSTable) {
 func (f *fakeClient) GetCookies() *cookies.Cookies                    { return f.jar }
 func (f *fakeClient) GetCursor(int64) string                          { return "cursor" }
 func (f *fakeClient) GetSyncGroupKeyStore(int64) *socket.KeyStoreData { return nil }
-func (f *fakeClient) SetDevice(*store.Device)                         {}
-func (f *fakeClient) RegisterE2EE(context.Context, int64) error       { return errors.New("no network") }
+func (f *fakeClient) SetDevice(*store.Device) {
+	f.mu.Lock()
+	hook := f.setDevice
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+}
+func (f *fakeClient) RegisterE2EE(context.Context, int64) error { return errors.New("no network") }
 func (f *fakeClient) PrepareE2EEClient() (*whatsmeow.Client, error) {
 	return nil, errors.New("no network")
 }

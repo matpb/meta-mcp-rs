@@ -6,7 +6,6 @@ import (
 	"math"
 	"reflect"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,10 +17,15 @@ import (
 
 const (
 	cacheCap          = 500
-	fetchTimeout      = 30 * time.Second
-	fetchRetryAfter   = 5 * time.Second
 	maxFetchReRequest = 1
+	maxFetchPages     = 10
 	noCursor          = int64(math.MaxInt64)
+)
+
+// Waits of a history fetch; tests lower them.
+var (
+	fetchTimeout    = 30 * time.Second
+	fetchRetryAfter = 5 * time.Second
 )
 
 type cachedMsg struct {
@@ -369,10 +373,11 @@ func (s *session) collectorFor(threadID string) *collector {
 
 // FetchMessages serves history from the E2EE store, the in-memory cache or a Messenger fetch.
 func (s *session) FetchMessages(ctx context.Context, p api.FetchMessagesParams) (api.FetchMessagesResult, error) {
-	key, err := strconv.ParseInt(p.ThreadID, 10, 64)
-	if err != nil || key <= 0 {
+	key, canon, ok := canonicalThreadID(p.ThreadID)
+	if !ok {
 		return api.FetchMessagesResult{}, api.Errorf(api.CodeThreadNotFound, "thread not found")
 	}
+	p.ThreadID = canon
 	if p.Limit < 1 {
 		return api.FetchMessagesResult{}, api.Errorf(api.CodeBadParams, "limit must be positive")
 	}
@@ -445,7 +450,9 @@ func (s *session) fetchRemote(ctx context.Context, cl metaClient, p api.FetchMes
 	}
 	defer s.dropCollector(col)
 
+	pages := 0
 	request := func(ts int64, mid string) error {
+		pages++
 		tbl, err := cl.ExecuteTasks(ctx, &socket.FetchMessagesTask{
 			ThreadKey: fbKey, Direction: 0, ReferenceTimestampMs: ts, ReferenceMessageId: mid,
 			SyncGroup: 1, Cursor: cl.GetCursor(1),
@@ -474,13 +481,16 @@ func (s *session) fetchRemote(ctx context.Context, cl metaClient, p api.FetchMes
 			msgs, more := col.result(p.Limit)
 			return api.FetchMessagesResult{Messages: msgs, HasMore: more}, nil
 		case <-col.more:
+			if pages >= maxFetchPages {
+				return pageCapResult(col, p.Limit)
+			}
 			ts, mid := col.ref()
 			if err := request(ts, midOf(mid)); err != nil {
 				return api.FetchMessagesResult{}, api.Errorf(api.CodeIO, "history fetch failed")
 			}
 			seen = col.progressCount()
 		case <-tick.C:
-			if col.progressCount() == seen && reRequests < maxFetchReRequest {
+			if col.progressCount() == seen && reRequests < maxFetchReRequest && pages < maxFetchPages {
 				reRequests++
 				ts, mid := col.ref()
 				if err := request(ts, midOf(mid)); err != nil {
@@ -500,6 +510,15 @@ func (s *session) fetchRemote(ctx context.Context, cl metaClient, p api.FetchMes
 	}
 }
 
+// pageCapResult answers a fetch that used up maxFetchPages: what was collected, with more to come.
+func pageCapResult(col *collector, limit int) (api.FetchMessagesResult, error) {
+	msgs, _ := col.result(limit)
+	if len(msgs) == 0 {
+		return api.FetchMessagesResult{}, api.Errorf(api.CodeIO, "history fetch page limit reached")
+	}
+	return api.FetchMessagesResult{Messages: msgs, HasMore: true}, nil
+}
+
 // midOf strips the fb: prefix from a normalised message id; "" for other forms.
 func midOf(id string) string {
 	mid, ok := strings.CutPrefix(id, "fb:")
@@ -511,15 +530,15 @@ func midOf(id string) string {
 
 // fetchAround runs one FetchMessagesTask page around a timestamp so caches refresh.
 func (s *session) fetchAround(ctx context.Context, threadID string, tsMS int64) error {
-	key, err := strconv.ParseInt(threadID, 10, 64)
-	if err != nil || key <= 0 {
+	key, canon, ok := canonicalThreadID(threadID)
+	if !ok {
 		return api.Errorf(api.CodeThreadNotFound, "thread not found")
 	}
 	cl := s.messagix()
 	if cl == nil || !cl.IsConnected() {
 		return api.Errorf(api.CodeNotConnected, "not connected")
 	}
-	if e, ok := s.reg.entry(threadID); ok && e.FBThreadKey > 0 {
+	if e, ok := s.reg.entry(canon); ok && e.FBThreadKey > 0 {
 		key = e.FBThreadKey
 	}
 	tbl, err := cl.ExecuteTasks(ctx, &socket.FetchMessagesTask{

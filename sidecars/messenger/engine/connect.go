@@ -12,6 +12,9 @@ import (
 	"github.com/matpb/meta-mcp-rs/sidecars/messenger/api"
 )
 
+// maxPageFailures is how many page loads in a row may fail without a verdict before the loop stops.
+const maxPageFailures = 6
+
 // Tunables; tests lower them.
 var (
 	periodicReconnect = 20 * time.Hour
@@ -55,6 +58,10 @@ func (s *session) Connect(ctx context.Context) error {
 		case s.loggedOut || s.wiped || len(s.jar.GetMissingCookieNames()) > 0:
 			s.mu.Unlock()
 			return api.Errorf(api.CodeNotLoggedIn, "not logged in")
+		case s.blocked != "":
+			reason := s.blocked
+			s.mu.Unlock()
+			return api.Errorf(api.CodeNotConnected, "sending is blocked (%s); restart the sidecar after the cause is resolved", reason)
 		case s.runCancel != nil:
 			s.mu.Unlock()
 			return nil
@@ -88,10 +95,14 @@ func (s *session) run(ctx context.Context, done chan struct{}) {
 		s.mu.Unlock()
 		close(done)
 	}()
+	s.mu.Lock()
+	s.pageFails = 0
+	s.mu.Unlock()
 	bo := newBackoff()
 	for ctx.Err() == nil {
 		start := time.Now()
-		out := s.runCycle(ctx)
+		out := outRetry
+		s.guard("connect cycle", func() { out = s.runCycle(ctx) })
 		if bo.Stable(time.Since(start)) {
 			bo.Reset()
 		}
@@ -130,8 +141,15 @@ func (s *session) runCycle(ctx context.Context) cycleOutcome {
 			if ae, isAPI := err.(*api.Error); isAPI && ae == errAccountMismatch {
 				f = loggedOut("account_mismatch", api.CodeLoginFailed, "")
 			}
+			if s.tooManyPageFailures(f) {
+				s.emitConn(api.ConnFatal, "repeated_failures", api.ActionRelogin)
+				return outStop
+			}
 			return s.cycleFailure(f)
 		}
+		s.mu.Lock()
+		s.pageFails = 0
+		s.mu.Unlock()
 	}
 	s.mu.Lock()
 	s.lastFull = time.Now()
@@ -180,6 +198,18 @@ func (s *session) runCycle(ctx context.Context) cycleOutcome {
 			}
 		}
 	}
+}
+
+// tooManyPageFailures counts consecutive page loads that failed without a verdict and reports when the cap is hit.
+func (s *session) tooManyPageFailures(f failure) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if f.kind != transient {
+		s.pageFails = 0
+		return false
+	}
+	s.pageFails++
+	return s.pageFails >= maxPageFailures
 }
 
 // cycleFailure applies a failure that happened while starting a cycle.
@@ -278,12 +308,7 @@ func (s *session) consume(cyc *cycle) {
 }
 
 func (s *session) safeHandle(cyc *cycle, evt any) {
-	defer func() {
-		if r := recover(); r != nil {
-			s.log.Error().Msg("panic in event handler")
-		}
-	}()
-	s.handleEvent(cyc, evt)
+	s.guard("event handler", func() { s.handleEvent(cyc, evt) })
 }
 
 func (s *session) handleEvent(cyc *cycle, evt any) {

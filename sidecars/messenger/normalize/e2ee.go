@@ -66,11 +66,14 @@ func FBMessage(evt *events.FBMessage, c E2EEContext) FBResult {
 		switch p := msg.GetPayload().GetPayload().(type) {
 		case *waConsumerApplication.ConsumerApplication_Payload_ApplicationData:
 			if rev := p.ApplicationData.GetRevoke(); rev != nil {
-				id := x.keyToID(rev.GetKey())
+				id, target := x.keyTarget(rev.GetKey())
 				if id == "" {
 					return FBResult{}
 				}
-				return FBResult{Removal: &api.Removal{ThreadID: ThreadIDFromJID(x.chat), MessageID: id, Unsent: true}}
+				return FBResult{Removal: &api.Removal{
+					ThreadID: ThreadIDFromJID(x.chat), MessageID: id, Unsent: true,
+					SenderID: userID(x.from), TargetSenderID: target,
+				}}
 			}
 			return FBResult{}
 		case *waConsumerApplication.ConsumerApplication_Payload_Content:
@@ -150,16 +153,27 @@ func (x e2eeCtx) reaction(r *waConsumerApplication.ConsumerApplication_ReactionM
 }
 
 func (x e2eeCtx) edit(e *waConsumerApplication.ConsumerApplication_EditMessage, fallback time.Time) FBResult {
-	target := x.keyToID(e.GetKey())
-	if target == "" {
+	id, target := x.keyTarget(e.GetKey())
+	if id == "" {
 		return FBResult{}
 	}
 	return FBResult{Edit: &api.Edit{
-		ThreadID:  ThreadIDFromJID(x.chat),
-		MessageID: target,
-		Text:      e.GetMessage().GetText(),
-		TS:        tsOr(e.GetTimestampMS(), fallback),
+		ThreadID:       ThreadIDFromJID(x.chat),
+		MessageID:      id,
+		Text:           e.GetMessage().GetText(),
+		TS:             tsOr(e.GetTimestampMS(), fallback),
+		SenderID:       userID(x.from),
+		TargetSenderID: target,
 	}}
+}
+
+// userID is the decimal user id of a JID, or "" when it is not numeric.
+func userID(j types.JID) string {
+	n := j.UserInt()
+	if n == 0 {
+		return ""
+	}
+	return strconv.FormatUint(n, 10)
 }
 
 func tsOr(ms int64, fallback time.Time) int64 {
@@ -172,38 +186,51 @@ func tsOr(ms int64, fallback time.Time) int64 {
 	return fallback.Unix()
 }
 
-// keyToID resolves a message key to a wa: id the way the connector's waKeyToMessageID does.
-func (x e2eeCtx) keyToID(key *waCommon.MessageKey) string {
+// keyTarget resolves a message key to the wa: id of its target and the user id of that message's sender.
+// A key aimed at another group than the one the event arrived in resolves to nothing.
+func (x e2eeCtx) keyTarget(key *waCommon.MessageKey) (id, sender string) {
 	if key == nil || key.GetID() == "" {
-		return ""
+		return "", ""
 	}
 	chat := x.chat
-	sender := x.from.ToNonAD()
+	from := x.from.ToNonAD()
 	if !key.GetFromMe() {
 		if key.GetParticipant() != "" {
 			parsed, err := types.ParseJID(key.GetParticipant())
 			if err != nil {
-				return ""
+				return "", ""
 			}
-			sender = parsed
-			if sender.Server == types.LegacyUserServer {
-				sender.Server = types.DefaultUserServer
+			from = parsed
+			if from.Server == types.LegacyUserServer {
+				from.Server = types.DefaultUserServer
 			}
 		} else if chat.Server == types.DefaultUserServer || chat.Server == types.MessengerServer {
 			own := types.JID{User: strconv.FormatInt(x.c.Me, 10), Server: types.MessengerServer}
-			if sender.User == own.User {
-				sender = chat
+			if from.User == own.User {
+				from = chat
 			} else {
-				sender = own
+				from = own
 			}
 		} else {
-			return ""
+			return "", ""
 		}
 	}
 	if remote, err := types.ParseJID(key.GetRemoteJID()); err == nil && !remote.IsEmpty() && remote.Server == types.GroupServer {
+		if remote.ToNonAD() != x.chat.ToNonAD() {
+			return "", ""
+		}
 		chat = remote
 	}
-	return string(metaid.MakeWAMessageID(chat, sender, key.GetID()))
+	if userID(from) == "" {
+		return "", ""
+	}
+	return string(metaid.MakeWAMessageID(chat, from, key.GetID())), userID(from)
+}
+
+// keyToID resolves a message key to a wa: id the way the connector's waKeyToMessageID does.
+func (x e2eeCtx) keyToID(key *waCommon.MessageKey) string {
+	id, _ := x.keyTarget(key)
+	return id
 }
 
 func (x e2eeCtx) consumerContent(content *waConsumerApplication.ConsumerApplication_Content) e2eeBody {

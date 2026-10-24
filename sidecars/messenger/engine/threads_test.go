@@ -230,18 +230,22 @@ func TestThreadsFileRoundTrip(t *testing.T) {
 		t.Fatal("temp file must not remain")
 	}
 
-	again := newRegistry(s.dataDir, testMe, nil)
+	again := newRegistry(s.dataDir, "111", testMe, nil)
 	if got := again.threadID(5000); got != "9000" {
 		t.Fatalf("restored mapping %s", got)
 	}
 	if got := again.threadID(alice); got != "222" {
 		t.Fatalf("unmapped key %s", got)
 	}
-	if err := again.wipe(); err != nil {
+	if err := s.f.Wipe(s.dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(path); err == nil {
-		t.Fatal("wipe must remove threads.json")
+		t.Fatal("Wipe must remove threads.json")
+	}
+	again.forget()
+	if got := again.threadID(5000); got != "5000" {
+		t.Fatalf("forget must drop the mapping, got %s", got)
 	}
 }
 

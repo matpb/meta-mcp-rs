@@ -13,6 +13,7 @@ import (
 	_ "image/jpeg" // registers the JPEG decoder for image.DecodeConfig
 	"image/png"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -23,6 +24,7 @@ import (
 
 	"go.mau.fi/mautrix-meta/pkg/messagix/httpclient"
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
+	"go.mau.fi/mautrix-meta/pkg/metaid"
 	"go.mau.fi/mautrix-meta/pkg/msgconv/mediadl"
 	"go.mau.fi/util/exhttp"
 	"go.mau.fi/whatsmeow"
@@ -31,6 +33,7 @@ import (
 	"go.mau.fi/whatsmeow/proto/waMediaTransport"
 	"google.golang.org/protobuf/proto"
 	"maunium.net/go/mautrix"
+	"maunium.net/go/mautrix/bridgev2/networkid"
 
 	"github.com/matpb/meta-mcp-rs/sidecars/messenger/api"
 )
@@ -98,7 +101,7 @@ func mediaName(p api.SendMediaParams) string {
 
 // SendMedia uploads a file and sends it with an optional caption.
 func (s *session) SendMedia(ctx context.Context, p api.SendMediaParams) (api.SendResult, error) {
-	if err := s.usable(); err != nil {
+	if err := s.writable(); err != nil {
 		return api.SendResult{}, err
 	}
 	t, err := s.resolveThread(p.ThreadID)
@@ -294,7 +297,31 @@ type tempFile struct {
 	done bool
 }
 
+// checkDest refuses a destination that is a symlink or sits directly in a symlinked directory.
+func checkDest(dest string) error {
+	fi, err := os.Lstat(dest)
+	switch {
+	case err == nil && fi.Mode()&os.ModeSymlink != 0:
+		return api.Errorf(api.CodeBadParams, "dest_path must not be a symlink")
+	case err != nil && !errors.Is(err, fs.ErrNotExist):
+		return api.Errorf(api.CodeIO, "cannot write the destination file")
+	}
+	dir, err := os.Lstat(filepath.Dir(dest))
+	switch {
+	case err != nil:
+		return api.Errorf(api.CodeIO, "cannot write the destination file")
+	case dir.Mode()&os.ModeSymlink != 0:
+		return api.Errorf(api.CodeBadParams, "dest_path must not be in a symlinked directory")
+	case !dir.IsDir():
+		return api.Errorf(api.CodeBadParams, "dest_path must be in a directory")
+	}
+	return nil
+}
+
 func newTempFile(dest string) (*tempFile, error) {
+	if err := checkDest(dest); err != nil {
+		return nil, err
+	}
 	f, err := os.CreateTemp(filepath.Dir(dest), ".dl-*.part")
 	if err != nil {
 		return nil, api.Errorf(api.CodeIO, "cannot write the destination file")
@@ -312,6 +339,9 @@ func (t *tempFile) discard() {
 
 // commit flushes, closes and moves the file to its destination with mode 0600.
 func (t *tempFile) commit() error {
+	if err := checkDest(t.dest); err != nil {
+		return err
+	}
 	if err := t.f.Sync(); err != nil {
 		return err
 	}
@@ -394,40 +424,48 @@ func writeWith(dest string, limit int64, fill func(f *os.File) error) (fileInfo,
 }
 
 // cappedFile is a whatsmeow.File that refuses to grow past limit and remembers that it did.
+// It holds the file in a field: embedding *os.File would promote ReadFrom and let io.Copy skip Write.
 type cappedFile struct {
-	*os.File
+	f       *os.File
 	limit   int64
 	tripped atomic.Bool
 }
+
+func newCappedFile(f *os.File, limit int64) *cappedFile { return &cappedFile{f: f, limit: limit} }
 
 func (c *cappedFile) deny() error {
 	c.tripped.Store(true)
 	return errTooLarge
 }
 
+func (c *cappedFile) Read(p []byte) (int, error)                { return c.f.Read(p) }
+func (c *cappedFile) ReadAt(p []byte, off int64) (int, error)   { return c.f.ReadAt(p, off) }
+func (c *cappedFile) Seek(off int64, whence int) (int64, error) { return c.f.Seek(off, whence) }
+func (c *cappedFile) Stat() (os.FileInfo, error)                { return c.f.Stat() }
+
 func (c *cappedFile) Write(p []byte) (int, error) {
-	off, err := c.File.Seek(0, io.SeekCurrent)
+	off, err := c.f.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return 0, err
 	}
 	if off+int64(len(p)) > c.limit {
 		return 0, c.deny()
 	}
-	return c.File.Write(p)
+	return c.f.Write(p)
 }
 
 func (c *cappedFile) WriteAt(p []byte, off int64) (int, error) {
 	if off < 0 || off+int64(len(p)) > c.limit {
 		return 0, c.deny()
 	}
-	return c.File.WriteAt(p, off)
+	return c.f.WriteAt(p, off)
 }
 
 func (c *cappedFile) Truncate(size int64) error {
 	if size > c.limit {
 		return c.deny()
 	}
-	return c.File.Truncate(size)
+	return c.f.Truncate(size)
 }
 
 var _ whatsmeow.File = (*cappedFile)(nil)
@@ -464,9 +502,14 @@ func (s *session) DownloadAttachment(ctx context.Context, p api.DownloadParams) 
 	if err := s.usable(); err != nil {
 		return api.DownloadResult{}, err
 	}
+	if err := checkDest(p.DestPath); err != nil {
+		return api.DownloadResult{}, err
+	}
 	t, err := s.resolveThread(p.ThreadID)
 	if err != nil {
-		return api.DownloadResult{}, err
+		if t, err = s.storedThread(ctx, p, err); err != nil {
+			return api.DownloadResult{}, err
+		}
 	}
 	if _, err := s.checkMessageID(t, p.MessageID); err != nil {
 		return api.DownloadResult{}, err
@@ -512,11 +555,51 @@ func downloadable(a api.Attachment) error {
 	return nil
 }
 
+// indexedMessage rebuilds the attachment view of a message from the persistent index when the cache no longer has it.
+func (s *session) indexedMessage(ctx context.Context, threadID, msgID string) (api.Message, int64, bool) {
+	st, err := s.ensureStore(ctx)
+	if err != nil {
+		return api.Message{}, 0, false
+	}
+	row, found, err := st.FBAttachments(ctx, msgID)
+	if err != nil || !found || row.ThreadID != threadID {
+		return api.Message{}, 0, false
+	}
+	return api.Message{ID: msgID, ThreadID: threadID, Attachments: row.Attachments}, row.TSMS, true
+}
+
+// storedThread vouches for a thread the registry does not list when a stored message of that thread has the
+// attachment; in every other case it returns miss, the registry's thread_not_found.
+func (s *session) storedThread(ctx context.Context, p api.DownloadParams, miss error) (threadTarget, error) {
+	key, canon, ok := canonicalThreadID(p.ThreadID)
+	if !ok {
+		return threadTarget{}, miss
+	}
+	switch parsed := metaid.ParseMessageID(networkid.MessageID(p.MessageID)).(type) {
+	case metaid.ParsedFBMessageID:
+		if _, _, found := s.indexedMessage(ctx, canon, p.MessageID); found {
+			return threadTarget{id: canon, fbKey: key, tt: table.ONE_TO_ONE}, nil
+		}
+	case metaid.ParsedWAMessageID:
+		st, err := s.ensureStore(ctx)
+		if err != nil {
+			return threadTarget{}, miss
+		}
+		if m, found, err := st.Get(ctx, p.MessageID); err == nil && found && m.ThreadID == canon {
+			return threadTarget{id: canon, fbKey: key, enc: true, chat: parsed.Chat}, nil
+		}
+	}
+	return threadTarget{}, miss
+}
+
 // downloadFB fetches an unencrypted attachment, refreshing its expiring URL once through a message fetch.
 func (s *session) downloadFB(ctx context.Context, t threadTarget, p api.DownloadParams) (api.DownloadResult, error) {
 	refreshed := false
 	for {
 		msg, ts, ok := s.cachedMessage(t.id, p.MessageID)
+		if !ok {
+			msg, ts, ok = s.indexedMessage(ctx, t.id, p.MessageID)
+		}
 		if !ok {
 			return api.DownloadResult{}, api.Errorf(api.CodeMessageNotFound, "message not found")
 		}
@@ -526,6 +609,9 @@ func (s *session) downloadFB(ctx context.Context, t threadTarget, p api.Download
 		}
 		if err := downloadable(att); err != nil {
 			return api.DownloadResult{}, err
+		}
+		if att.Size != nil && *att.Size > maxDownloadBytes {
+			return api.DownloadResult{}, downloadFailure(errTooLarge)
 		}
 		now := time.Now().Unix()
 		if att.ExpiresAt != nil && *att.ExpiresAt-now <= expirySlack && !refreshed {
@@ -607,7 +693,7 @@ func (s *session) downloadE2EE(ctx context.Context, t threadTarget, p api.Downlo
 	dctx, cancel := context.WithTimeout(ctx, downloadTimeout)
 	defer cancel()
 	info, err := writeWith(p.DestPath, maxDownloadBytes, func(f *os.File) error {
-		cf := &cappedFile{File: f, limit: maxDownloadBytes}
+		cf := newCappedFile(f, maxDownloadBytes)
 		err := wa.DownloadFBToFile(dctx, integral, whatsmeow.MediaType(md.MediaType), cf)
 		if cf.tripped.Load() {
 			return errTooLarge

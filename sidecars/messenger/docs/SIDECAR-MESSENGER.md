@@ -4,7 +4,7 @@ Reference for the Go sidecar that gives the meta-mcp daemon a personal Facebook 
 
 ## 1. What it is
 
-The Rust daemon (`meta-mcp personal daemon`) spawns `meta-messenger-sidecar` as a child process, one per Messenger account. It speaks JSON lines on stdin and stdout (one object per line, at most 16 MiB), logs to stderr through a scrubber and listens on no port. Stdin closing ends it with status 0. The daemon sends `hello` first, then ops; the sidecar answers every request once and pushes events in between. One process is one account and one connection set: a Messenger socket plus, once registered, one encrypted-chat socket.
+The Rust daemon (`meta-mcp personal daemon`) spawns `meta-messenger-sidecar` as a child process, one per Messenger account. It speaks JSON lines on stdin and stdout (one object per line, at most 16 MiB), logs to stderr through a scrubber and listens on no port. Stdin closing ends it with status 0. The daemon sends `hello` first, then ops; the sidecar answers every request once and pushes events in between. One process is one account and one connection set: a Messenger socket plus, once registered, one encrypted-chat socket. A second sidecar on the same `data_dir` is refused in its first `hello` with `io` "another sidecar process holds this data_dir".
 
 ## 2. Module layout
 
@@ -14,12 +14,12 @@ Module `github.com/matpb/meta-mcp-rs/sidecars/messenger`.
 |---|---|
 | `main.go` | Entry point: Info-level zerolog through `logscrub`, runs `server.Run` with `engine.NewFactory`. Exit 0 clean, 2 frame violation, 1 I/O error. |
 | `ipc/` | JSON-line framing and the reply writer. |
-| `logscrub/` | Stderr scrubber for cookies, tokens, keys and ids; the code does not log them in the first place. |
+| `logscrub/` | Stderr scrubber: an allowlist of top-level log fields (`level`, `time`, `message`, `op`, `code`, `reason`, `component`, `count`, `event`, `platform`, `thread`, `id`, `state`), every other field is dropped, and URLs, cookies, tokens, long key-like runs, plus-prefixed phone numbers, XML tags with attributes (a protocol node carries push names) and the quoted input of strconv, time, URL and JSON parse errors are cut out of the strings that stay; a JSON line that is malformed, cut off or over 1 MiB becomes one fixed marker line and the rest of an oversized line is discarded. |
 | `api/` | Wire shapes, error codes, `State`, and the `Factory` and `Session` contract between server and engine. |
-| `server/` | Request loop, op validation, login state machine, event sink, error replies. |
-| `engine/` | The session. `session.go` (state, validate, logout), `client.go` (the `metaClient` seam over messagix), `factory.go` (Open), `connect.go`, `backoff.go`, `queue.go` (connect loop and event queue), `classify.go` (library errors to failure verdicts), `cookies.go` (cookie rotation to `state_updated`), `events.go` (tables to events), `threads.go` (thread registry, `list_threads`), `history.go` (message cache, `fetch_messages`), `e2ee.go` (encrypted client), `send.go`, `sendwait.go` (sends, reactions, read, typing, OTID waiter), `media.go` (uploads, downloads, file writer). |
+| `server/` | Request loop, op validation, login state machine, event sink, error replies, the `data_dir` lock (`lock.go`). |
+| `engine/` | The session. `session.go` (state, validate, logout), `client.go` (the `metaClient` seam over messagix), `factory.go` (Open, Wipe), `connect.go`, `backoff.go`, `queue.go` (connect loop and event queue), `classify.go` (library errors to failure verdicts), `cookies.go` (cookie rotation to `state_updated`), `events.go` (tables to events), `threads.go` (thread registry, `list_threads`), `history.go` (message cache, `fetch_messages`), `e2ee.go` (encrypted client), `send.go`, `sendwait.go` (sends, reactions, read, typing, OTID waiter), `media.go` (uploads, downloads, file writer). |
 | `normalize/` | Pure conversion of Lightspeed tables and E2EE events into protocol shapes and ids. |
-| `e2ee/` | `e2ee.db`: whatsmeow device store plus the encrypted message cache. |
+| `e2ee/` | `e2ee.db`: whatsmeow device store, the encrypted message cache, the account binding and the attachment index of unencrypted messages. |
 | `build.sh` | The only supported build. |
 
 ## 3. Build
@@ -43,24 +43,25 @@ Pins in `go.mod`:
 
 | File | Content |
 |---|---|
-| `e2ee.db` | SQLite (WAL, `synchronous=FULL`, so an acked message survives power loss). whatsmeow device keys, Signal sessions and sender keys in the clear, plus the E2EE message cache as plaintext JSON (newest 2000 messages per thread kept) and the encrypted media download records. Treat it like a password and like the messages themselves. Deleted by `logout`. |
-| `threads.json` | Hybrid thread map: Messenger thread key to the shared thread id and thread type. No message content. |
+| `e2ee.db` | SQLite (WAL, `synchronous=FULL`, so an acked message survives power loss). whatsmeow device keys, Signal sessions and sender keys in the clear, plus the E2EE message cache as plaintext JSON (newest 2000 messages per thread kept) and the encrypted media download records. It also records the account (fbid) it belongs to and, for each unencrypted message with downloadable media, the thread, timestamp and attachment metadata including the signed CDN link (newest 10000 kept), so `download_attachment` works after a restart. Opening it for a different account wipes it first, while a file written before accounts were recorded is judged by the JID of its device and otherwise adopted. Treat it like a password and like the messages themselves. Deleted by `logout`. |
+| `threads.json` | Hybrid thread map: Messenger thread key to the shared thread id and thread type, with the account it belongs to (a map of another account is ignored, one without an account is adopted). No message content. |
+| `sidecar.lock` | Empty file, 0600, holding an exclusive `flock` for the life of the process. `logout` leaves it in place. |
 
 `state` (opaque to the daemon, persisted from `state_updated`): `{"cookies": {"c_user": "...", "xs": "...", ...}, "user_agent": "<string>", "fbid": "<c_user>", "e2ee_registered": bool}`. Cookies rotate; the sidecar re-emits the blob when they change. `user_agent` is stored but not applied (section 9).
 
 ## 5. Ops and library calls
 
-Thread ids are the decimal portal id. A thread counts as encrypted when it has a hybrid mapping to another key, sits in an `e2ee_cutover` folder, has `ThreadType` encrypted-over-WA, or has received an E2EE message; routing uses that flag. Message ids are `fb:<mid>` or `wa:<chat>:<sender>:<id>`; a wa id on an unencrypted thread, or the reverse, is `bad_params` "message id does not belong to this thread". An unknown thread id is `thread_not_found`, except a numeric id of a known contact, which is treated as a 1:1.
+Thread ids are the decimal portal id. A thread counts as encrypted when it has a hybrid mapping to another key, sits in an `e2ee_cutover` folder, has `ThreadType` encrypted-over-WA, or has received an E2EE message; routing uses that flag. Message ids are `fb:<mid>` or `wa:<chat>:<sender>:<id>`; a wa id on an unencrypted thread, or the reverse, is `bad_params` "message id does not belong to this thread". Numeric ids are canonicalised before any lookup, so `0333` and `+333` are thread `333` and cannot dodge the encrypted flag. A thread id the registry does not list is `thread_not_found`, also when it is the id of a known contact, because it may be an encrypted chat that is not listed yet and a send must never fall back to plaintext. Encrypted edits and unsends are applied only when the authenticated sender of the event wrote the target message (an unsend may also come from a group admin the sidecar knows from the group info and from promote, demote and leave events); anything else is ignored and logged at info with ids only. Encrypted messages are stored under chat, sender and id, so a peer reusing an id lands on its own row and a redelivery never overwrites a stored message.
 
 | Op | Unencrypted (messagix) | Encrypted (whatsmeow) |
 |---|---|---|
 | `hello`, `ping`, `shutdown` | No library call; `hello` builds the session without network access. | same |
 | `login_start`, `login_finish`, `login_cancel` | Cookie login: `LoadMessagesPage` once to check the account. | none |
 | `connect`, `disconnect` | `Connect` the realtime socket in a loop with backoff; after the first connect `RegisterE2EE` (once) and `PrepareE2EEClient` + `Connect`. | same loop |
-| `logout` | Drops cookies, `threads.json`, `e2ee.db`, caches. | same |
+| `logout` | Drops cookies, then deletes `threads.json`, `e2ee.db` with its journal files and the caches through the factory, with or without a live session; a failed deletion answers `io` after the daemon state was cleared, and `login_start` answers `bad_params` "logout in progress" until it is done; it first waits (at most 20 s) for a session dropped after a fail-closed verdict to finish closing. | same |
 | `list_threads` | `FetchMoreThreads` on sync groups 1 (and 95 when E2EE is active) when the registry is short. | threads join as messages arrive |
-| `fetch_messages` | Cache, else `FetchMessagesTask` with a collector (30 s). | Answered from `e2ee.db`; `has_more` false past the stored range. |
-| `download_attachment` | Cached message, then `mediadl.DownloadMedia` of the CDN URL; on 403, 410 or an `expires_at` within 60 s, one `FetchMessagesTask` page refreshes the URL. | `e2ee.db` media record, then `DownloadFBToFile` into a temp file. |
+| `fetch_messages` | Cache, else `FetchMessagesTask` with a collector (30 s, at most 10 requests per call; at the cap it returns what it has with `has_more` true, or `io` when nothing arrived). | Answered from `e2ee.db`; `has_more` false past the stored range. |
+| `download_attachment` | Cached message or the persistent attachment index, then `mediadl.DownloadMedia` of the CDN URL; on 403, 410 or an `expires_at` within 60 s, one `FetchMessagesTask` page refreshes the URL. | `e2ee.db` media record, then `DownloadFBToFile` into a temp file. |
 | `send_text` | `SendMessageTask` (TEXT) through `ExecuteTasks`, then wait for the OTID outcome. | `SendFBMessage` with a `ConsumerApplication` text, quoted reply key from the wa id. |
 | `send_media` | `SendMercuryUploadRequest`, then `SendMessageTask` (MEDIA, `AttachmentFBIds`, caption as text). Caps: image 8 MB, other 25 MB. | Images only: `Upload`, image transport, `SendFBMessage`. Cap 100 MB. |
 | `send_reaction` | `SendReactionTask` (empty emoji removes). | `SendFBMessage` with a reaction `ConsumerApplication`. |
@@ -73,33 +74,35 @@ Send details:
 - The connector's trailing mark-read task after a send is not copied: sending does not mark the thread read. Use `mark_read`.
 - Encrypted sends use `cli.GenerateMessageID()` (a Facebook-style numeric id), time out after 30 s and write the sent message into `e2ee.db` with `is_me` true, because the server does not echo it back to this device. No `message` event is emitted for the send.
 - Encrypted images carry thumbnail dimensions only, as the connector does: the decoded size clamped to 400 by 400, or 400 by 400 when the size is unknown. Odd PNG color models are re-encoded as NRGBA. GIFs go out as GIF-playback videos. Captions are dropped because Messenger Web does not render captions in encrypted chats.
-- Attachments of kind `link` and `location` are not downloadable. Downloads stream into a temp file in the destination directory (0600), cap at 100 MiB, hash while writing, fsync and rename. Errors never contain the CDN URL.
+- Attachments of kind `link` and `location` are not downloadable. Downloads stream into a temp file in the destination directory (0600), cap at 100 MiB while streaming (also on the encrypted path, where the capped file hides `os.File.ReadFrom` so `io.Copy` cannot skip the check), refuse up front when the advertised size is over the cap, hash while writing, fsync and rename. A `dest_path` that is a symlink, or sits directly in a symlinked directory, is refused with `bad_params` before the download starts and again before the rename. After a restart the thread need not be listed yet when a stored message of that thread carries the attachment. Errors never contain the CDN URL.
 
 ## 6. Events
 
 | Event | When |
 |---|---|
-| `connection` | connecting, connected, disconnected (transient or requested), fatal (rate limit, permanent error). |
+| `connection` | connecting, connected, disconnected (transient or requested), fatal (rate limit, permanent error, `repeated_failures` with action `relogin` after six page loads in a row that failed without a verdict, and the account signals `temporary_ban`, `stream_replaced`, `client_outdated` and `device_removed` from the encrypted client, which also block sending). |
 | `logged_out`, `state_updated` | A fail-closed verdict; `state` null when the stored session must be forgotten. Also when cookies rotate or E2EE registers. |
 | `message` | Live `LSInsertMessage` rows and live E2EE messages, `direction` out for our own account's other devices and for echoes of our unencrypted sends. |
-| `history` | Initial-page, backfill and upserted messages (anything not a live insert), unless a `fetch_messages` collector is consuming them. |
+| `history` | Initial-page, backfill and upserted messages (anything not a live insert), unless a `fetch_messages` collector is consuming them; one thread arrives in events of at most 200 messages and about 4 MiB of JSON, with `complete` only on the last. |
 | `reaction`, `receipt` | Live reaction and read-receipt rows, E2EE reactions and receipts. |
 | `thread` | A thread appears or its name, members, preview or read state changes. |
-| `error` | Non-fatal: `e2ee_unavailable`, `e2ee_logged_out`, `e2ee_cat_refresh`. |
+| `error` | Non-fatal: `e2ee_unavailable`, `e2ee_logged_out`, `e2ee_cat_refresh`, and `internal` when a panic in an event handler or connect cycle was contained (the encrypted handler then does not ack, so the message is redelivered). |
 
 `logged_in` is emitted by the server after `login_finish`; `qr` and the pairing events of the shared protocol are not used by this sidecar. A `FetchMessagesTask` without a cursor uses the current time with an empty reference id; this is not verified against the live server.
 
 ## 7. Errors
 
 Codes are the shared protocol codes. Messages are fixed text: never a cookie, token, key, number, url or message body.
-- Gates: `not_logged_in` when the session was closed or failed closed; `not_connected` when the Messenger socket or the encrypted client is down or cannot send within 15 s; `thread_not_found`, `message_not_found`, `bad_params` (including "unknown attachment" and "file too large for messenger"); `unsupported`; `attachment_expired` when a refreshed link still answers 403 or 410; `io` for local file errors, "attachment exceeds 100 MiB" and failed downloads.
-- Fail-closed (the `logged_out` event carries the reason, `url` when Meta gave one, and the op returns the matching code): `token_invalidated`, `user_id_is_zero`, `dgw_unauthorized`, `account_disabled` (login_failed, state cleared); `checkpoint_required`, `challenge_required`, `consent_required`, `account_suspended` (state kept, the user acts on facebook.com); `account_mismatch` when the cookies belong to another account. The same verdicts apply when E2EE registration or connect fails. After any of these the session refuses ops with `not_logged_in` until a new login. `rate_limited` is a `connection` fatal with action `wait`, not a logout.
+- Request rules, identical in the WhatsApp sidecar: `ping` and `shutdown` are answered before `hello`; any other op before `hello` is `not_initialised`; a second `hello` is `bad_params` "already initialised"; an unknown op is `unsupported` "no such op"; a panic inside an op is `internal` "internal error".
+- Gates: `not_logged_in` when the session was closed or failed closed; `not_connected` when the Messenger socket or the encrypted client is down or cannot send within 15 s; `thread_not_found`, `message_not_found`, `bad_params` (including "unknown attachment" and "file too large for messenger"); `unsupported`; `attachment_expired` when a refreshed link still answers 403 or 410; `io` for local file errors, "attachment exceeds 100 MiB", failed downloads, a failed deletion on `logout` and "another sidecar process holds this data_dir".
+- Fail-closed (the `logged_out` event carries the reason, `url` when Meta gave one, and the op returns the matching code): `token_invalidated` (also for Meta error 1357001, "please log in"), `user_id_is_zero`, `dgw_unauthorized`, `account_disabled` (login_failed, state cleared); `checkpoint_required`, `challenge_required`, `consent_required`, `account_suspended` (state kept, the user acts on facebook.com); `account_mismatch` when the cookies belong to another account. The same verdicts apply when E2EE registration or connect fails. After any of these the session refuses ops with `not_logged_in` until a new login. `rate_limited` is a `connection` fatal with action `wait`, not a logout.
 - Sends: `send_failed` (rejected, or the upload failed), `send_unknown` (outcome unclear after the write), `rate_limited` and the fail-closed codes when the library says so. Encrypted: `ErrServerReturnedError` is `send_failed`, a timeout or any unclassified error is `send_unknown`.
 - A library `ErrPleaseReloadPage` requests a full reconnect, honouring the one hour minimum between full reconnects.
+- A fatal signal from the encrypted client (`TemporaryBan`, `StreamReplaced`, `ClientOutdated`, or a removed device) emits one `connection` fatal with the reason, stops that client for good and blocks sending until the process is restarted: `connect`, `send_text`, `send_media`, `send_reaction`, `mark_read` and `set_typing` answer `not_connected` "sending is blocked (reason)", while reads and downloads keep working and no further connecting or connected event is sent, so the daemon keeps the fatal state it was given.
 
 ## 8. Not in v1
 
-Encrypted `send_media` other than images; encrypted captions; encrypted history from before this device existed (the secure-history PIN restore is deliberately never called, see section 9); the pre-E2EE history of hybrid threads is not merged into the encrypted thread; sending edits or unsends; message requests (accepting or listing); group admin (rename, add, remove, leave); polls; contacts; view-once sends; mentions; disappearing-message timers on encrypted sends; community subthreads.
+Encrypted `send_media` other than images; encrypted captions; encrypted history from before this device existed (the secure-history PIN restore is deliberately never called, see section 9); the pre-E2EE history of hybrid threads is not merged into the encrypted thread; sending edits or unsends; starting a conversation with a contact that has no listed thread; message requests (accepting or listing); group admin (rename, add, remove, leave); polls; contacts; view-once sends; mentions; disappearing-message timers on encrypted sends; community subthreads.
 
 ## 9. Risks
 
@@ -110,3 +113,4 @@ Encrypted `send_media` other than images; encrypted captions; encrypted history 
 - No outbound rate limiter in the sidecar. The daemon must pace sends, reactions and read marks per account.
 - Licensing: mautrix-meta is AGPL-3.0, so the combined binary is AGPL-3.0 and distributing it carries the AGPL source obligations. whatsmeow is MPL-2.0.
 - `e2ee.db` and the cookies in `state` are credentials. Keep `data_dir` 0700 on an encrypted disk.
+- The library calls `os.Exit(1)` on a malformed Lightspeed step (`lightspeed/decode.go`), which no `recover` can catch, so a Meta format change can still end the process with status 1, the same as the sidecar's own I/O error; a panic in a library goroutine ends it with status 2, the same as a frame violation. The daemon restarts the sidecar in both cases.

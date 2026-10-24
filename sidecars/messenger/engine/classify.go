@@ -35,6 +35,7 @@ func loggedOut(reason, code, url string) failure {
 }
 
 // classify maps a library error to a failure. Order matters: ErrUserIDIsZero wraps ErrTokenInvalidated.
+// ErrPleaseLogIn (1357001) is the invalid-login answer of an API call and counts as an invalidated token.
 func classify(err error) failure {
 	if err == nil {
 		return failure{kind: transient, reason: "transient", code: api.CodeIO, action: api.ActionNone}
@@ -44,7 +45,7 @@ func classify(err error) failure {
 	switch {
 	case errors.Is(err, httpclient.ErrUserIDIsZero):
 		return loggedOut("user_id_is_zero", api.CodeLoginFailed, "")
-	case errors.Is(err, httpclient.ErrTokenInvalidated):
+	case errors.Is(err, httpclient.ErrTokenInvalidated), errors.Is(err, types.ErrPleaseLogIn):
 		return loggedOut("token_invalidated", api.CodeLoginFailed, "")
 	case errors.Is(err, httpclient.ErrCheckpointRequired):
 		return loggedOut("checkpoint_required", api.CodeCheckpointRequired, url)

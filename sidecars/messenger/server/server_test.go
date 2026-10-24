@@ -229,7 +229,11 @@ func TestHelloNoSessionAndSecondHello(t *testing.T) {
 		t.Fatalf("unexpected hello result %v", res)
 	}
 	wantErr(t, h.call(h.helloLine(2, "null")), 2, "bad_params")
-	wantErr(t, h.call(h.req(3, "bogus", "null")), 3, "bad_params")
+	rep := h.call(h.req(3, "bogus", "null"))
+	wantErr(t, rep, 3, "unsupported")
+	if rep.Error.Message != "no such op" {
+		t.Fatalf("message %q", rep.Error.Message)
+	}
 	wantErr(t, h.call(h.req(4, "send_text", `{"thread_id":"1","text":"x"}`)), 4, "not_logged_in")
 	wantOK(t, h.call(h.req(5, "disconnect", "null")), 5)
 }

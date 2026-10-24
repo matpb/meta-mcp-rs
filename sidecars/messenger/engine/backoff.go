@@ -3,10 +3,12 @@ package engine
 import "time"
 
 const (
-	backoffMin    = time.Second
 	backoffMax    = 5 * time.Minute
 	backoffStable = 2 * time.Minute
 )
+
+// backoffMin is the first retry delay; tests lower it.
+var backoffMin = time.Second
 
 // backoff doubles from backoffMin to backoffMax; reset after a connection that stayed up backoffStable.
 type backoff struct {

@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"image"
 	"image/color"
@@ -338,7 +339,7 @@ func TestCappedFileRefusesGrowthAndWriteWithCleansUp(t *testing.T) {
 	dest := filepath.Join(dir, "e.bin")
 	var cf *cappedFile
 	_, err := writeWith(dest, 10, func(f *os.File) error {
-		cf = &cappedFile{File: f, limit: 10}
+		cf = newCappedFile(f, 10)
 		if _, err := cf.Write([]byte("12345")); err != nil {
 			t.Fatalf("write within the cap: %v", err)
 		}
@@ -371,7 +372,7 @@ func TestCappedFileLimits(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer f.Close()
-	cf := &cappedFile{File: f, limit: 8}
+	cf := newCappedFile(f, 8)
 	if err := cf.Truncate(8); err != nil {
 		t.Fatalf("truncate to the cap: %v", err)
 	}
@@ -394,3 +395,78 @@ func TestCappedFileLimits(t *testing.T) {
 		t.Fatalf("size %d", st.Size())
 	}
 }
+
+// whatsmeow copies with io.Copy(file, io.TeeReader(body, hasher)); the cap has to hold on that path.
+func TestCappedFileHoldsUnderIOCopy(t *testing.T) {
+	const limit = 1000
+	sources := map[string]func() io.Reader{
+		"tee reader as whatsmeow uses": func() io.Reader {
+			return io.TeeReader(bytes.NewReader(make([]byte, 1<<20)), sha256.New())
+		},
+		"bytes reader with WriteTo": func() io.Reader { return bytes.NewReader(make([]byte, 1<<20)) },
+		"plain reader":              func() io.Reader { return io.LimitReader(zeroReader{}, 1<<20) },
+	}
+	for name, src := range sources {
+		t.Run(name, func(t *testing.T) {
+			f, err := os.CreateTemp(t.TempDir(), "c")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+			cf := newCappedFile(f, limit)
+			n, err := io.Copy(cf, src())
+			if !errors.Is(err, errTooLarge) || !cf.tripped.Load() {
+				t.Fatalf("copied %d bytes, err %v, tripped %v", n, err, cf.tripped.Load())
+			}
+			if st, _ := f.Stat(); st.Size() > limit {
+				t.Fatalf("%d bytes reached the disk, cap is %d", st.Size(), limit)
+			}
+		})
+	}
+}
+
+func TestCappedFileAllowsExactlyTheLimitUnderIOCopy(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	cf := newCappedFile(f, 4096)
+	if n, err := io.Copy(cf, io.TeeReader(bytes.NewReader(make([]byte, 4096)), sha256.New())); err != nil || n != 4096 || cf.tripped.Load() {
+		t.Fatalf("n %d err %v tripped %v", n, err, cf.tripped.Load())
+	}
+}
+
+// Embedding *os.File would promote ReadFrom and WriterTo, which io.Copy prefers over Write.
+func TestCappedFileExposesNoFastCopyPaths(t *testing.T) {
+	var w any = newCappedFile(nil, 1)
+	if _, ok := w.(io.ReaderFrom); ok {
+		t.Fatal("cappedFile implements io.ReaderFrom, so io.Copy can bypass Write")
+	}
+	if _, ok := w.(io.WriterTo); ok {
+		t.Fatal("cappedFile implements io.WriterTo")
+	}
+}
+
+func TestWriteWithStopsAnIOCopyPastTheCapAndCleansUp(t *testing.T) {
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "big.bin")
+	_, err := writeWith(dest, 1000, func(f *os.File) error {
+		cf := newCappedFile(f, 1000)
+		_, err := io.Copy(cf, io.TeeReader(bytes.NewReader(make([]byte, 1<<20)), sha256.New()))
+		if cf.tripped.Load() {
+			return errTooLarge
+		}
+		return err
+	})
+	if !errors.Is(err, errTooLarge) {
+		t.Fatalf("err %v", err)
+	}
+	if names := entries(t, dir); len(names) != 0 {
+		t.Fatalf("files left behind: %v", names)
+	}
+}
+
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) { clear(p); return len(p), nil }

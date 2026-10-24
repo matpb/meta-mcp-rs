@@ -61,6 +61,8 @@ type session struct {
 	validated      *validatedPage
 	loggedOut      bool
 	wiped          bool
+	blocked        string
+	pageFails      int
 	cyc            *cycle
 	runCancel      context.CancelFunc
 	runDone        chan struct{}
@@ -92,7 +94,7 @@ func newSession(f *factory, state api.State, dataDir string, sink api.Sink, jar 
 		recycle:        make(chan bool, 1),
 	}
 	s.me.Store(me)
-	s.reg = newRegistry(dataDir, me, s.names.get)
+	s.reg = newRegistry(dataDir, state.FBID, me, s.names.get)
 	s.watch = newStateWatch(state, s.State, func(st api.State) {
 		s.emit(api.EvStateUpdated, api.StateUpdatedEvent{State: &st})
 	})
@@ -106,7 +108,12 @@ func (s *session) emit(name string, data any) {
 	s.sink(name, data)
 }
 
+// emitConn reports a connection change; after a fatal account signal only fatal events follow, so the
+// daemon keeps the state it already holds.
 func (s *session) emitConn(state, reason, action string) {
+	if state != api.ConnFatal && s.blockedReason() != "" {
+		return
+	}
 	s.emit(api.EvConnection, api.ConnectionEvent{State: state, Reason: reason, Action: action})
 }
 
@@ -249,14 +256,34 @@ func (s *session) Logout(ctx context.Context) error {
 	s.wiped = true
 	s.e2eeRegistered = false
 	s.mu.Unlock()
-	werr := e2ee.Wipe(s.dataDir)
-	terr := s.reg.wipe()
+	err := s.f.Wipe(s.dataDir)
+	s.reg.forget()
 	s.hist.reset()
 	s.watch.reset(s.State())
-	if werr != nil || terr != nil {
+	if err != nil {
 		return api.Errorf(api.CodeIO, "failed to delete local session data")
 	}
 	return nil
+}
+
+// blockedReason is the fatal account signal that stopped sending, or "".
+func (s *session) blockedReason() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.blocked
+}
+
+// guard runs fn; a panic is contained, logged without its value and reported as an error event.
+func (s *session) guard(what string, fn func()) (panicked bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			panicked = true
+			s.log.Error().Str("op", what).Msg("panic contained")
+			s.emit(api.EvError, api.ErrorEvent{Code: api.CodeInternal, Message: "an internal error was contained"})
+		}
+	}()
+	fn()
+	return false
 }
 
 func (m *msgCache) reset() {

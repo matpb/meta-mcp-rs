@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +18,15 @@ import (
 	"github.com/rs/zerolog"
 	zlog "github.com/rs/zerolog/log"
 )
+
+// TestMain removes the sidecar binary that sidecarBinary built for the run.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if binPath != "" {
+		_ = os.RemoveAll(filepath.Dir(binPath))
+	}
+	os.Exit(code)
+}
 
 func TestLoggerIsScrubbedAndInfoOnly(t *testing.T) {
 	var dst bytes.Buffer
@@ -182,6 +192,45 @@ func TestBinaryHelloPingShutdown(t *testing.T) {
 	}
 	if code := p.exitCode(t); code != 0 {
 		t.Fatalf("exit status %d", code)
+	}
+}
+
+// M4: two real processes on one data_dir; the second is refused until the first has exited.
+func TestBinarySecondProcessOnTheSameDataDirIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	hello := func(id int) string {
+		return `{"id":` + strconv.Itoa(id) + `,"op":"hello","params":{"protocol":1,"platform":"messenger","data_dir":` + quote(dir) + `,"state":null}}` + "\n"
+	}
+	a, b := spawn(t), spawn(t)
+	wantReady(t, a)
+	wantReady(t, b)
+	if _, err := io.WriteString(a.in, hello(1)); err != nil {
+		t.Fatal(err)
+	}
+	if f := a.frame(t); f["ok"] != true {
+		t.Fatalf("first process: %v", f)
+	}
+	if _, err := io.WriteString(b.in, hello(1)); err != nil {
+		t.Fatal(err)
+	}
+	f := b.frame(t)
+	errBody, _ := f["error"].(map[string]any)
+	if f["ok"] != false || errBody["code"] != "io" || errBody["message"] != "another sidecar process holds this data_dir" {
+		t.Fatalf("second process: %v", f)
+	}
+	_ = a.in.Close()
+	if code := a.exitCode(t); code != 0 {
+		t.Fatalf("first process exit status %d", code)
+	}
+	if _, err := io.WriteString(b.in, hello(2)); err != nil {
+		t.Fatal(err)
+	}
+	if f := b.frame(t); f["ok"] != true {
+		t.Fatalf("second process after the first exited: %v", f)
+	}
+	_ = b.in.Close()
+	if code := b.exitCode(t); code != 0 {
+		t.Fatalf("second process exit status %d", code)
 	}
 }
 

@@ -24,6 +24,7 @@ const (
 	libraryModule   = "go.mau.fi/mautrix-meta"
 	eofDrain        = 40 * time.Second
 	shutdownDrain   = 5 * time.Second
+	dropWait        = 20 * time.Second
 )
 
 // ErrFrame marks a protocol violation by the writer, which main turns into exit status 2.
@@ -54,10 +55,13 @@ type server struct {
 	mu          sync.Mutex
 	initialised bool
 	dataDir     string
+	lock        *dirLock
 	sess        api.Session
 	login       int
 	loginGen    uint64
 	loginCancel context.CancelFunc
+	loggingOut  int
+	dropping    map[chan struct{}]struct{}
 }
 
 // Run emits the ready event, then serves requests from in until shutdown, EOF or ctx ends.
@@ -81,6 +85,7 @@ func run(ctx context.Context, in io.Reader, out io.Writer, log zerolog.Logger, f
 		cancel()
 		s.wait(shutdownDrain)
 		s.closeSession()
+		s.releaseLock()
 	}()
 
 	if err := s.w.Write(event("ready", map[string]any{"pid": os.Getpid(), "protocol": protocolVersion})); err != nil {
@@ -141,6 +146,7 @@ func run(ctx context.Context, in io.Reader, out io.Writer, log zerolog.Logger, f
 }
 
 // handle routes one request. hello, shutdown and the login steps run inline, the rest asynchronously.
+// Before hello only ping and shutdown are answered; anything else is not_initialised.
 func (s *server) handle(req ipc.Request) (stop bool, err error) {
 	switch req.Op {
 	case "ping":
@@ -148,18 +154,22 @@ func (s *server) handle(req ipc.Request) (stop bool, err error) {
 	case "shutdown":
 		return true, s.reply(req.Op, ok(req.ID, struct{}{}))
 	case "hello":
-		return false, s.reply(req.Op, s.hello(req))
+		return false, s.reply(req.Op, s.inline(req, func() ipc.Reply { return s.hello(req) }))
 	}
 	if !s.isInitialised() {
 		return false, s.reply(req.Op, fail(req.ID, api.CodeNotInitialised, "hello must be the first request"))
 	}
 	switch req.Op {
 	case "login_start":
-		return false, s.reply(req.Op, s.loginStart(req))
+		return false, s.reply(req.Op, s.inline(req, func() ipc.Reply { return s.loginStart(req) }))
 	case "login_cancel":
-		return false, s.reply(req.Op, s.loginCancelOp(req))
+		return false, s.reply(req.Op, s.inline(req, func() ipc.Reply { return s.loginCancelOp(req) }))
 	case "login_finish":
-		rep, work := s.loginFinish(req)
+		var work func() ipc.Reply
+		rep := s.inline(req, func() (r ipc.Reply) {
+			r, work = s.loginFinish(req)
+			return r
+		})
 		if work == nil {
 			return false, s.reply(req.Op, rep)
 		}
@@ -168,10 +178,21 @@ func (s *server) handle(req ipc.Request) (stop bool, err error) {
 	}
 	h := s.asyncHandler(req.Op)
 	if h == nil {
-		return false, s.reply(req.Op, fail(req.ID, api.CodeBadParams, "unknown op"))
+		return false, s.reply(req.Op, fail(req.ID, api.CodeUnsupported, "no such op"))
 	}
 	s.spawn(req, func() ipc.Reply { return h(s.ctx, req) })
 	return false, nil
+}
+
+// inline runs an op on the reader goroutine; a panic becomes an internal error reply.
+func (s *server) inline(req ipc.Request, fn func() ipc.Reply) (rep ipc.Reply) {
+	defer func() {
+		if recover() != nil {
+			s.log.Error().Str("op", req.Op).Msg("handler panicked")
+			rep = fail(req.ID, api.CodeInternal, "internal error")
+		}
+	}()
+	return fn()
 }
 
 // spawn runs fn in its own goroutine and writes its reply; a panic becomes an internal error reply.
@@ -229,6 +250,15 @@ func (s *server) emit(name string, data any) {
 	if err := s.w.Write(event(name, data)); err != nil {
 		s.log.Error().Str("event", name).Msg("event write failed")
 	}
+}
+
+// releaseLock drops the data_dir lock at shutdown.
+func (s *server) releaseLock() {
+	s.mu.Lock()
+	l := s.lock
+	s.lock = nil
+	s.mu.Unlock()
+	l.release()
 }
 
 // closeSession disconnects and closes the current session, if any.
@@ -303,7 +333,8 @@ func (s *server) install(sess api.Session, ref *sinkRef, gen *uint64) error {
 	return nil
 }
 
-// dropIf forgets sess when it is still current and closes it in the background.
+// dropIf forgets sess when it is still current and closes it in the background; Close goes first so a
+// dying session writes nothing more to the data dir, and logout waits for it (see waitDropped).
 func (s *server) dropIf(sess api.Session) {
 	s.mu.Lock()
 	if s.sess != sess {
@@ -312,11 +343,43 @@ func (s *server) dropIf(sess api.Session) {
 	}
 	s.sess = nil
 	s.login = loginNone
+	done := make(chan struct{})
+	if s.dropping == nil {
+		s.dropping = map[chan struct{}]struct{}{}
+	}
+	s.dropping[done] = struct{}{}
 	s.mu.Unlock()
 	go func() {
-		sess.Disconnect()
+		defer func() {
+			if recover() != nil {
+				s.log.Error().Str("op", "drop").Msg("handler panicked")
+			}
+			s.mu.Lock()
+			delete(s.dropping, done)
+			s.mu.Unlock()
+			close(done)
+		}()
 		sess.Close()
+		sess.Disconnect()
 	}()
+}
+
+// waitDropped blocks until the sessions that were dropped in the background are closed, for at most dropWait.
+func (s *server) waitDropped() {
+	s.mu.Lock()
+	pending := make([]chan struct{}, 0, len(s.dropping))
+	for ch := range s.dropping {
+		pending = append(pending, ch)
+	}
+	s.mu.Unlock()
+	timeout := time.After(dropWait)
+	for _, ch := range pending {
+		select {
+		case <-ch:
+		case <-timeout:
+			return
+		}
+	}
 }
 
 type helloParams struct {
@@ -350,6 +413,19 @@ func (s *server) hello(req ipc.Request) ipc.Reply {
 			return fail(req.ID, api.CodeBadParams, "state is invalid")
 		}
 	}
+	lock, err := lockDataDir(p.DataDir)
+	if err != nil {
+		if errors.Is(err, errDirLocked) {
+			return fail(req.ID, api.CodeIO, "another sidecar process holds this data_dir")
+		}
+		return fail(req.ID, api.CodeIO, "could not lock data_dir")
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			lock.release()
+		}
+	}()
 	var acct any
 	if st != nil {
 		sink, ref := s.newSink()
@@ -360,14 +436,18 @@ func (s *server) hello(req ipc.Request) ipc.Reply {
 		s.mu.Lock()
 		s.initialised = true
 		s.dataDir = p.DataDir
+		s.lock = lock
 		s.mu.Unlock()
+		committed = true
 		s.install(sess, ref, nil)
 		acct = api.Account{ID: st.FBID}
 	} else {
 		s.mu.Lock()
 		s.initialised = true
 		s.dataDir = p.DataDir
+		s.lock = lock
 		s.mu.Unlock()
+		committed = true
 	}
 	return ok(req.ID, map[string]any{
 		"protocol":        protocolVersion,
@@ -389,7 +469,7 @@ func checkDataDir(dir string, log zerolog.Logger) string {
 		return "data_dir must be an existing directory"
 	}
 	if fi.Mode().Perm() != 0o700 {
-		log.Warn().Str("mode", fi.Mode().Perm().String()).Msg("data_dir mode is not 0700")
+		log.Warn().Msg("data_dir mode is not 0700")
 	}
 	return ""
 }
