@@ -4,17 +4,25 @@ mod common;
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use common::{Session, TempHome, blocking, mock_graph, tool_json, tool_text};
+use common::{
+    Session, TempHome, blocking, free_port, graph_base, jpeg_image, mock_graph, png_image,
+    polyglot_bodies, tool_json, tool_text,
+};
 use meta_mcp::config::{Config, PageConfig, Secret};
 use meta_mcp::graph::GraphClient;
-use meta_mcp::messenger::{ListConversationsParams, Messenger};
+use meta_mcp::messenger::{
+    DownloadAttachmentParams, ListConversationsParams, Messenger, SendAttachmentParams,
+    SendTextParams,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use wiremock::matchers::{any, body_json, header, method, path, query_param};
+use wiremock::matchers::{
+    any, body_json, body_partial_json, header, method, path, path_regex, query_param,
+};
 use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
 
 const TOKEN: &str = "EAAtest0123456789ABCDEFGHIJKLMNOP";
@@ -59,7 +67,17 @@ async fn call_many(
     files: Option<&Path>,
     calls: Vec<(&'static str, Value)>,
 ) -> Vec<Value> {
-    let uri = graph.uri();
+    call_many_env(graph, files, "127.0.0.1", calls).await
+}
+
+/// `call_many` with the operator's `META_MCP_DOWNLOAD_HOSTS` list given.
+async fn call_many_env(
+    graph: &MockServer,
+    files: Option<&Path>,
+    download_hosts: &'static str,
+    calls: Vec<(&'static str, Value)>,
+) -> Vec<Value> {
+    let uri = graph_base(&graph.uri());
     let files = files.map(|p| p.display().to_string());
     blocking(move || {
         let home = TempHome::new();
@@ -67,7 +85,7 @@ async fn call_many(
             ("META_PAGE_ACCESS_TOKEN", TOKEN),
             ("META_PAGE_ID", PAGE),
             ("META_APP_SECRET", "secret"),
-            ("META_MCP_DOWNLOAD_HOSTS", "127.0.0.1"),
+            ("META_MCP_DOWNLOAD_HOSTS", download_hosts),
         ];
         if let Some(dir) = files.as_deref() {
             envs.push(("META_MCP_FILES_DIR", dir));
@@ -92,22 +110,37 @@ fn files_dir() -> tempfile::TempDir {
 }
 
 fn library(graph: &MockServer, files: &Path, page_id: &str) -> Messenger {
+    library_with(graph, files, page_id, "127.0.0.1", None)
+}
+
+fn config_for(graph: &MockServer, files: &Path, page_id: &str, config_hosts: &str) -> Config {
     let home = tempfile::tempdir().expect("home");
     let vars: HashMap<&str, String> = HashMap::from([
-        ("META_GRAPH_BASE_URL", graph.uri()),
+        ("META_GRAPH_BASE_URL", graph_base(&graph.uri())),
         ("META_PAGE_ACCESS_TOKEN", TOKEN.to_string()),
         ("META_PAGE_ID", page_id.to_string()),
         ("META_APP_SECRET", "secret".to_string()),
         ("META_MCP_FILES_DIR", files.display().to_string()),
-        ("META_MCP_DOWNLOAD_HOSTS", "127.0.0.1".to_string()),
+        ("META_MCP_DOWNLOAD_HOSTS", config_hosts.to_string()),
         (
             "META_MCP_INBOX_DB",
             home.path().join("inbox.db").display().to_string(),
         ),
     ]);
-    let cfg = Config::from_lookup(|k| vars.get(k).cloned(), Some(home.path().to_path_buf()))
-        .expect("config");
-    let client = GraphClient::new(&cfg.graph, cfg.download_hosts.clone()).expect("client");
+    Config::from_lookup(|k| vars.get(k).cloned(), Some(home.path().to_path_buf())).expect("config")
+}
+
+/// `config_hosts` is the operator's download list; `client_hosts` replaces the Graph client's own.
+fn library_with(
+    graph: &MockServer,
+    files: &Path,
+    page_id: &str,
+    config_hosts: &str,
+    client_hosts: Option<Vec<String>>,
+) -> Messenger {
+    let cfg = config_for(graph, files, page_id, config_hosts);
+    let hosts = client_hosts.unwrap_or_else(|| cfg.download_hosts.clone());
+    let client = GraphClient::new(&cfg.graph, hosts).expect("client");
     Messenger::new(Arc::new(cfg), Arc::new(client))
 }
 
@@ -1244,7 +1277,7 @@ async fn download_attachment_saves_and_inlines_image() {
     assert_eq!(content[1]["mimeType"], json!("image/png"));
     assert_eq!(content[1]["data"], json!(PNG_B64));
     let v = tool_json(first);
-    let saved = files.path().join("cat photo.png");
+    let saved = files.path().join("inbound/messenger/cat photo.png");
     assert_eq!(
         std::fs::canonicalize(v["path"].as_str().expect("path")).expect("saved path"),
         std::fs::canonicalize(&saved).expect("file in the jail")
@@ -1264,7 +1297,7 @@ async fn download_attachment_saves_and_inlines_image() {
             .len(),
         1
     );
-    let renamed = files.path().join("shot.png");
+    let renamed = files.path().join("inbound/messenger/shot.png");
     assert_eq!(std::fs::read(renamed).expect("sanitised name"), bytes);
     assert!(
         !files
@@ -1372,7 +1405,7 @@ async fn download_does_not_inline_non_images_or_big_images_and_never_overwrites_
             .contains("2 MiB")
     );
     assert_eq!(
-        std::fs::metadata(files.path().join("big.png"))
+        std::fs::metadata(files.path().join("inbound/messenger/big.png"))
             .expect("big")
             .len(),
         big.len() as u64
@@ -1471,7 +1504,7 @@ async fn download_retries_with_token_on_403_only_for_meta_hosts() {
     let v = tool_json(&out[0]);
     assert_eq!(v["mime"], json!("image/jpeg"));
     assert_eq!(
-        std::fs::read(files.path().join("secret.jpg")).expect("saved"),
+        std::fs::read(files.path().join("inbound/messenger/secret.jpg")).expect("saved"),
         jpeg
     );
     assert!(
@@ -1889,6 +1922,7 @@ async fn tools_list_includes_messenger_tools() {
         (
             "messenger_send_attachment",
             &[
+                "allow_inbound",
                 "conversation_id",
                 "is_reusable",
                 "kind",
@@ -2066,4 +2100,792 @@ async fn read_only_hides_messenger_write_tools() {
             "{shown} missing in {names:?}"
         );
     }
+}
+
+// ---- review fixes: token scope, inline images, inbound files, names, retries and ids ---------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_graph_host_is_never_fetched_and_never_gets_the_page_token() {
+    let graph = mock_graph().await;
+    let port = graph.address().port();
+    let base = graph_base(&graph.uri());
+    let node = format!("/v26.0/{PAGE}");
+    Mock::given(method("GET"))
+        .and(path(node.clone()))
+        .and(|req: &Request| !req.headers.contains_key("authorization"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(graph_error(
+            200,
+            None,
+            "(#200) Provide valid app ID",
+        )))
+        .mount(&graph)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(node.clone()))
+        .and(header("authorization", format!("Bearer {TOKEN}")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"access_token": "PAGE-SECRET"})),
+        )
+        .mount(&graph)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v26.0/m_graph"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "m_graph",
+            "attachments": {"data": [{"id": "a1", "mime_type": "application/pdf", "name": "x.pdf",
+                "file_url": format!("{base}{node}?fields=access_token")}]}
+        })))
+        .mount(&graph)
+        .await;
+    let files = files_dir();
+    let leaked = format!("{base}{node}?fields=access_token");
+    let out = call_many_env(
+        &graph,
+        Some(files.path()),
+        "localhost,127.0.0.1",
+        vec![
+            ("messenger_download_attachment", json!({"url": leaked})),
+            (
+                "messenger_download_attachment",
+                json!({"url": format!("{base}{node}/conversations?fields=messages")}),
+            ),
+            (
+                "messenger_download_attachment",
+                json!({"url": format!("http://LOCALHOST:{port}{node}")}),
+            ),
+            (
+                "messenger_download_attachment",
+                json!({"message_id": "m_graph"}),
+            ),
+        ],
+    )
+    .await;
+    for resp in &out {
+        assert!(is_error(resp), "{resp}");
+        let text = tool_text(resp);
+        assert!(
+            text.contains("Graph API host") && !text.contains("PAGE-SECRET"),
+            "{text}"
+        );
+    }
+    let sent = requests(&graph).await;
+    assert_eq!(
+        sent.len(),
+        1,
+        "only the message lookup of the last call: {:?}",
+        sent.iter().map(|r| r.url.path()).collect::<Vec<_>>()
+    );
+    assert_eq!(sent[0].url.path(), "/v26.0/m_graph");
+    assert!(!files.path().join("inbound").exists(), "nothing was saved");
+}
+
+// Kills the mutant that deletes the token_host_allowed guard at the retry site: the retry would
+// carry the Page token to a host the operator never listed.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_page_token_is_retried_only_on_token_hosts() {
+    let graph = mock_graph().await;
+    let port = graph.address().port();
+    for name in ["guarded.jpg", "allowed.jpg"] {
+        Mock::given(method("GET"))
+            .and(path(format!("/cdn/{name}")))
+            .and(|req: &Request| !req.headers.contains_key("authorization"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&graph)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/cdn/{name}")))
+            .and(header("authorization", format!("Bearer {TOKEN}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(jpeg_image())
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .mount(&graph)
+            .await;
+    }
+    let params = |name: &str| DownloadAttachmentParams {
+        url: Some(format!("http://127.0.0.1:{port}/cdn/{name}")),
+        inline: Some(false),
+        ..DownloadAttachmentParams::default()
+    };
+    let files = files_dir();
+
+    // the download layer may fetch from 127.0.0.1 but the operator's list does not name it
+    let strict = library_with(
+        &graph,
+        files.path(),
+        "PAGE_GUARD_A",
+        "",
+        Some(vec!["127.0.0.1".into()]),
+    );
+    let err = strict
+        .download_attachment(params("guarded.jpg"))
+        .await
+        .expect_err("the 403 stays an error");
+    assert!(err.to_string().contains("403"), "{err}");
+    let sent = requests(&graph).await;
+    assert_eq!(sent.len(), 1, "no second attempt");
+    assert!(sent.iter().all(|r| header_of(r, "authorization").is_none()));
+    assert!(!files.path().join("inbound").exists());
+
+    // a host the operator listed gets one retry with the token
+    let listed = library_with(&graph, files.path(), "PAGE_GUARD_B", "127.0.0.1", None);
+    listed
+        .download_attachment(params("allowed.jpg"))
+        .await
+        .expect("retried with the token");
+    let sent = requests(&graph).await;
+    assert_eq!(sent.len(), 3);
+    assert!(header_of(&sent[1], "authorization").is_none());
+    assert_eq!(
+        header_of(&sent[2], "authorization"),
+        Some(format!("Bearer {TOKEN}"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_page_token_does_not_follow_a_redirect_to_another_port() {
+    let graph = mock_graph().await;
+    let other = mock_graph().await;
+    Mock::given(method("GET"))
+        .and(path("/cdn/hop.jpg"))
+        .and(|req: &Request| !req.headers.contains_key("authorization"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&graph)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/cdn/hop.jpg"))
+        .and(header("authorization", format!("Bearer {TOKEN}")))
+        .respond_with(ResponseTemplate::new(302).insert_header(
+            "location",
+            format!("http://127.0.0.1:{}/final.jpg", other.address().port()),
+        ))
+        .mount(&graph)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/final.jpg"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(jpeg_image())
+                .insert_header("content-type", "image/jpeg"),
+        )
+        .mount(&other)
+        .await;
+    let files = files_dir();
+    let m = library(&graph, files.path(), "PAGE_HOP");
+    let url = format!("http://127.0.0.1:{}/cdn/hop.jpg", graph.address().port());
+    m.download_attachment(DownloadAttachmentParams {
+        url: Some(url),
+        inline: Some(false),
+        ..DownloadAttachmentParams::default()
+    })
+    .await
+    .expect("the retry followed the redirect");
+    let first = requests(&graph).await;
+    assert_eq!(first.len(), 2);
+    assert!(header_of(&first[1], "authorization").is_some());
+    let second = requests(&other).await;
+    assert_eq!(second.len(), 1);
+    assert!(
+        header_of(&second[0], "authorization").is_none(),
+        "the same host on another port gets no token"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn polyglot_downloads_are_saved_but_not_shown() {
+    let graph = mock_graph().await;
+    let mut bodies = polyglot_bodies();
+    bodies.push(("real_png", png_image()));
+    for (label, body) in &bodies {
+        Mock::given(method("GET"))
+            .and(path(format!("/cdn/{label}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body.clone())
+                    .insert_header("content-type", "image/png"),
+            )
+            .mount(&graph)
+            .await;
+    }
+    let base = graph.uri();
+    let files = files_dir();
+    let calls = bodies
+        .iter()
+        .map(|(label, _)| {
+            (
+                "messenger_download_attachment",
+                json!({"url": format!("{base}/cdn/{label}")}),
+            )
+        })
+        .collect();
+    let out = call_many(&graph, Some(files.path()), calls).await;
+    for ((label, body), resp) in bodies.iter().zip(&out) {
+        assert!(!is_error(resp), "{label}: {resp}");
+        let blocks = resp["result"]["content"].as_array().expect("content");
+        let v = tool_json(resp);
+        let saved = files.path().join(format!("inbound/messenger/{label}.png"));
+        assert_eq!(&std::fs::read(&saved).expect("saved"), body, "{label}");
+        if *label == "real_png" {
+            assert_eq!(blocks.len(), 2, "a real picture is shown");
+            assert!(v.get("note").is_none());
+        } else {
+            assert_eq!(blocks.len(), 1, "{label} must not become an image block");
+            let note = v["note"].as_str().expect("note");
+            assert!(
+                note.contains("saved but not shown") && note.contains("not a well-formed one"),
+                "{label}: {note}"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn downloads_stay_in_the_inbound_folder_and_are_not_resent_by_accident() {
+    let graph = mock_graph().await;
+    Mock::given(method("GET"))
+        .and(path("/cdn/id-scan.pdf"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(b"%PDF-1.7 customer A passport".to_vec())
+                .insert_header("content-type", "application/pdf"),
+        )
+        .mount(&graph)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v26.0/{PAGE}/message_attachments")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"attachment_id": "ATT"})))
+        .expect(2)
+        .mount(&graph)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v26.0/{PAGE}/messages")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "recipient_id": "CUSTOMER_B", "message_id": "m_b"})))
+        .expect(2)
+        .mount(&graph)
+        .await;
+    let files = files_dir();
+    std::fs::create_dir(files.path().join("mine")).expect("mkdir");
+    std::fs::write(files.path().join("mine/own.pdf"), b"%PDF-1.7 our own file").expect("fixture");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(
+        files.path().join("inbound/messenger"),
+        files.path().join("alias"),
+    )
+    .expect("symlink");
+    let absolute = files
+        .path()
+        .join("inbound/messenger/id-scan.pdf")
+        .display()
+        .to_string();
+    let send = |path: &str, allow: Option<bool>| {
+        let mut args = json!({"kind": "file", "path": path, "recipient_psid": "CUSTOMER_B"});
+        if let Some(allow) = allow {
+            args["allow_inbound"] = json!(allow);
+        }
+        ("messenger_send_attachment", args)
+    };
+    let out = call_many(
+        &graph,
+        Some(files.path()),
+        vec![
+            (
+                "messenger_download_attachment",
+                json!({"url": format!("{}/cdn/id-scan.pdf", graph.uri()), "inline": false}),
+            ),
+            send("inbound/messenger/id-scan.pdf", None),
+            send(&absolute, None),
+            send("mine/../inbound/messenger/id-scan.pdf", Some(false)),
+            send("alias/id-scan.pdf", None),
+            send("mine/own.pdf", None),
+            send("inbound/messenger/id-scan.pdf", Some(true)),
+        ],
+    )
+    .await;
+    let saved = files.path().join("inbound/messenger/id-scan.pdf");
+    assert_eq!(
+        std::fs::read(&saved).expect("saved"),
+        b"%PDF-1.7 customer A passport"
+    );
+    let v = tool_json(&out[0]);
+    assert_eq!(
+        std::fs::canonicalize(v["path"].as_str().expect("path")).expect("path"),
+        std::fs::canonicalize(&saved).expect("saved")
+    );
+    let refusals = if cfg!(unix) { 1..5 } else { 1..4 };
+    for resp in &out[refusals] {
+        assert!(is_error(resp), "{resp}");
+        let text = tool_text(resp);
+        assert!(
+            text.contains("other people") && text.contains("allow_inbound"),
+            "{text}"
+        );
+    }
+    assert!(!is_error(&out[5]), "{}", out[5]);
+    assert!(!is_error(&out[6]), "{}", out[6]);
+    let uploads: Vec<String> = requests(&graph)
+        .await
+        .into_iter()
+        .filter(|r| r.url.path().ends_with("message_attachments"))
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .collect();
+    assert_eq!(uploads.len(), 2, "the refused calls never reached Meta");
+    assert!(uploads[0].contains("our own file") && !uploads[0].contains("passport"));
+    assert!(uploads[1].contains("customer A passport"));
+    graph.verify().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn derived_names_are_safe_short_and_distinct_per_url() {
+    let graph = mock_graph().await;
+    Mock::given(method("GET"))
+        .and(path_regex("^/cdn/.*"))
+        .respond_with(|req: &Request| {
+            ResponseTemplate::new(200)
+                .set_body_bytes(req.url.path().as_bytes().to_vec())
+                .insert_header("content-type", "application/octet-stream")
+        })
+        .mount(&graph)
+        .await;
+    let base = graph.uri();
+    let files = files_dir();
+    let wide = "%E3%81%82".repeat(100);
+    let url_b = format!("{base}/cdn/b/photo.jpg");
+    let tag_b = hex::encode(&Sha256::digest(url_b.as_bytes())[..4]);
+    let download = |args: Value| ("messenger_download_attachment", args);
+    let out = call_many(
+        &graph,
+        Some(files.path()),
+        vec![
+            download(json!({"url": format!("{base}/cdn/a/photo.jpg")})),
+            download(json!({"url": url_b})),
+            download(json!({"url": format!("{base}/cdn/a/photo.jpg")})),
+            download(json!({"url": url_b})),
+            download(json!({"url": format!("{base}/cdn/c/photo.jpg"), "dest_name": "photo.jpg"})),
+            download(json!({"url": format!("{base}/cdn/invoice%E2%80%AEgpj.exe")})),
+            download(json!({"url": format!("{base}/cdn/CON")})),
+            download(json!({"url": format!("{base}/cdn/{wide}.pdf")})),
+            download(json!({"url": format!("{base}/cdn/a/photo.jpg"), "overwrite": true})),
+        ],
+    )
+    .await;
+    let first = tool_json(&out[0]);
+    assert!(first.get("name_note").is_none());
+    let second = tool_json(&out[1]);
+    assert!(
+        second["path"]
+            .as_str()
+            .expect("path")
+            .ends_with(&format!("photo-{tag_b}.jpg")),
+        "{second}"
+    );
+    assert!(
+        second["name_note"]
+            .as_str()
+            .expect("note")
+            .contains("URL hash")
+    );
+    for repeat in [&out[2], &out[3], &out[4]] {
+        assert!(
+            is_error(repeat) && tool_text(repeat).contains("already exists"),
+            "{repeat}"
+        );
+    }
+    for resp in [&out[5], &out[6], &out[7], &out[8]] {
+        assert!(!is_error(resp), "{resp}");
+    }
+    let mut names: Vec<String> = std::fs::read_dir(files.path().join("inbound/messenger"))
+        .expect("dir")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    let mut expected = vec![
+        "_CON".to_string(),
+        "invoice_gpj.exe".to_string(),
+        format!("photo-{tag_b}.jpg"),
+        "photo.jpg".to_string(),
+        format!("{}.pdf", "\u{3042}".repeat(65)),
+    ];
+    expected.sort();
+    assert_eq!(names, expected);
+    assert_eq!(
+        std::fs::read(files.path().join("inbound/messenger/photo.jpg")).expect("a"),
+        b"/cdn/a/photo.jpg"
+    );
+    assert_eq!(
+        std::fs::read(
+            files
+                .path()
+                .join(format!("inbound/messenger/photo-{tag_b}.jpg"))
+        )
+        .expect("b"),
+        b"/cdn/b/photo.jpg",
+        "the second URL did not replace the first file"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_psid_cache_is_kept_per_page() {
+    const TOKEN_B: &str = "EAAtokenB0123456789ABCDEFGHIJKLMNOPQ";
+    let graph = mock_graph().await;
+    for (token, page, psid) in [
+        (TOKEN, "PAGE_ISO_A", "PSID_OF_A"),
+        (TOKEN_B, "PAGE_ISO_B", "PSID_OF_B"),
+    ] {
+        Mock::given(method("GET"))
+            .and(path("/v26.0/t_iso_shared"))
+            .and(header("authorization", format!("Bearer {token}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "participants": {"data": [{"id": page}, {"id": psid}]}})))
+            .expect(1)
+            .mount(&graph)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/v26.0/{page}/messages")))
+            .and(body_partial_json(json!({"recipient": {"id": psid}})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "recipient_id": psid, "message_id": format!("m_{page}")})))
+            .expect(2)
+            .mount(&graph)
+            .await;
+    }
+    let files = files_dir();
+    let mut cfg = config_for(&graph, files.path(), "PAGE_ISO_A", "");
+    cfg.pages.push(PageConfig {
+        id: "PAGE_ISO_B".into(),
+        name: String::new(),
+        token: Secret::new(TOKEN_B),
+    });
+    let client = GraphClient::new(&cfg.graph, Vec::new()).expect("client");
+    let m = Messenger::new(Arc::new(cfg), Arc::new(client));
+    for round in 0..2 {
+        for (page, psid) in [("PAGE_ISO_A", "PSID_OF_A"), ("PAGE_ISO_B", "PSID_OF_B")] {
+            let params = SendTextParams {
+                text: "hi".into(),
+                conversation_id: Some("t_iso_shared".into()),
+                page_id: Some(page.into()),
+                ..SendTextParams::default()
+            };
+            let sent = m
+                .send_text(params)
+                .await
+                .unwrap_or_else(|e| panic!("round {round}, {page}: {e}"));
+            assert_eq!(sent["recipient_id"], json!(psid), "round {round}, {page}");
+        }
+    }
+    graph.verify().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retried_conversation_read_still_waits_for_the_page_spacing() {
+    let graph = mock_graph().await;
+    let arrivals: Arc<Mutex<Vec<Instant>>> = Arc::default();
+    let seen = arrivals.clone();
+    Mock::given(method("GET"))
+        .and(path("/v26.0/PAGE_RETRY/conversations"))
+        .respond_with(move |_: &Request| {
+            let mut stamps = seen.lock().expect("stamps");
+            stamps.push(Instant::now());
+            if stamps.len() == 1 {
+                ResponseTemplate::new(500).set_body_json(graph_error(
+                    2,
+                    None,
+                    "An unexpected error has occurred",
+                ))
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({"data": []}))
+            }
+        })
+        .mount(&graph)
+        .await;
+    let files = files_dir();
+    let m = Arc::new(library(&graph, files.path(), "PAGE_RETRY"));
+    let read = |m: Arc<Messenger>| async move {
+        m.list_conversations(ListConversationsParams::default())
+            .await
+    };
+    let (a, b) = tokio::join!(read(m.clone()), read(m.clone()));
+    a.expect("first caller");
+    b.expect("second caller");
+    let mut stamps = arrivals.lock().expect("stamps").clone();
+    stamps.sort();
+    assert_eq!(stamps.len(), 3, "two callers and one retry");
+    for pair in stamps.windows(2) {
+        let gap = pair[1].duration_since(pair[0]);
+        assert!(
+            gap >= Duration::from_millis(350),
+            "requests of one Page must be about 500 ms apart, got {gap:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conversation_reads_retry_once_and_only_on_transient_errors() {
+    let files = files_dir();
+    for (code, status, want) in [(2, 500, 2), (613, 400, 2), (100, 400, 1), (190, 400, 1)] {
+        let graph = mock_graph().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(status).set_body_json(graph_error(code, None, "boom")),
+            )
+            .mount(&graph)
+            .await;
+        let m = library(&graph, files.path(), &format!("PAGE_ONCE_{code}"));
+        m.list_conversations(ListConversationsParams::default())
+            .await
+            .expect_err("the answer is an error");
+        assert_eq!(requests(&graph).await.len(), want, "code {code}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_a_missing_field_triggers_the_field_fallback() {
+    let graph = mock_graph().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(400).set_body_json(graph_error(
+            100,
+            Some(33),
+            "Unsupported get request. Object with ID '1234567890' does not exist, cannot be loaded due to missing permissions, or does not support this operation",
+        )))
+        .mount(&graph)
+        .await;
+    let files = files_dir();
+    let resp = call(
+        &graph,
+        files.path(),
+        "messenger_list_conversations",
+        json!({}),
+    )
+    .await;
+    assert!(is_error(&resp), "{resp}");
+    let text = tool_text(&resp);
+    assert!(
+        text.contains("does not exist") && !text.contains("fields_reduced"),
+        "{text}"
+    );
+    assert_eq!(
+        requests(&graph).await.len(),
+        1,
+        "no second request with fewer fields"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ids_that_would_change_the_request_path_are_refused_before_any_request() {
+    let graph = mock_graph().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(400).set_body_json(graph_error(100, None, "nope")))
+        .mount(&graph)
+        .await;
+    let files = files_dir();
+    let mut calls: Vec<(&'static str, Value)> = Vec::new();
+    for id in ["..", ".", "v1.0", "v26.0", "v9.zz", ".hidden", "-1"] {
+        calls.push((
+            "messenger_read_conversation",
+            json!({"conversation_id": id}),
+        ));
+        calls.push(("messenger_get_message", json!({"message_id": id})));
+        calls.push(("messenger_get_profile", json!({"psid": id})));
+        calls.push((
+            "messenger_send_text",
+            json!({"text": "x", "conversation_id": id}),
+        ));
+        calls.push((
+            "messenger_send_text",
+            json!({"text": "x", "recipient_psid": id}),
+        ));
+        calls.push((
+            "messenger_sender_action",
+            json!({"action": "react", "message_id": id, "recipient_psid": "P1"}),
+        ));
+        calls.push(("messenger_list_conversations", json!({"user_id": id})));
+    }
+    let out = call_many(&graph, Some(files.path()), calls).await;
+    for resp in &out {
+        assert!(
+            is_error(resp) && tool_text(resp).contains("not a valid"),
+            "{resp}"
+        );
+    }
+    assert!(requests(&graph).await.is_empty(), "no request left");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_send_whose_outcome_is_unknown_says_the_message_may_have_gone_through() {
+    const NOTE: &str =
+        "(the message may still have been delivered: read the conversation before sending again)";
+    let graph = mock_graph().await;
+    let sends = format!("/v26.0/{PAGE}/messages");
+    for (text, answer) in [
+        (
+            "server",
+            ResponseTemplate::new(503).set_body_json(graph_error(2, None, "Service unavailable")),
+        ),
+        ("html", ResponseTemplate::new(502).set_body_string("<html>")),
+        (
+            "rejected",
+            ResponseTemplate::new(400).set_body_json(graph_error(100, Some(2_018_278), "late")),
+        ),
+    ] {
+        Mock::given(method("POST"))
+            .and(path(sends.clone()))
+            .and(body_partial_json(json!({"message": {"text": text}})))
+            .respond_with(answer)
+            .expect(1)
+            .mount(&graph)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(path(format!("/v26.0/{PAGE}/message_attachments")))
+        .respond_with(ResponseTemplate::new(502).set_body_string("bad gateway"))
+        .expect(1)
+        .mount(&graph)
+        .await;
+    let files = files_dir();
+    std::fs::write(files.path().join("a.png"), png_image()).expect("fixture");
+    let say = |text: &str| {
+        (
+            "messenger_send_text",
+            json!({"text": text, "recipient_psid": "PSID1"}),
+        )
+    };
+    let out = call_many(
+        &graph,
+        Some(files.path()),
+        vec![
+            say("server"),
+            say("html"),
+            say("rejected"),
+            (
+                "messenger_send_attachment",
+                json!({"kind": "image", "path": "a.png", "recipient_psid": "PSID1"}),
+            ),
+        ],
+    )
+    .await;
+    for resp in [&out[0], &out[1], &out[3]] {
+        assert!(is_error(resp), "{resp}");
+        let text = tool_text(resp);
+        assert_eq!(text.matches(NOTE).count(), 1, "{text}");
+        assert!(!text.contains(TOKEN));
+    }
+    assert!(
+        is_error(&out[2]) && !tool_text(&out[2]).contains("may still have been"),
+        "a rejection is a definite answer: {}",
+        out[2]
+    );
+    assert_eq!(requests(&graph).await.len(), 4, "sends are never retried");
+
+    let dead = format!("http://127.0.0.1:{}", free_port());
+    let resp = blocking(move || {
+        let home = TempHome::new();
+        let envs = [("META_PAGE_ACCESS_TOKEN", TOKEN), ("META_PAGE_ID", PAGE)];
+        let mut s = Session::start(&home, &dead, &envs);
+        s.call_tool(
+            "messenger_send_text",
+            json!({"text": "hello", "recipient_psid": "PSID1"}),
+        )
+    })
+    .await;
+    let text = tool_text(&resp);
+    assert!(
+        is_error(&resp) && text.contains("could not connect") && text.contains(NOTE),
+        "{text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn human_agent_is_documented_as_a_tag_for_a_person_replying_by_hand() {
+    let tools = blocking(|| {
+        let home = TempHome::new();
+        let envs = [("META_PAGE_ACCESS_TOKEN", TOKEN), ("META_PAGE_ID", PAGE)];
+        let mut s = Session::start(&home, "http://127.0.0.1:9", &envs);
+        s.request("tools/list", json!({}))["result"]["tools"].clone()
+    })
+    .await;
+    let tool = |name: &str| {
+        tools
+            .as_array()
+            .expect("tools")
+            .iter()
+            .find(|t| t["name"] == json!(name))
+            .unwrap_or_else(|| panic!("{name}"))
+            .clone()
+    };
+    for name in ["messenger_send_text", "messenger_send_attachment"] {
+        let t = tool(name);
+        let description = t["description"].as_str().expect("description");
+        assert!(
+            description.contains("HUMAN_AGENT")
+                && description.contains("generated replies")
+                && !description.contains("unless the app has the HUMAN_AGENT approval"),
+            "{name}: {description}"
+        );
+        let tag = t["inputSchema"]["properties"]["tag"]["description"]
+            .as_str()
+            .expect("tag description");
+        for needle in [
+            "by hand",
+            "7 days",
+            "automated messages as a disallowed use",
+            "never use it for generated replies",
+        ] {
+            assert!(tag.contains(needle), "{name}.tag lacks {needle:?}: {tag}");
+        }
+    }
+    let text = tool("messenger_send_text")["description"]
+        .as_str()
+        .expect("description")
+        .to_string();
+    assert!(
+        text.contains("by hand") && text.contains("disallowed use"),
+        "{text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_global_file_cap_limits_messenger_uploads_too() {
+    let graph = mock_graph().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v26.0/{PAGE}/message_attachments")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"attachment_id": "ATT_CAP"})))
+        .expect(1)
+        .mount(&graph)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v26.0/{PAGE}/messages")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "recipient_id": "PSID1", "message_id": "m_cap"})))
+        .expect(1)
+        .mount(&graph)
+        .await;
+    let files = files_dir();
+    std::fs::write(files.path().join("over.png"), vec![1u8; 1001]).expect("fixture");
+    std::fs::write(files.path().join("exact.png"), vec![1u8; 1000]).expect("fixture");
+    let mut cfg = config_for(&graph, files.path(), PAGE, "");
+    cfg.max_file_bytes = 1000;
+    let client = GraphClient::new(&cfg.graph, Vec::new()).expect("client");
+    let m = Messenger::new(Arc::new(cfg), Arc::new(client));
+    let upload = |name: &str| SendAttachmentParams {
+        kind: "image".into(),
+        path: Some(name.into()),
+        recipient_psid: Some("PSID1".into()),
+        ..SendAttachmentParams::default()
+    };
+    let err = m
+        .send_attachment(upload("over.png"))
+        .await
+        .expect_err("above the cap");
+    assert!(err.to_string().contains("META_MCP_MAX_FILE_BYTES"), "{err}");
+    assert!(
+        requests(&graph).await.is_empty(),
+        "refused before any request"
+    );
+    let out = m
+        .send_attachment(upload("exact.png"))
+        .await
+        .expect("at the cap");
+    assert_eq!(out["uploaded_bytes"], json!(1000));
+    graph.verify().await;
 }

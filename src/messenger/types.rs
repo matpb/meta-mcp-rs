@@ -56,7 +56,7 @@ pub struct SendTextParams {
     /// RESPONSE (default, within 24 hours of the person's last message), UPDATE, or MESSAGE_TAG (needs tag).
     #[schemars(extend("enum" = ["RESPONSE", "UPDATE", "MESSAGE_TAG", null]))]
     pub messaging_type: Option<String>,
-    /// HUMAN_AGENT lets a person reply up to 7 days after the last message and needs Meta's Human Agent approval; it implies MESSAGE_TAG.
+    /// HUMAN_AGENT: Meta allows it for a person replying by hand within 7 days of the last message and lists automated messages as a disallowed use, so never use it for generated replies. Needs Meta's Human Agent approval; implies MESSAGE_TAG.
     #[schemars(extend("enum" = ["HUMAN_AGENT", null]))]
     pub tag: Option<String>,
     /// Message ID to reply to as a quoted reply.
@@ -90,10 +90,12 @@ pub struct SendAttachmentParams {
     pub is_reusable: Option<bool>,
     /// With path: MIME type of the file when its extension is unknown, for example image/png.
     pub mime_type: Option<String>,
+    /// With path: allow a file under the inbound folder of META_MCP_FILES_DIR, where downloads from other people are kept (default false: such a path is refused).
+    pub allow_inbound: Option<bool>,
     /// RESPONSE (default), UPDATE, or MESSAGE_TAG (needs tag).
     #[schemars(extend("enum" = ["RESPONSE", "UPDATE", "MESSAGE_TAG", null]))]
     pub messaging_type: Option<String>,
-    /// HUMAN_AGENT lets a person reply up to 7 days after the last message and needs Meta's Human Agent approval; it implies MESSAGE_TAG.
+    /// HUMAN_AGENT: Meta allows it for a person replying by hand within 7 days of the last message and lists automated messages as a disallowed use, so never use it for generated replies. Needs Meta's Human Agent approval; implies MESSAGE_TAG.
     #[schemars(extend("enum" = ["HUMAN_AGENT", null]))]
     pub tag: Option<String>,
 }
@@ -107,7 +109,7 @@ pub struct DownloadAttachmentParams {
     pub message_id: Option<String>,
     /// With message_id: which attachment of the message, starting at 0 (default 0).
     pub index: Option<i64>,
-    /// File name to save as, inside the files directory; path separators are removed.
+    /// File name to save as, inside inbound/messenger of the files directory; path separators are removed.
     pub dest_name: Option<String>,
     /// For small images (up to 2 MiB), also return the picture itself (default true).
     pub inline: Option<bool>,
@@ -304,7 +306,7 @@ pub fn parse_graph_datetime(s: &str) -> Option<i64> {
 
 /// Epoch values above 10^11 are milliseconds.
 fn epoch_seconds(n: i64) -> i64 {
-    if n.abs() > 100_000_000_000 {
+    if n.unsigned_abs() > 100_000_000_000 {
         n / 1000
     } else {
         n
@@ -482,6 +484,45 @@ mod tests {
         for bad in [json!(null), json!(true), json!([1]), json!(1.5)] {
             assert_eq!(parse_graph_time(&bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn extreme_epoch_values_do_not_overflow() {
+        assert_eq!(
+            parse_graph_datetime("-9223372036854775808"),
+            Some(i64::MIN / 1000)
+        );
+        assert_eq!(parse_graph_time(&json!(i64::MIN)), Some(i64::MIN / 1000));
+        assert_eq!(parse_graph_time(&json!(i64::MAX)), Some(i64::MAX / 1000));
+        assert_eq!(
+            parse_graph_datetime("9223372036854775807"),
+            Some(i64::MAX / 1000)
+        );
+        assert_eq!(
+            parse_graph_time(&json!(-100_000_000_000_i64)),
+            Some(-100_000_000_000),
+            "10^11 is still seconds"
+        );
+        assert_eq!(
+            parse_graph_time(&json!(-100_000_000_001_i64)),
+            Some(-100_000_000)
+        );
+        assert_eq!(
+            parse_graph_time(&json!(100_000_000_001_i64)),
+            Some(100_000_000)
+        );
+        let m = message(
+            &json!({"id": "m_min", "created_time": i64::MIN, "message": "x"}),
+            "1",
+        )
+        .expect("message");
+        assert_eq!(m.created_at, Some(i64::MIN / 1000));
+        let m = message(
+            &json!({"id": "m_max", "created_time": "-9223372036854775808"}),
+            "1",
+        )
+        .expect("message");
+        assert_eq!(m.created_at, Some(i64::MIN / 1000));
     }
 
     #[test]

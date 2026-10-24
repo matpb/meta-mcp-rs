@@ -30,6 +30,25 @@ fn client(server: &MockServer, app_secret: Option<&str>) -> GraphClient {
     .expect("client")
 }
 
+/// A client for download tests: its Graph base host is never the mock's, as in production where
+/// media comes from a CDN. Loopback hosts are listed so that the mocks can serve the files.
+fn download_client(app_secret: Option<&str>) -> GraphClient {
+    GraphClient::new(
+        &download_settings(app_secret),
+        vec!["127.0.0.1".into(), "localhost".into()],
+    )
+    .expect("client")
+}
+
+fn download_settings(app_secret: Option<&str>) -> GraphSettings {
+    GraphSettings {
+        base_url: "https://graph.example.org".into(),
+        version: "v26.0".into(),
+        app_id: None,
+        app_secret: app_secret.map(Secret::new),
+    }
+}
+
 fn hex_hmac(key: &str, message: &str) -> String {
     let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key.as_bytes()).expect("key");
     mac.update(message.as_bytes());
@@ -499,6 +518,45 @@ async fn retries_stop_after_two() {
 }
 
 #[tokio::test]
+async fn get_with_retry_off_makes_one_attempt_and_get_still_retries() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(graph_error(
+            2,
+            None,
+            "Service temporarily unavailable",
+        )))
+        .mount(&server)
+        .await;
+    let c = client(&server, None);
+    let err = c
+        .get_with_retry("me", None, &[], false)
+        .await
+        .expect_err("500");
+    assert!(
+        matches!(
+            err,
+            GraphError::Api {
+                code: 2,
+                http_status: 500,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert_eq!(count(&server).await, 1, "no retry of its own");
+    c.get("me", None, &[]).await.expect_err("500");
+    assert_eq!(count(&server).await, 4, "get keeps its two retries");
+    let before = count(&server).await;
+    let err = c
+        .get_with_retry("me", None, &[], true)
+        .await
+        .expect_err("500");
+    assert!(matches!(err, GraphError::Api { code: 2, .. }));
+    assert_eq!(count(&server).await, before + 3, "true is the same as get");
+}
+
+#[tokio::test]
 async fn retry_on_rate_limit_code_but_not_for_sends() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -732,7 +790,7 @@ async fn download_scopes_the_token_per_hop() {
         )
         .mount(&server)
         .await;
-    let c = client(&server, Some("s"));
+    let c = download_client(Some("s"));
     let token = Secret::new("WA-TOKEN");
     let hosts = ["127.0.0.1".to_string()];
     let url = url::Url::parse(&format!("http://127.0.0.1:{port}/media")).expect("url");
@@ -785,7 +843,7 @@ async fn download_token_is_dropped_by_a_hop_that_changes_the_port() {
     let token = Secret::new("WA-TOKEN");
     let hosts = [format!("127.0.0.1:{}", first.address().port())];
     let url = url::Url::parse(&format!("{}/media", first.uri())).expect("url");
-    let got = client(&first, None)
+    let got = download_client(None)
         .download(
             &url,
             TokenMode::OnHosts {
@@ -813,7 +871,7 @@ async fn download_token_stays_for_a_bare_host_entry_and_for_the_same_port() {
     let token = Secret::new("WA-TOKEN");
     let url = url::Url::parse(&format!("{}/media", first.uri())).expect("url");
     let bare = ["127.0.0.1".to_string()];
-    client(&first, None)
+    download_client(None)
         .download(
             &url,
             TokenMode::OnHosts {
@@ -833,7 +891,7 @@ async fn download_token_stays_for_a_bare_host_entry_and_for_the_same_port() {
         format!("127.0.0.1:{}", first.address().port()),
         format!("127.0.0.1:{}", second.address().port()),
     ];
-    client(&first, None)
+    download_client(None)
         .download(
             &url,
             TokenMode::OnHosts {
@@ -858,13 +916,104 @@ async fn download_never_sends_a_token_without_a_mode() {
         .respond_with(ResponseTemplate::new(200).set_body_bytes(b"x".to_vec()))
         .mount(&server)
         .await;
-    let c = client(&server, None);
+    let c = download_client(None);
     let url = url::Url::parse(&format!("{}/f", server.uri())).expect("url");
     c.download(&url, TokenMode::Never, 10)
         .await
         .expect("download");
     let reqs = server.received_requests().await.expect("recording");
     assert!(reqs[0].headers.get("authorization").is_none());
+}
+
+#[tokio::test]
+async fn download_never_fetches_from_the_graph_host_in_any_mode() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(|req: &wiremock::Request| !req.headers.contains_key("authorization"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(graph_error(
+            200,
+            None,
+            "(#200) Provide valid app ID",
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(header("authorization", "Bearer TOK"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"access_token": "SECRET", "id": "1"})),
+        )
+        .mount(&server)
+        .await;
+    let c =
+        GraphClient::new(&settings(&server, Some("s")), vec!["127.0.0.1".into()]).expect("client");
+    let token = Secret::new("TOK");
+    let hosts = ["127.0.0.1".to_string()];
+    let url =
+        url::Url::parse(&format!("{}/v26.0/1?fields=access_token", server.uri())).expect("url");
+    for mode in [
+        TokenMode::Never,
+        TokenMode::OnHosts {
+            token: &token,
+            hosts: &hosts,
+        },
+    ] {
+        let err = c.download(&url, mode, 1024).await.expect_err("graph host");
+        assert!(matches!(err, GraphError::Refused(_)), "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("Graph API host") && text.contains("127.0.0.1"),
+            "{text}"
+        );
+    }
+    assert_eq!(
+        count(&server).await,
+        0,
+        "refused before any request, though the operator listed the host"
+    );
+}
+
+#[tokio::test]
+async fn a_redirect_onto_the_graph_host_is_refused_on_that_hop() {
+    let graph = MockServer::start().await;
+    let cdn = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"access_token": "SECRET"})))
+        .mount(&graph)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/media"))
+        .respond_with(ResponseTemplate::new(302).insert_header(
+            "location",
+            format!("{}/v26.0/me?fields=access_token", graph.uri()),
+        ))
+        .mount(&cdn)
+        .await;
+    let c = GraphClient::new(
+        &settings(&graph, Some("s")),
+        vec!["127.0.0.1".into(), "localhost".into()],
+    )
+    .expect("client");
+    let token = Secret::new("TOK");
+    let hosts = ["localhost".to_string(), "127.0.0.1".to_string()];
+    let url =
+        url::Url::parse(&format!("http://localhost:{}/media", cdn.address().port())).expect("url");
+    let err = c
+        .download(
+            &url,
+            TokenMode::OnHosts {
+                token: &token,
+                hosts: &hosts,
+            },
+            1024,
+        )
+        .await
+        .expect_err("the second hop is the Graph host");
+    assert!(
+        matches!(err, GraphError::Refused(_)) && err.to_string().contains("Graph API host"),
+        "{err}"
+    );
+    assert_eq!(count(&cdn).await, 1, "the first hop was made");
+    assert_eq!(count(&graph).await, 0, "the Graph host saw nothing");
 }
 
 #[tokio::test]
@@ -893,7 +1042,7 @@ async fn download_enforces_host_size_and_redirect_limits() {
         .respond_with(ResponseTemplate::new(404))
         .mount(&server)
         .await;
-    let c = client(&server, None);
+    let c = download_client(None);
     let base = format!("http://127.0.0.1:{port}");
     let get = |p: &str, cap: u64| {
         let c = &c;
@@ -929,7 +1078,7 @@ async fn download_enforces_host_size_and_redirect_limits() {
         c.download(&plain, TokenMode::Never, 10).await,
         Err(GraphError::Refused(_))
     ));
-    let strict = GraphClient::new(&settings(&server, None), Vec::new()).expect("client");
+    let strict = GraphClient::new(&download_settings(None), Vec::new()).expect("client");
     let local = url::Url::parse(&format!("{base}/big")).expect("url");
     assert!(
         matches!(

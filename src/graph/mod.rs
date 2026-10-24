@@ -318,8 +318,19 @@ impl GraphClient {
         token: Option<&Secret>,
         query: &[(&str, String)],
     ) -> Result<Value, GraphError> {
+        self.get_with_retry(path, token, query, true).await
+    }
+
+    /// `get` with the client's own retries on or off; a caller that paces its requests turns them off.
+    pub async fn get_with_retry(
+        &self,
+        path: &str,
+        token: Option<&Secret>,
+        query: &[(&str, String)],
+        retry: bool,
+    ) -> Result<Value, GraphError> {
         let url = self.request_url(path, query, token)?;
-        self.execute(Method::GET, url, token, Payload::None, true)
+        self.execute(Method::GET, url, token, Payload::None, retry)
             .await
     }
 

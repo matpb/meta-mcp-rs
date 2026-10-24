@@ -9,6 +9,9 @@ static TMP_COUNTER: AtomicU32 = AtomicU32::new(0);
 /// Longest destination name (any path component), so temp names stay under filesystem limits.
 pub const MAX_NAME_BYTES: usize = 200;
 
+/// Folder under the root where downloads from other people are saved, one sub-folder per platform.
+pub const INBOUND_DIR: &str = "inbound";
+
 /// Failures resolving a path inside the jail.
 #[derive(Debug, thiserror::Error)]
 pub enum FileError {
@@ -22,6 +25,10 @@ pub enum FileError {
     Exists(String),
     #[error("invalid path: {0}")]
     Invalid(String),
+    #[error(
+        "`{0}` is under inbound/ in META_MCP_FILES_DIR, where files received from other people are kept, so sending it on would pass their data to someone else: pass allow_inbound=true only when the user asked to forward this exact file"
+    )]
+    Inbound(String),
     #[error("file is {size} bytes, above the limit of {cap} (META_MCP_MAX_FILE_BYTES)")]
     TooLarge { size: u64, cap: u64 },
     #[error("file tools are disabled: set META_MCP_FILES_DIR to a directory to enable them")]
@@ -206,27 +213,40 @@ impl FileJail {
 
     /// Reads a jailed file, refusing anything above `max_bytes`. Blocking: use `spawn_blocking`.
     pub fn read_capped(&self, input: &str, max_bytes: u64) -> Result<Vec<u8>, FileError> {
+        read_file_capped(&self.resolve_read(input)?, max_bytes)
+    }
+
+    /// True when a canonical path lies under `<root>/inbound/`, where downloads are kept.
+    pub fn is_inbound(&self, resolved: &Path) -> bool {
+        let named = resolved.strip_prefix(&self.root).is_ok_and(|rel| {
+            rel.components()
+                .next()
+                .is_some_and(|c| c.as_os_str().eq_ignore_ascii_case(INBOUND_DIR))
+        });
+        named
+            || std::fs::canonicalize(self.root.join(INBOUND_DIR))
+                .is_ok_and(|real| resolved.starts_with(real))
+    }
+
+    /// `read_capped` for a file that is about to be sent: one under `inbound/` needs `allow_inbound`.
+    pub fn read_upload(
+        &self,
+        input: &str,
+        max_bytes: u64,
+        allow_inbound: bool,
+    ) -> Result<Vec<u8>, FileError> {
         let path = self.resolve_read(input)?;
-        let size = std::fs::metadata(&path)
-            .map_err(|e| io_err(&path, e))?
-            .len();
-        if size > max_bytes {
-            return Err(FileError::TooLarge {
-                size,
-                cap: max_bytes,
-            });
+        if !allow_inbound && self.is_inbound(&path) {
+            return Err(FileError::Inbound(input.to_string()));
         }
-        let mut buf = Vec::new();
-        std::fs::File::open(&path)
-            .and_then(|f| f.take(max_bytes.saturating_add(1)).read_to_end(&mut buf))
-            .map_err(|e| io_err(&path, e))?;
-        if buf.len() as u64 > max_bytes {
-            return Err(FileError::TooLarge {
-                size: buf.len() as u64,
-                cap: max_bytes,
-            });
-        }
-        Ok(buf)
+        read_file_capped(&path, max_bytes)
+    }
+
+    /// True when `input` is an existing jailed file holding exactly `bytes`. Blocking.
+    pub fn holds(&self, input: &str, bytes: &[u8]) -> bool {
+        self.resolve_read(input)
+            .and_then(|path| read_file_capped(&path, bytes.len() as u64))
+            .is_ok_and(|have| have == bytes)
     }
 
     /// Writes `bytes` to a temp file and moves it into place; without `overwrite` an existing
@@ -254,6 +274,51 @@ impl FileJail {
         let _ = std::fs::remove_file(&tmp);
         result.map(|()| dest)
     }
+}
+
+/// The bytes of a regular file, refusing anything above `max_bytes` even if it grew while reading.
+fn read_file_capped(path: &Path, max_bytes: u64) -> Result<Vec<u8>, FileError> {
+    let size = std::fs::metadata(path).map_err(|e| io_err(path, e))?.len();
+    if size > max_bytes {
+        return Err(FileError::TooLarge {
+            size,
+            cap: max_bytes,
+        });
+    }
+    let mut buf = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|f| f.take(max_bytes.saturating_add(1)).read_to_end(&mut buf))
+        .map_err(|e| io_err(path, e))?;
+    if buf.len() as u64 > max_bytes {
+        return Err(FileError::TooLarge {
+            size: buf.len() as u64,
+            cap: max_bytes,
+        });
+    }
+    Ok(buf)
+}
+
+/// `inbound/<platform>/<name>`, where a download goes. `name` may hold sub-folders but cannot leave
+/// the platform folder.
+pub fn inbound_dest(platform: &str, name: &str) -> Result<String, FileError> {
+    if name.trim().is_empty() || name.contains('\0') {
+        return Err(FileError::Invalid("path is empty or contains NUL".into()));
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for comp in Path::new(name).components() {
+        match comp {
+            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            Component::ParentDir if parts.pop().is_some() => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(FileError::Escape(name.to_string()));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(FileError::Invalid("destination has no file name".into()));
+    }
+    Ok(format!("{INBOUND_DIR}/{platform}/{}", parts.join("/")))
 }
 
 /// A symlink, a directory or (without `overwrite`) an existing file at `target` is refused.
@@ -650,5 +715,142 @@ mod tests {
             failures.len(),
             failures.first()
         );
+    }
+
+    #[test]
+    fn inbound_destinations_stay_below_the_platform_folder() {
+        for (name, want) in [
+            ("doc.pdf", "inbound/whatsapp/doc.pdf"),
+            ("inbox/doc.pdf", "inbound/whatsapp/inbox/doc.pdf"),
+            ("./a/../b.png", "inbound/whatsapp/b.png"),
+            ("dir/", "inbound/whatsapp/dir"),
+        ] {
+            assert_eq!(inbound_dest("whatsapp", name).expect(name), want);
+        }
+        for bad in [
+            "../x.png",
+            "a/../../x.png",
+            "..",
+            "/etc/passwd",
+            "inbound/../../x",
+        ] {
+            assert!(
+                matches!(inbound_dest("whatsapp", bad), Err(FileError::Escape(_))),
+                "{bad}"
+            );
+        }
+        for bad in ["", "  ", ".", "a/..", "a\0b"] {
+            assert!(
+                matches!(inbound_dest("whatsapp", bad), Err(FileError::Invalid(_))),
+                "{bad:?}"
+            );
+        }
+        let err = inbound_dest("whatsapp", "../escape.png").expect_err("escape");
+        assert!(
+            err.to_string().contains("outside META_MCP_FILES_DIR"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn uploads_refuse_inbound_files_unless_allowed() {
+        let (_guard, root) = canon_tmp();
+        let jail = FileJail::new(&root).expect("jail");
+        jail.write_new("inbound/messenger/pic.png", b"theirs", false, 100)
+            .expect("download");
+        jail.write_new("mine/pic.png", b"mine", false, 100)
+            .expect("own file");
+        assert_eq!(
+            jail.read_upload("mine/pic.png", 100, false).expect("own"),
+            b"mine"
+        );
+        let absolute = root.join("inbound/messenger/pic.png").display().to_string();
+        for path in [
+            "inbound/messenger/pic.png",
+            "mine/../inbound/messenger/pic.png",
+            "./inbound/messenger/pic.png",
+            absolute.as_str(),
+        ] {
+            let err = jail.read_upload(path, 100, false).expect_err(path);
+            assert!(matches!(err, FileError::Inbound(_)), "{path}: {err}");
+            let text = err.to_string();
+            assert!(
+                text.contains("other people") && text.contains("allow_inbound=true"),
+                "{text}"
+            );
+            assert_eq!(jail.read_upload(path, 100, true).expect(path), b"theirs");
+        }
+        assert_eq!(
+            jail.read_capped("inbound/messenger/pic.png", 100)
+                .expect("plain read"),
+            b"theirs",
+            "read_capped keeps its meaning"
+        );
+        assert!(matches!(
+            jail.read_upload("inbound/messenger/pic.png", 3, true),
+            Err(FileError::TooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn the_inbound_test_looks_at_the_first_folder_only() {
+        let (_guard, root) = canon_tmp();
+        let jail = FileJail::new(&root).expect("jail");
+        assert!(jail.is_inbound(&root.join("inbound/whatsapp/id.pdf")));
+        assert!(jail.is_inbound(&root.join("Inbound/whatsapp/id.pdf")));
+        assert!(!jail.is_inbound(&root.join("inbound2/id.pdf")));
+        assert!(!jail.is_inbound(&root.join("mine/inbound/id.pdf")));
+        assert!(!jail.is_inbound(Path::new("/elsewhere/inbound/id.pdf")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_into_the_inbound_folder_does_not_hide_it() {
+        let (_guard, root) = canon_tmp();
+        let jail = FileJail::new(&root).expect("jail");
+        jail.write_new("inbound/whatsapp/id.pdf", b"theirs", false, 100)
+            .expect("download");
+        std::os::unix::fs::symlink(root.join("inbound/whatsapp"), root.join("alias")).expect("ln");
+        assert!(matches!(
+            jail.read_upload("alias/id.pdf", 100, false),
+            Err(FileError::Inbound(_))
+        ));
+        let other = canon_tmp();
+        let jail = FileJail::new(&other.1).expect("jail");
+        std::fs::create_dir(other.1.join("kept")).expect("mkdir");
+        std::os::unix::fs::symlink(other.1.join("kept"), other.1.join("inbound")).expect("ln");
+        jail.write_new("inbound/whatsapp/id.pdf", b"theirs", false, 100)
+            .expect("download through the link");
+        assert!(matches!(
+            jail.read_upload("kept/whatsapp/id.pdf", 100, false),
+            Err(FileError::Inbound(_))
+        ));
+    }
+
+    #[test]
+    fn holds_compares_the_whole_content() {
+        let (_guard, root) = canon_tmp();
+        std::fs::write(root.join("a.bin"), b"abcd").expect("write");
+        let jail = FileJail::new(&root).expect("jail");
+        assert!(jail.holds("a.bin", b"abcd"));
+        assert!(!jail.holds("a.bin", b"abcx"));
+        assert!(!jail.holds("a.bin", b"abc"));
+        assert!(!jail.holds("a.bin", b"abcde"));
+        assert!(!jail.holds("missing.bin", b"abcd"));
+        assert!(!jail.holds("../a.bin", b"abcd"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_read_enforces_the_cap_when_the_size_it_was_told_is_small() {
+        let procfile = Path::new("/proc/version");
+        assert_eq!(
+            std::fs::metadata(procfile).expect("procfs").len(),
+            0,
+            "procfs reports no size for a file that has content"
+        );
+        let err = read_file_capped(procfile, 10).expect_err("over the cap");
+        assert!(matches!(err, FileError::TooLarge { cap: 10, .. }), "{err}");
+        assert!(read_file_capped(procfile, 1 << 20).expect("fits").len() > 10);
     }
 }

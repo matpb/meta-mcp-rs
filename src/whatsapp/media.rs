@@ -226,17 +226,20 @@ pub fn limit_for(kind: MediaKind, head: &[u8]) -> u64 {
 }
 
 /// Largest picture a download returns inline.
-pub const INLINE_IMAGE_MAX: usize = 2 * 1024 * 1024;
+pub const INLINE_IMAGE_MAX: usize = crate::messenger::media::INLINE_MAX_BYTES;
 
-/// The MIME type to show `bytes` inline with, judged by the bytes alone: the type a sender
-/// reports is never trusted. The error says why the picture cannot be shown.
+/// The MIME type to show `bytes` inline with, judged by the bytes alone with the structural check
+/// Messenger uses: the type a sender reports is never trusted. The error says why not.
 pub fn inline_image(bytes: &[u8]) -> Result<&'static str, &'static str> {
-    let mime = crate::messenger::media::sniff_image_mime(bytes)
-        .ok_or("the bytes are not a PNG, JPEG, GIF or WEBP picture")?;
-    if bytes.len() > INLINE_IMAGE_MAX {
-        return Err("the picture is larger than 2 MiB");
+    use crate::messenger::media::{inline_image_mime, sniff_image_mime};
+    if let Some(mime) = inline_image_mime(bytes) {
+        return Ok(mime);
     }
-    Ok(mime)
+    if sniff_image_mime(bytes).is_some() {
+        Err("the picture is larger than 2 MiB")
+    } else {
+        Err("the bytes are not a PNG, JPEG, GIF or WEBP picture")
+    }
 }
 
 /// `5 MiB`, `100 KiB` or `1234 bytes`.
@@ -412,16 +415,16 @@ mod tests {
 
     #[test]
     fn inline_images_are_judged_by_their_bytes() {
-        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0];
-        jpeg.extend([0u8; 16]);
-        let mut webp = b"RIFF\0\0\0\0WEBPVP8 ".to_vec();
-        webp.extend([0u8; 8]);
+        use crate::messenger::media::fixtures;
         for (bytes, want) in [
-            (b"\x89PNG\r\n\x1a\nrest".to_vec(), "image/png"),
-            (jpeg, "image/jpeg"),
-            (b"GIF89a\x01\0\x01\0".to_vec(), "image/gif"),
-            (b"GIF87a\x01\0\x01\0".to_vec(), "image/gif"),
-            (webp, "image/webp"),
+            (fixtures::png(), "image/png"),
+            (fixtures::jpeg(), "image/jpeg"),
+            (fixtures::jpeg_progressive(), "image/jpeg"),
+            (fixtures::gif(), "image/gif"),
+            (b"GIF87a\x01\0\x01\0\x80\0\0".to_vec(), "image/gif"),
+            (fixtures::webp_lossy(), "image/webp"),
+            (fixtures::webp_lossless(), "image/webp"),
+            (fixtures::webp_alpha(), "image/webp"),
         ] {
             assert_eq!(inline_image(&bytes), Ok(want));
         }
@@ -437,12 +440,30 @@ mod tests {
             let why = inline_image(&bytes).expect_err("not a raster picture");
             assert!(why.contains("not a PNG, JPEG, GIF or WEBP"), "{why}");
         }
-        let mut edge = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut edge = fixtures::png();
         edge.resize(INLINE_IMAGE_MAX, 0);
         assert_eq!(inline_image(&edge), Ok("image/png"));
         edge.push(0);
         let why = inline_image(&edge).expect_err("too big");
         assert!(why.contains("2 MiB"), "{why}");
+    }
+
+    #[test]
+    fn a_picture_that_only_starts_like_one_is_not_shown() {
+        for bytes in [
+            [
+                b"\x89PNG\r\n\x1a\n".as_slice(),
+                b"<html><script>alert(1)</script>",
+            ]
+            .concat(),
+            [b"\xFF\xD8\xFF".as_slice(), b"not really a jpeg, just text"].concat(),
+            [b"GIF89a".as_slice(), b"<?php system($_GET[0]); ?>"].concat(),
+            [b"RIFF\0\0\0\0WEBP".as_slice(), b"garbage garbage"].concat(),
+            b"\x89PNG\r\n\x1a\nrest".to_vec(),
+        ] {
+            let why = inline_image(&bytes).expect_err("a polyglot is not a picture");
+            assert!(why.contains("not a PNG, JPEG, GIF or WEBP"), "{why}");
+        }
     }
 
     #[test]

@@ -56,6 +56,8 @@ pub struct SendMediaParams {
     pub voice: Option<bool>,
     /// MIME type to send with a path upload: it must match the file extension and only adds parameters (for example audio/ogg; codecs=opus).
     pub mime_type: Option<String>,
+    /// With path: allow a file under the inbound folder of META_MCP_FILES_DIR, where downloads from other people are kept (default false: such a path is refused).
+    pub allow_inbound: Option<bool>,
     /// WhatsApp message id (wamid...) to quote as a reply.
     pub reply_to_message_id: Option<String>,
     /// Only for tokens that reach several messaging accounts on the number; normally omit.
@@ -137,6 +139,8 @@ pub struct UploadMediaParams {
     pub kind: Option<String>,
     /// MIME type to send with the upload: it must match the file extension and only adds parameters (for example codecs=opus).
     pub mime_type: Option<String>,
+    /// Allow a file under the inbound folder of META_MCP_FILES_DIR, where downloads from other people are kept (default false: such a path is refused).
+    pub allow_inbound: Option<bool>,
     /// WhatsApp phone number ID to upload to; optional when only one number is configured.
     pub phone_number_id: Option<String>,
 }
@@ -146,7 +150,7 @@ pub struct UploadMediaParams {
 pub struct DownloadMediaParams {
     /// Media ID of an inbound message (from the inbox attachments); it expires 7 days after receipt.
     pub media_id: String,
-    /// File name inside META_MCP_FILES_DIR to save to (default: whatsapp_ plus the media id and the file extension).
+    /// File name inside inbound/whatsapp of META_MCP_FILES_DIR to save to (default: whatsapp_ plus the media id and the file extension).
     pub dest_name: Option<String>,
     /// Also return real PNG, JPEG, GIF or WEBP pictures up to 2 MiB inline so you can look at them (default true); inline_skipped says why one is not shown.
     pub inline: Option<bool>,

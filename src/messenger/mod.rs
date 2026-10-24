@@ -15,10 +15,10 @@ use tokio::time::Instant;
 use url::Url;
 
 use crate::config::{Config, PageConfig};
-use crate::files::{FileError, FileJail};
+use crate::files::{FileError, FileJail, inbound_dest};
 use crate::graph::download::TokenMode;
 use crate::graph::{GraphClient, GraphError};
-use crate::mcp::valid_id;
+use crate::mcp::{plain_segment, valid_id};
 pub use types::{
     DownloadAttachmentParams, GetMessageParams, GetProfileParams, ListConversationsParams,
     ReadConversationParams, SendAttachmentParams, SendTextParams, SenderActionParams,
@@ -40,12 +40,13 @@ const DETAIL_WINDOW: i64 = 20;
 const TEXT_LIMIT_CHARS: usize = 2000;
 const METADATA_LIMIT_CHARS: usize = 1000;
 const MAX_IMAGES: usize = 30;
-const TOKEN_HOST_SUFFIXES: &[&str] = &[
-    ".fbcdn.net",
-    ".fbsbx.com",
-    ".facebook.com",
-    ".messenger.com",
-];
+/// Meta CDN hosts that may receive the Page token; the Graph host and `*.facebook.com` never do.
+const TOKEN_HOST_SUFFIXES: &[&str] = &[".fbcdn.net", ".fbsbx.com"];
+/// Graph codes a conversation read repeats once.
+const RETRYABLE_READ_CODES: [i64; 7] = [1, 2, 4, 17, 32, 613, 80006];
+const INBOUND_PLATFORM: &str = "messenger";
+const MAYBE_DELIVERED: &str =
+    "the message may still have been delivered: read the conversation before sending again";
 
 type Gate = Arc<tokio::sync::Mutex<Option<Instant>>>;
 type GateMap = Mutex<HashMap<String, Gate>>;
@@ -110,7 +111,8 @@ fn check_mid(label: &str, value: &str) -> Result<(), GraphError> {
         && value.len() <= 512
         && value.bytes().all(|b| {
             b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':' | b'=' | b'+' | b'$')
-        });
+        })
+        && plain_segment(value);
     if ok {
         Ok(())
     } else {
@@ -136,6 +138,10 @@ fn extra_hint(code: i64, subcode: Option<i64>) -> Option<&'static str> {
         Some(
             "Meta could not fetch the URL: it must be public, https with a valid certificate, and answer within 10 seconds (75 for video)",
         )
+    } else if is(2_018_278) || is(2_534_022) {
+        Some(
+            "outside the 24-hour messaging window: the person must write to the Page first. HUMAN_AGENT is only for a person replying by hand within 7 days, never for generated replies",
+        )
     } else {
         None
     }
@@ -158,15 +164,43 @@ fn explain(mut e: GraphError) -> GraphError {
 
 /// True for the code 100 answer Graph gives when a requested field does not exist.
 fn unknown_field_error(e: &GraphError) -> bool {
+    matches!(e, GraphError::Api { code: 100, message, .. }
+        if message.to_ascii_lowercase().contains("nonexisting field"))
+}
+
+/// Errors a conversation read repeats once: transient Graph codes, server errors, timeouts and
+/// connections that did not complete.
+fn retryable_read(e: &GraphError) -> bool {
     match e {
         GraphError::Api {
-            code: 100, message, ..
-        } => {
-            let m = message.to_ascii_lowercase();
-            m.contains("nonexisting field") || m.contains("does not exist")
+            code, http_status, ..
+        } => RETRYABLE_READ_CODES.contains(code) || *http_status >= 500,
+        GraphError::Transport(m) => {
+            m.contains("timed out")
+                || m.contains("could not connect")
+                || m.contains("answered HTTP 5")
         }
         _ => false,
     }
+}
+
+/// A failed send whose outcome is unknown gets a note: the request may have reached the person.
+fn with_delivery_caveat(mut e: GraphError) -> GraphError {
+    let unsure = match &e {
+        GraphError::Transport(_) | GraphError::Json(_) => true,
+        GraphError::Api { http_status, .. } => *http_status >= 500,
+        GraphError::Config(_) | GraphError::Refused(_) => false,
+    };
+    if unsure {
+        match &mut e {
+            GraphError::Transport(m)
+            | GraphError::Json(m)
+            | GraphError::Config(m)
+            | GraphError::Refused(m)
+            | GraphError::Api { message: m, .. } => m.push_str(&format!(" ({MAYBE_DELIVERED})")),
+        }
+    }
+    e
 }
 
 /// `GraphClient::download` reports the HTTP status only inside its error message.
@@ -182,6 +216,14 @@ fn token_host_allowed(host: &str, extra: &[String]) -> bool {
         || TOKEN_HOST_SUFFIXES
             .iter()
             .any(|s| host.len() > s.len() && host.ends_with(s))
+}
+
+/// The `host:port` entry for the URL, so that the token follows no redirect to another port.
+fn token_entry(url: &Url, host: String) -> String {
+    match url.port_or_known_default() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    }
 }
 
 /// The `messaging_type` and `tag` to send; a tag alone implies MESSAGE_TAG.
@@ -345,20 +387,34 @@ impl Messenger {
             .ok_or_else(|| FileError::Disabled.into())
     }
 
-    /// A Conversations API read, spaced per Page.
+    /// A Conversations API read, spaced per Page. A transient failure is repeated once, through
+    /// the same gate, so a retry never lands inside the spacing.
     async fn read(
         &self,
         page: &PageConfig,
         path: &str,
         query: &[(&str, String)],
     ) -> Result<Value, GraphError> {
-        throttle_in(self.read_gate, &page.id, READ_SPACING).await;
-        self.graph.get(path, Some(&page.token), query).await
+        let once = || async {
+            throttle_in(self.read_gate, &page.id, READ_SPACING).await;
+            self.graph
+                .get_with_retry(path, Some(&page.token), query, false)
+                .await
+        };
+        match once().await {
+            Err(e) if retryable_read(&e) => once().await,
+            other => other,
+        }
     }
 
     async fn send(&self, page: &PageConfig, body: &Value) -> Result<Value, GraphError> {
         let path = format!("{}/messages", page.id);
         self.graph.post_json(&path, Some(&page.token), body).await
+    }
+
+    /// `send` for a message: a failure that leaves the outcome open says so.
+    async fn send_message(&self, page: &PageConfig, body: &Value) -> Result<Value, GraphError> {
+        self.send(page, body).await.map_err(with_delivery_caveat)
     }
 
     pub async fn list_conversations(
@@ -559,7 +615,7 @@ impl Messenger {
         if let Some(m) = metadata {
             body["message"]["metadata"] = json!(m);
         }
-        let answer = self.send(page, &body).await?;
+        let answer = self.send_message(page, &body).await?;
         Ok(send_output(&answer, &page.id, &psid))
     }
 
@@ -596,8 +652,12 @@ impl Messenger {
             list.iter().try_for_each(|u| check_media_url(u))?;
         }
         let page = self.page(p.page_id.as_deref())?;
+        let allow_inbound = p.allow_inbound.unwrap_or(false);
         let upload = match &path {
-            Some(path) => Some(self.load_upload(path, kind, clean(p.mime_type)).await?),
+            Some(path) => Some(
+                self.load_upload(path, kind, clean(p.mime_type), allow_inbound)
+                    .await?,
+            ),
             None => None,
         };
         let psid = self
@@ -637,7 +697,7 @@ impl Messenger {
         if let Some(tag) = tag {
             body["tag"] = json!(tag);
         }
-        let answer = self.send(page, &body).await?;
+        let answer = self.send_message(page, &body).await?;
         let mut out = send_output(&answer, &page.id, &psid);
         if let Some((attachment_id, size)) = uploaded {
             out["attachment_id"] = json!(attachment_id);
@@ -654,21 +714,20 @@ impl Messenger {
         path: &str,
         kind: &'static str,
         mime_override: Option<String>,
+        allow_inbound: bool,
     ) -> Result<Upload, GraphError> {
         let jail = self.jail()?.clone();
         let path = path.to_string();
-        let cap = self.cfg.max_file_bytes;
+        let cap = self.cfg.max_file_bytes.min(media::MAX_UPLOAD_BYTES);
         let (bytes, name) = tokio::task::spawn_blocking(move || {
-            let resolved = jail.resolve_read(&path)?;
-            let size = std::fs::metadata(&resolved)
-                .map_err(|e| GraphError::Refused(format!("cannot read `{path}`: {e}")))?
-                .len();
-            if size > media::MAX_UPLOAD_BYTES {
-                return Err(GraphError::Refused(format!(
-                    "`{path}` is {size} bytes: Meta accepts attachments up to 25 MB"
-                )));
-            }
-            let bytes = jail.read_capped(&path, cap)?;
+            let bytes = match jail.read_upload(&path, cap, allow_inbound) {
+                Err(FileError::TooLarge { size, .. }) if cap == media::MAX_UPLOAD_BYTES => {
+                    return Err(GraphError::Refused(format!(
+                        "`{path}` is {size} bytes: Meta accepts attachments up to 25 MB"
+                    )));
+                }
+                other => other?,
+            };
             let base = Path::new(&path)
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -723,7 +782,8 @@ impl Messenger {
         let answer = self
             .graph
             .post_multipart(&path, Some(&page.token), form)
-            .await?;
+            .await
+            .map_err(with_delivery_caveat)?;
         answer
             .get("attachment_id")
             .and_then(id_string)
@@ -760,7 +820,7 @@ impl Messenger {
                 if !token_host_allowed(&host, &self.cfg.download_hosts) {
                     return Err(e);
                 }
-                let hosts = [host];
+                let hosts = [token_entry(&url, host)];
                 let mode = TokenMode::OnHosts {
                     token: &page.token,
                     hosts: &hosts,
@@ -788,14 +848,34 @@ impl Messenger {
             Some(&mime),
         );
         let overwrite = p.overwrite.unwrap_or(false);
+        let derived = clean(p.dest_name).is_none();
+        let dest = inbound_dest(INBOUND_PLATFORM, &name)?;
+        let alt = if derived {
+            Some(inbound_dest(
+                INBOUND_PLATFORM,
+                &media::hashed_name(&name, &url),
+            )?)
+        } else {
+            None
+        };
         let data = downloaded.bytes.clone();
-        let (saved, sha256): (PathBuf, String) = tokio::task::spawn_blocking(move || {
-            let sha256 = hex::encode(Sha256::digest(&data));
-            let saved = jail.write_new(&name, &data, overwrite, max)?;
-            Ok::<_, FileError>((saved, sha256))
-        })
-        .await
-        .map_err(|e| GraphError::transport(format!("file write task failed: {e}")))??;
+        let (saved, sha256, renamed): (PathBuf, String, bool) =
+            tokio::task::spawn_blocking(move || {
+                let sha256 = hex::encode(Sha256::digest(&data));
+                match jail.write_new(&dest, &data, overwrite, max) {
+                    Ok(saved) => Ok((saved, sha256, false)),
+                    Err(FileError::Exists(taken)) => match alt {
+                        Some(alt) if !jail.holds(&dest, &data) => {
+                            let saved = jail.write_new(&alt, &data, false, max)?;
+                            Ok((saved, sha256, true))
+                        }
+                        _ => Err(FileError::Exists(taken)),
+                    },
+                    Err(e) => Err(e),
+                }
+            })
+            .await
+            .map_err(|e| GraphError::transport(format!("file write task failed: {e}")))??;
         let mut out = json!({
             "path": saved.to_string_lossy(),
             "bytes": downloaded.bytes.len(),
@@ -803,6 +883,11 @@ impl Messenger {
             "sha256": sha256,
             "source_url_host": url.host_str(),
         });
+        if renamed {
+            out["name_note"] = json!(
+                "a different file already had this name, so the URL hash was added to this one's name"
+            );
+        }
         let mut image = None;
         if p.inline.unwrap_or(true) && mime.starts_with("image/") {
             match media::inline_image_mime(&downloaded.bytes) {
@@ -817,7 +902,7 @@ impl Messenger {
                 }
                 None => {
                     out["note"] = json!(
-                        "the image is saved but not shown inline: only png, jpeg, gif and webp pictures can be shown"
+                        "the image is saved but not shown inline: only png, jpeg, gif and webp pictures can be shown, and these bytes are not a well-formed one"
                     );
                 }
             }
@@ -1079,8 +1164,6 @@ mod tests {
             "scontent.xx.fbcdn.net",
             "lookaside.fbsbx.com",
             "cdn.fbsbx.com",
-            "www.facebook.com",
-            "api.messenger.com",
             "SCONTENT.XX.FBCDN.NET",
             "127.0.0.1",
             "files.example.org",
@@ -1088,6 +1171,10 @@ mod tests {
             assert!(token_host_allowed(host, &extra), "{host}");
         }
         for host in [
+            "graph.facebook.com",
+            "www.facebook.com",
+            "facebook.com",
+            "api.messenger.com",
             "mmg.whatsapp.net",
             "evil.example",
             "fbcdn.net",
@@ -1097,6 +1184,93 @@ mod tests {
             "localhost",
         ] {
             assert!(!token_host_allowed(host, &extra), "{host}");
+        }
+    }
+
+    #[test]
+    fn the_token_entry_names_the_host_and_the_port() {
+        let url = |s: &str| Url::parse(s).expect("url");
+        for (target, want) in [
+            (
+                "https://scontent.xx.fbcdn.net/v/a.jpg",
+                "scontent.xx.fbcdn.net:443",
+            ),
+            (
+                "https://SCONTENT.xx.fbcdn.net:8443/a",
+                "scontent.xx.fbcdn.net:8443",
+            ),
+            ("https://cdn.fbsbx.com/a", "cdn.fbsbx.com:443"),
+            ("http://127.0.0.1:9000/a", "127.0.0.1:9000"),
+            ("http://[::1]:9001/a", "[::1]:9001"),
+        ] {
+            let u = url(target);
+            let host = u.host_str().expect("host").to_ascii_lowercase();
+            assert_eq!(token_entry(&u, host), want, "{target}");
+        }
+    }
+
+    #[test]
+    fn only_transient_conversation_read_failures_are_repeated() {
+        for code in [1, 2, 4, 17, 32, 613, 80006] {
+            assert!(retryable_read(&api(code, None, "busy")), "{code}");
+        }
+        for code in [0, 10, 100, 190, 200, 368, 130429] {
+            assert!(!retryable_read(&api(code, None, "no")), "{code}");
+        }
+        let server = |status: u16| GraphError::Api {
+            code: 100,
+            subcode: None,
+            message: "boom".into(),
+            error_type: None,
+            fbtrace_id: None,
+            user_msg: None,
+            hint: None,
+            http_status: status,
+        };
+        assert!(retryable_read(&server(500)) && retryable_read(&server(503)));
+        assert!(!retryable_read(&server(400)) && !retryable_read(&server(404)));
+        for message in [
+            "request timed out: operation timed out",
+            "request could not connect: connection refused",
+            "Graph API answered HTTP 502 Bad Gateway without JSON",
+        ] {
+            assert!(retryable_read(&GraphError::transport(message)), "{message}");
+        }
+        assert!(!retryable_read(&GraphError::transport(
+            "request failed: bad header"
+        )));
+        assert!(!retryable_read(&GraphError::Refused("no".into())));
+        assert!(!retryable_read(&GraphError::Config("no".into())));
+        assert!(!retryable_read(&GraphError::Json("odd".into())));
+    }
+
+    #[test]
+    fn a_send_with_an_open_outcome_says_it_may_have_gone_through() {
+        let server =
+            GraphError::from_body(&json!({"error": {"message": "unknown", "code": 2}}), 503)
+                .expect("api error");
+        for unsure in [
+            GraphError::transport("request timed out: deadline has elapsed"),
+            GraphError::Json("the response is not valid JSON (HTTP 200)".into()),
+            server,
+        ] {
+            let shown = with_delivery_caveat(unsure).to_string();
+            assert!(
+                shown.contains(
+                    "(the message may still have been delivered: read the conversation before sending again)"
+                ),
+                "{shown}"
+            );
+            assert_eq!(shown.matches("may still have been delivered").count(), 1);
+        }
+        for sure in [
+            api(100, Some(2_018_278), "outside the window"),
+            api(200, None, "permission"),
+            GraphError::Refused("text is too long".into()),
+            GraphError::Config("bad id".into()),
+        ] {
+            let before = sure.to_string();
+            assert_eq!(with_delivery_caveat(sure).to_string(), before);
         }
     }
 
@@ -1119,7 +1293,16 @@ mod tests {
         assert!(unknown_field_error(&api(
             100,
             None,
-            "Object does not exist"
+            "(#100) TRIED ACCESSING NONEXISTING FIELD (snippet) on node type (Conversation)"
+        )));
+        assert!(
+            !unknown_field_error(&api(100, None, "Object does not exist")),
+            "a missing object is not a missing field"
+        );
+        assert!(!unknown_field_error(&api(
+            100,
+            Some(33),
+            "Unsupported get request. Object with ID '1234567890' does not exist, cannot be loaded due to missing permissions, or does not support this operation"
         )));
         assert!(!unknown_field_error(&api(100, None, "Invalid parameter")));
         assert!(!unknown_field_error(&api(190, None, "does not exist")));
@@ -1143,6 +1326,15 @@ mod tests {
         }
         let window = explain(api(100, Some(2_018_278), "boom")).to_string();
         assert!(window.contains("24-hour"), "{window}");
+        assert!(
+            window.contains("never for generated replies") && window.contains("by hand"),
+            "the window hint must not offer HUMAN_AGENT for generated replies: {window}"
+        );
+        let other = explain(api(10, Some(2_534_022), "boom")).to_string();
+        assert!(
+            other.contains("24-hour") && other.contains("by hand"),
+            "{other}"
+        );
         let plain = explain(api(1, None, "boom")).to_string();
         assert!(!plain.contains("Hint"), "{plain}");
         let refused = explain(GraphError::Refused("nope".into())).to_string();
@@ -1165,8 +1357,26 @@ mod tests {
         }
         assert!(check_mid("m", "m_AbC-9").is_ok());
         assert!(check_mid("m", "mid.$cAAAAA:1234").is_ok());
-        for bad in ["", "a/b", "a b", "a?b", &"x".repeat(600)] {
+        assert!(check_mid("m", "v26").is_ok() && check_mid("m", "video.1").is_ok());
+        for bad in [
+            "",
+            "a/b",
+            "a b",
+            "a?b",
+            &"x".repeat(600),
+            ".",
+            "..",
+            ".hidden",
+            "$mid",
+            "v1.0",
+            "v26.0",
+            "v9.zz",
+        ] {
             assert!(check_mid("m", bad).is_err(), "{bad}");
         }
+        for bad in [".", "..", "v1.0", "v26.0", "-x", "+1"] {
+            assert!(check_id("i", bad).is_err(), "{bad}");
+        }
+        assert!(check_id("i", "t_123").is_ok() && check_id("i", "US.123").is_ok());
     }
 }

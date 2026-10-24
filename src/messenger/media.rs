@@ -1,5 +1,6 @@
 //! Media helpers: MIME by extension, attachment kinds, safe file names and the inline-image check.
 
+use sha2::{Digest, Sha256};
 use url::Url;
 
 /// Largest image returned inline as an image block.
@@ -10,8 +11,11 @@ pub const MAX_UPLOAD_BYTES: u64 = 25 * 1024 * 1024;
 pub const IMAGE_SOFT_LIMIT_BYTES: u64 = 8 * 1024 * 1024;
 
 const FALLBACK_NAME: &str = "attachment";
-const MAX_NAME_CHARS: usize = 120;
-const MAX_EXT_CHARS: usize = 16;
+/// A derived name never exceeds what the files directory accepts for one path component.
+const MAX_NAME_BYTES: usize = crate::files::MAX_NAME_BYTES;
+const MAX_EXT_BYTES: usize = 16;
+/// Largest width or height of a picture shown inline.
+const MAX_DIMENSION: u32 = 20_000;
 
 const MIME_BY_EXT: &[(&str, &str)] = &[
     ("3gp", "video/3gpp"),
@@ -82,7 +86,7 @@ fn extension_of(name: &str) -> Option<String> {
     let (stem, ext) = last.rsplit_once('.')?;
     let plausible = !stem.is_empty()
         && !ext.is_empty()
-        && ext.len() <= MAX_EXT_CHARS
+        && ext.len() <= MAX_EXT_BYTES
         && ext.bytes().all(|b| b.is_ascii_alphanumeric());
     plausible.then(|| ext.to_ascii_lowercase())
 }
@@ -197,13 +201,60 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Reduces a remote name to one safe path component: no separators, no control or reserved characters.
+/// Bidi controls, zero-width characters and line separators: invisible, so they can disguise a name.
+fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{061C}'
+            | '\u{FEFF}'
+    )
+}
+
+/// Windows treats these stems as devices, with or without an extension, in any case.
+fn is_windows_device(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or_default().trim_end();
+    let upper = stem.to_ascii_uppercase();
+    if matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) {
+        return true;
+    }
+    ["COM", "LPT"].iter().any(|prefix| {
+        upper.strip_prefix(prefix).is_some_and(|n| {
+            matches!(
+                n,
+                "1" | "2"
+                    | "3"
+                    | "4"
+                    | "5"
+                    | "6"
+                    | "7"
+                    | "8"
+                    | "9"
+                    | "\u{b9}"
+                    | "\u{b2}"
+                    | "\u{b3}"
+            )
+        })
+    })
+}
+
+/// Reduces a remote name to one safe path component: no separators, no control, invisible or
+/// reserved characters, no Windows device name, at most `MAX_NAME_BYTES` bytes.
 pub fn safe_file_name(raw: &str) -> String {
     let base = raw.rsplit(['/', '\\']).next().unwrap_or_default();
     let cleaned: String = base
         .chars()
         .map(|c| {
-            if c.is_control() || matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+            if c.is_control()
+                || is_invisible(c)
+                || matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|')
+            {
                 '_'
             } else {
                 c
@@ -217,22 +268,47 @@ pub fn safe_file_name(raw: &str) -> String {
     if trimmed.is_empty() || trimmed.chars().all(|c| c == '_') {
         return FALLBACK_NAME.to_string();
     }
+    if is_windows_device(trimmed) {
+        return shorten(&format!("_{trimmed}"));
+    }
     shorten(trimmed)
 }
 
-/// Caps the name at `MAX_NAME_CHARS` characters and keeps a short extension.
+/// The longest prefix of `s` within `max` bytes that ends on a character boundary and not on a dot or space.
+fn cut(s: &str, max: usize) -> &str {
+    let mut end = max.min(s.len());
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].trim_end_matches(['.', ' '])
+}
+
+/// Caps the name at `MAX_NAME_BYTES` bytes on a character boundary and keeps a short extension.
 fn shorten(name: &str) -> String {
-    if name.chars().count() <= MAX_NAME_CHARS {
+    if name.len() <= MAX_NAME_BYTES {
         return name.to_string();
     }
     match name.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() && ext.chars().count() <= MAX_EXT_CHARS => {
-            let keep = MAX_NAME_CHARS.saturating_sub(ext.chars().count() + 1);
-            let stem: String = stem.chars().take(keep).collect();
-            format!("{stem}.{ext}")
+        Some((stem, ext)) if !stem.is_empty() && ext.len() <= MAX_EXT_BYTES => {
+            format!("{}.{ext}", cut(stem, MAX_NAME_BYTES - ext.len() - 1))
         }
-        _ => name.chars().take(MAX_NAME_CHARS).collect(),
+        _ => cut(name, MAX_NAME_BYTES).to_string(),
     }
+}
+
+/// `stem-<8 hex of the URL hash>.ext`, within `MAX_NAME_BYTES`: the name a download gets when its
+/// plain name holds other content.
+pub fn hashed_name(name: &str, url: &Url) -> String {
+    let digest = Sha256::digest(url.as_str().as_bytes());
+    let tag = format!("-{}", hex::encode(&digest[..4]));
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && ext.len() <= MAX_EXT_BYTES => {
+            (stem, format!(".{ext}"))
+        }
+        _ => (name, String::new()),
+    };
+    let room = MAX_NAME_BYTES - tag.len() - ext.len();
+    format!("{}{tag}{ext}", cut(stem, room))
 }
 
 /// The last non-empty path segment of a URL, percent-decoded.
@@ -284,31 +360,203 @@ pub fn choose_file_name(
     {
         name.push('.');
         name.push_str(ext);
+        name = shorten(&name);
     }
     name
 }
 
-/// The raster image type of `bytes` by magic number: png, jpeg, gif or webp.
+fn sane_size(width: u32, height: u32) -> bool {
+    (1..=MAX_DIMENSION).contains(&width) && (1..=MAX_DIMENSION).contains(&height)
+}
+
+fn be16(b: &[u8]) -> u32 {
+    u32::from(u16::from_be_bytes([b[0], b[1]]))
+}
+
+fn be32(b: &[u8]) -> u32 {
+    u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+}
+
+fn le16(b: &[u8]) -> u32 {
+    u32::from(u16::from_le_bytes([b[0], b[1]]))
+}
+
+fn le32(b: &[u8]) -> u32 {
+    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+}
+
+/// Signature, then the IHDR chunk: length 13, its type and a width and height in range.
+fn is_png(b: &[u8]) -> bool {
+    b.len() >= 29
+        && b.starts_with(b"\x89PNG\r\n\x1a\n")
+        && b[8..12] == [0, 0, 0, 13]
+        && &b[12..16] == b"IHDR"
+        && sane_size(be32(&b[16..20]), be32(&b[20..24]))
+}
+
+/// SOI, then the segments in turn until a baseline or progressive frame header gives a size.
+fn is_jpeg(b: &[u8]) -> bool {
+    if !b.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return false;
+    }
+    let mut i = 2;
+    while b.get(i) == Some(&0xFF) {
+        while b.get(i) == Some(&0xFF) {
+            i += 1;
+        }
+        let Some(&marker) = b.get(i) else {
+            return false;
+        };
+        i += 1;
+        match marker {
+            0xC0 | 0xC2 => {
+                return b
+                    .get(i..i + 7)
+                    .is_some_and(|f| be16(f) >= 8 && sane_size(be16(&f[5..7]), be16(&f[3..5])));
+            }
+            0x00 | 0x01 | 0xD0..=0xD9 | 0xC1 | 0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => {
+                return false;
+            }
+            _ => {
+                let Some(len) = b.get(i..i + 2).map(be16) else {
+                    return false;
+                };
+                if marker == 0xDA || len < 2 || i + len as usize > b.len() {
+                    return false;
+                }
+                i += len as usize;
+            }
+        }
+    }
+    false
+}
+
+/// Header and logical screen descriptor with a size in range; any data after the colour table
+/// must start with a block introducer.
+fn is_gif(b: &[u8]) -> bool {
+    if b.len() < 13
+        || !(b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a"))
+        || !sane_size(le16(&b[6..8]), le16(&b[8..10]))
+    {
+        return false;
+    }
+    let table = if b[10] & 0x80 != 0 {
+        3usize << ((b[10] & 0x07) + 1)
+    } else {
+        0
+    };
+    b.get(13 + table)
+        .is_none_or(|block| matches!(block, 0x21 | 0x2C | 0x3B))
+}
+
+/// A RIFF whose size matches the body within a byte and whose first chunk is VP8, VP8L or VP8X.
+fn is_webp(b: &[u8]) -> bool {
+    if b.len() < 20 || &b[0..4] != b"RIFF" || &b[8..12] != b"WEBP" {
+        return false;
+    }
+    let body = b.len() as u64;
+    let declared = u64::from(le32(&b[4..8])) + 8;
+    let first = u64::from(le32(&b[16..20])) + 20;
+    declared.abs_diff(body) <= 1
+        && matches!(&b[12..16], b"VP8 " | b"VP8L" | b"VP8X")
+        && first <= body + 1
+}
+
+/// The raster type of `bytes` when its structure parses as a png, jpeg, gif or webp picture.
 pub fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+    if is_png(bytes) {
         Some("image/png")
-    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+    } else if is_jpeg(bytes) {
         Some("image/jpeg")
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+    } else if is_gif(bytes) {
         Some("image/gif")
-    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+    } else if is_webp(bytes) {
         Some("image/webp")
     } else {
         None
     }
 }
 
-/// The MIME type to show `bytes` inline with, or `None` when it is not a small raster image.
+/// The MIME type to show `bytes` inline with, or `None` unless it is a well-formed png, jpeg, gif
+/// or webp picture of at most `INLINE_MAX_BYTES`. Shared by Messenger and WhatsApp downloads.
 pub fn inline_image_mime(bytes: &[u8]) -> Option<&'static str> {
     if bytes.len() > INLINE_MAX_BYTES {
         return None;
     }
     sniff_image_mime(bytes)
+}
+
+#[cfg(test)]
+pub(crate) mod fixtures {
+    /// Real 2x2 pictures written by Pillow, for the tests of this crate.
+    const PNG_B64: &str = concat!(
+        "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFklEQVR42mM8ISfHwMDAxMDAwMDAAAANBAEIf62CUQAAAABJ",
+        "RU5ErkJggg=="
+    );
+    const JPEG_B64: &str = concat!(
+        "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDABALDA4MChAODQ4SERATGCgaGBYWGDEjJR0oOjM9PDkzODdASFxOQERXRTc4UG1R",
+        "V19iZ2hnPk1xeXBkeFxlZ2P/2wBDARESEhgVGC8aGi9jQjhCY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2Nj",
+        "Y2NjY2NjY2NjY2NjY2P/wAARCAACAAIDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAA",
+        "AgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6",
+        "Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXG",
+        "x8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREA",
+        "AgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5",
+        "OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPE",
+        "xcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDHooorhPqD/9k="
+    );
+    const JPEG_PROGRESSIVE_B64: &str = concat!(
+        "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDABALDA4MChAODQ4SERATGCgaGBYWGDEjJR0oOjM9PDkzODdASFxOQERXRTc4UG1R",
+        "V19iZ2hnPk1xeXBkeFxlZ2P/2wBDARESEhgVGC8aGi9jQjhCY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2Nj",
+        "Y2NjY2NjY2NjY2NjY2P/wgARCAACAAIDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAT/xAAVAQEBAAAAAAAAAAAA",
+        "AAAAAAADBf/aAAwDAQACEAMQAAABjAVP/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBEBAAAAAAAAAAAA",
+        "AAAAAAAAAP/aAAgBAwEBPwF//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwF//8QAFBABAAAAAAAAAAAAAAAAAAAA",
+        "AP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPyF//9oADAMBAAIAAwAAABAD/8QAFBEBAAAAAAAA",
+        "AAAAAAAAAAAAAP/aAAgBAwEBPxB//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPxB//8QAFBABAAAAAAAAAAAAAAAA",
+        "AAAAAP/aAAgBAQABPxB//9k="
+    );
+    const GIF_B64: &str = "R0lGODdhAgACAIEAAMgeHgAAAAAAAAAAACwAAAAAAgACAAAIBgABCAQQEAA7";
+    const WEBP_LOSSY_B64: &str =
+        "UklGRjYAAABXRUJQVlA4ICoAAACQAQCdASoCAAIAAsBMJaACdLoAA5gA/u2QP4hd7G2//PTP62/j/xkAAAA=";
+    const WEBP_LOSSLESS_B64: &str = "UklGRh4AAABXRUJQVlA4TBEAAAAvAUAAAAdQjyLXo/+BiOh/AAA=";
+    const WEBP_ALPHA_B64: &str = concat!(
+        "UklGRlYAAABXRUJQVlA4WAoAAAAQAAAAAQAAAQAAQUxQSAUAAAAAgICAgABWUDggKgAAAJABAJ0BKgIAAgACwEwloAJ0ugAD",
+        "mAD+7ZA/iF3sbb/89M/rb+P/GQAAAA=="
+    );
+
+    fn decode(b64: &str) -> Vec<u8> {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .expect("fixture")
+    }
+
+    pub fn png() -> Vec<u8> {
+        decode(PNG_B64)
+    }
+
+    pub fn jpeg() -> Vec<u8> {
+        decode(JPEG_B64)
+    }
+
+    pub fn jpeg_progressive() -> Vec<u8> {
+        decode(JPEG_PROGRESSIVE_B64)
+    }
+
+    pub fn gif() -> Vec<u8> {
+        decode(GIF_B64)
+    }
+
+    pub fn webp_lossy() -> Vec<u8> {
+        decode(WEBP_LOSSY_B64)
+    }
+
+    pub fn webp_lossless() -> Vec<u8> {
+        decode(WEBP_LOSSLESS_B64)
+    }
+
+    pub fn webp_alpha() -> Vec<u8> {
+        decode(WEBP_ALPHA_B64)
+    }
 }
 
 #[cfg(test)]
@@ -418,10 +666,125 @@ mod tests {
         assert_eq!(safe_file_name("trailing. . "), "trailing");
         let long = format!("{}.jpeg", "x".repeat(300));
         let short = safe_file_name(&long);
-        assert_eq!(short.chars().count(), MAX_NAME_CHARS);
+        assert_eq!(short.len(), MAX_NAME_BYTES);
         assert!(short.ends_with(".jpeg"));
         let no_ext = safe_file_name(&"y".repeat(300));
-        assert_eq!(no_ext.chars().count(), MAX_NAME_CHARS);
+        assert_eq!(no_ext.len(), MAX_NAME_BYTES);
+    }
+
+    #[test]
+    fn invisible_characters_and_windows_devices_are_neutralised() {
+        for (raw, want) in [
+            ("invoice\u{202e}gpj.exe", "invoice_gpj.exe"),
+            (
+                "a\u{202a}b\u{202b}c\u{202c}d\u{202d}e\u{202e}f",
+                "a_b_c_d_e_f",
+            ),
+            ("a\u{2066}b\u{2067}c\u{2068}d\u{2069}e", "a_b_c_d_e"),
+            (
+                "a\u{200b}b\u{200c}c\u{200d}d\u{200e}e\u{200f}f",
+                "a_b_c_d_e_f",
+            ),
+            ("a\u{2028}b\u{2029}c\u{feff}d", "a_b_c_d"),
+            ("a\u{2060}b\u{061c}c", "a_b_c"),
+            ("\u{202e}\u{200b}", FALLBACK_NAME),
+            ("CON", "_CON"),
+            ("con.txt", "_con.txt"),
+            ("Nul.tar.gz", "_Nul.tar.gz"),
+            ("PRN", "_PRN"),
+            ("aux.png", "_aux.png"),
+            ("COM1", "_COM1"),
+            ("com9.log", "_com9.log"),
+            ("LPT1.txt", "_LPT1.txt"),
+            ("lpt9", "_lpt9"),
+            ("CON .txt", "_CON .txt"),
+            ("CONIN$", "_CONIN$"),
+            ("com\u{b9}.txt", "_com\u{b9}.txt"),
+            ("CON.", "_CON"),
+            ("COM0", "COM0"),
+            ("COM10", "COM10"),
+            ("CONSOLE.txt", "CONSOLE.txt"),
+            ("my.con", "my.con"),
+            ("LPT", "LPT"),
+            ("communique.pdf", "communique.pdf"),
+        ] {
+            assert_eq!(safe_file_name(raw), want, "{raw:?}");
+        }
+        let u = url("https://cdn.fbsbx.com/files/stream");
+        assert_eq!(
+            choose_file_name(Some("NUL"), None, &u, None),
+            "_NUL",
+            "an explicit name is sanitised too"
+        );
+        assert_eq!(
+            choose_file_name(None, Some("aux.png"), &u, Some("image/png")),
+            "_aux.png"
+        );
+    }
+
+    #[test]
+    fn names_are_capped_by_bytes_on_a_character_boundary() {
+        let wide = "\u{3042}".repeat(100);
+        let capped = safe_file_name(&wide);
+        assert!(capped.len() <= MAX_NAME_BYTES, "{}", capped.len());
+        assert_eq!(
+            capped,
+            "\u{3042}".repeat(66),
+            "66 characters of 3 bytes fit"
+        );
+        let with_ext = safe_file_name(&format!("{wide}.pdf"));
+        assert_eq!(with_ext, format!("{}.pdf", "\u{3042}".repeat(65)));
+        let emoji = format!("{}.png", "\u{1F600}".repeat(70));
+        let out = safe_file_name(&emoji);
+        assert_eq!(out, format!("{}.png", "\u{1F600}".repeat(49)));
+        assert_eq!(out.len(), MAX_NAME_BYTES);
+        let edge = format!("{}.png", "n".repeat(196));
+        assert_eq!(safe_file_name(&edge), edge, "exactly 200 bytes is kept");
+        let over = format!("{}.png", "n".repeat(197));
+        assert_eq!(safe_file_name(&over).len(), MAX_NAME_BYTES);
+        let odd = format!("{} {}.txt", "a".repeat(195), "b".repeat(30));
+        assert_eq!(
+            safe_file_name(&odd),
+            format!("{}.txt", "a".repeat(195)),
+            "a cut that ends on a space drops it"
+        );
+        let long_ext = format!("{}.{}", "s".repeat(100), "e".repeat(300));
+        assert_eq!(safe_file_name(&long_ext).len(), MAX_NAME_BYTES);
+    }
+
+    #[test]
+    fn an_extension_added_from_the_mime_type_stays_within_the_cap() {
+        let u = url("https://cdn.fbsbx.com/files/stream");
+        let bare = "n".repeat(250);
+        let name = choose_file_name(None, Some(&bare), &u, Some("image/png"));
+        assert_eq!(name, format!("{}.png", "n".repeat(196)));
+        let wide = "\u{3042}".repeat(100);
+        let name = choose_file_name(None, Some(&wide), &u, Some("application/pdf"));
+        assert_eq!(name, format!("{}.pdf", "\u{3042}".repeat(65)));
+        assert!(name.len() <= MAX_NAME_BYTES);
+        let exact = "n".repeat(196);
+        assert_eq!(
+            choose_file_name(None, Some(&exact), &u, Some("image/png")),
+            format!("{exact}.png"),
+            "a name that fits with its extension is untouched"
+        );
+    }
+
+    #[test]
+    fn a_taken_name_gets_a_hash_of_the_url() {
+        let a = url("https://cdn.fbsbx.com/a/doc.pdf");
+        let b = url("https://cdn.fbsbx.com/b/doc.pdf");
+        assert_eq!(hashed_name("doc.pdf", &a), "doc-ac964be3.pdf");
+        assert_eq!(hashed_name("doc.pdf", &b), "doc-358b1744.pdf");
+        assert_eq!(hashed_name("doc.pdf", &a), hashed_name("doc.pdf", &a));
+        assert_eq!(hashed_name("archive", &a), "archive-ac964be3");
+        assert_eq!(hashed_name("a.tar.gz", &a), "a.tar-ac964be3.gz");
+        let long = format!("{}.jpeg", "x".repeat(200));
+        let name = hashed_name(&safe_file_name(&long), &a);
+        assert!(name.len() <= MAX_NAME_BYTES && name.ends_with("-ac964be3.jpeg"));
+        let wide = hashed_name(&safe_file_name(&"\u{3042}".repeat(100)), &a);
+        assert!(wide.len() <= MAX_NAME_BYTES && wide.ends_with("-ac964be3"));
+        assert!(wide.is_char_boundary(wide.len() - 9));
     }
 
     #[test]
@@ -485,17 +848,27 @@ mod tests {
         );
     }
 
+    fn patched(base: &[u8], at: usize, patch: &[u8]) -> Vec<u8> {
+        let mut v = base.to_vec();
+        v[at..at + patch.len()].copy_from_slice(patch);
+        v
+    }
+
     #[test]
     fn inline_decision_needs_a_small_real_raster_image() {
-        let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
-        let jpeg = [0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10];
-        let mut webp = b"RIFF\0\0\0\0WEBPVP8 ".to_vec();
-        webp.extend_from_slice(&[0; 8]);
-        assert_eq!(inline_image_mime(png), Some("image/png"));
-        assert_eq!(inline_image_mime(&jpeg), Some("image/jpeg"));
-        assert_eq!(inline_image_mime(b"GIF89a\x01\0\x01\0"), Some("image/gif"));
-        assert_eq!(inline_image_mime(b"GIF87a\x01\0\x01\0"), Some("image/gif"));
-        assert_eq!(inline_image_mime(&webp), Some("image/webp"));
+        let png = fixtures::png();
+        for (bytes, want) in [
+            (png.clone(), "image/png"),
+            (fixtures::jpeg(), "image/jpeg"),
+            (fixtures::jpeg_progressive(), "image/jpeg"),
+            (fixtures::gif(), "image/gif"),
+            (fixtures::webp_lossy(), "image/webp"),
+            (fixtures::webp_lossless(), "image/webp"),
+            (fixtures::webp_alpha(), "image/webp"),
+        ] {
+            assert_eq!(inline_image_mime(&bytes), Some(want));
+            assert_eq!(sniff_image_mime(&bytes), Some(want));
+        }
         assert_eq!(
             inline_image_mime(b"<svg xmlns='http://www.w3.org/2000/svg'/>"),
             None
@@ -503,10 +876,295 @@ mod tests {
         assert_eq!(inline_image_mime(b"%PDF-1.7"), None);
         assert_eq!(inline_image_mime(b"RIFF\0\0\0\0WAVEfmt "), None);
         assert_eq!(inline_image_mime(b""), None);
-        let mut big = png.to_vec();
+        let mut big = png;
         big.resize(INLINE_MAX_BYTES, 0);
         assert_eq!(inline_image_mime(&big), Some("image/png"));
         big.push(0);
         assert_eq!(inline_image_mime(&big), None);
+        assert_eq!(
+            sniff_image_mime(&big),
+            Some("image/png"),
+            "only the size stops a big picture"
+        );
+    }
+
+    #[test]
+    fn polyglot_bodies_that_only_start_like_an_image_are_not_images() {
+        for (label, body) in [
+            (
+                "png magic then html",
+                [
+                    b"\x89PNG\r\n\x1a\n".as_slice(),
+                    b"<html><script>alert(1)</script>",
+                ]
+                .concat(),
+            ),
+            (
+                "jpeg magic then text",
+                [b"\xFF\xD8\xFF".as_slice(), b"not really a jpeg, just text"].concat(),
+            ),
+            (
+                "gif magic then php",
+                [b"GIF89a".as_slice(), b"<?php system($_GET[0]); ?>"].concat(),
+            ),
+            (
+                "gif magic then html with small dimensions",
+                [
+                    b"GIF89a".as_slice(),
+                    b" <!-- <html><script>alert(1)</script>",
+                ]
+                .concat(),
+            ),
+            (
+                "webp magic then text",
+                [b"RIFF\0\0\0\0WEBP".as_slice(), b"garbage garbage"].concat(),
+            ),
+            (
+                "webp with the right size but no vp8 chunk",
+                [b"RIFF\x1a\0\0\0WEBP".as_slice(), b"<html>1234567890</html>"].concat(),
+            ),
+            ("magic numbers only", b"\x89PNG\r\n\x1a\n".to_vec()),
+            ("jpeg magic only", vec![0xFF, 0xD8, 0xFF, 0xE0]),
+            ("gif magic only", b"GIF89a".to_vec()),
+        ] {
+            assert_eq!(sniff_image_mime(&body), None, "{label}");
+            assert_eq!(inline_image_mime(&body), None, "{label}");
+        }
+    }
+
+    #[test]
+    fn png_structure_is_the_signature_and_an_ihdr_with_sane_sizes() {
+        let png = fixtures::png();
+        let sizes = |w: u32, h: u32| {
+            let mut v = patched(&png, 16, &w.to_be_bytes());
+            v[20..24].copy_from_slice(&h.to_be_bytes());
+            v
+        };
+        for (label, bytes, ok) in [
+            ("the real file", png.clone(), true),
+            ("1 by 1", sizes(1, 1), true),
+            ("20000 by 20000", sizes(20_000, 20_000), true),
+            ("zero width", sizes(0, 2), false),
+            ("zero height", sizes(2, 0), false),
+            ("width 20001", sizes(20_001, 2), false),
+            ("height 20001", sizes(2, 20_001), false),
+            ("huge", sizes(u32::MAX, u32::MAX), false),
+            ("wrong IHDR length", patched(&png, 8, &[0, 0, 0, 12]), false),
+            ("another chunk first", patched(&png, 12, b"IDAT"), false),
+            ("damaged signature", patched(&png, 1, b"png"), false),
+            ("cut inside the dimensions", png[..23].to_vec(), false),
+            ("cut right after the IHDR data", png[..29].to_vec(), true),
+        ] {
+            assert_eq!(sniff_image_mime(&bytes).is_some(), ok, "{label}");
+        }
+    }
+
+    #[test]
+    fn jpeg_segments_are_walked_to_a_baseline_or_progressive_frame() {
+        let sof = |marker: u8, h: u16, w: u16| {
+            let mut v = vec![0xFF, 0xD8, 0xFF, 0xE0, 0, 4, 0, 0, 0xFF, marker, 0, 8, 8];
+            v.extend(h.to_be_bytes());
+            v.extend(w.to_be_bytes());
+            v
+        };
+        for (label, bytes, ok) in [
+            ("real baseline", fixtures::jpeg(), true),
+            ("real progressive", fixtures::jpeg_progressive(), true),
+            ("sof0 after an app segment", sof(0xC0, 16, 16), true),
+            ("sof2", sof(0xC2, 16, 16), true),
+            ("20000 by 20000", sof(0xC0, 20_000, 20_000), true),
+            ("zero height", sof(0xC0, 0, 16), false),
+            ("zero width", sof(0xC0, 16, 0), false),
+            ("width 20001", sof(0xC0, 16, 20_001), false),
+            ("height 65535", sof(0xC0, 65_535, 16), false),
+            ("extended sequential", sof(0xC1, 16, 16), false),
+            ("lossless", sof(0xC3, 16, 16), false),
+            ("arithmetic coded", sof(0xC9, 16, 16), false),
+            (
+                "sof straight after soi",
+                {
+                    let mut v = vec![0xFF, 0xD8, 0xFF, 0xC0, 0, 8, 8, 0, 1, 0, 1];
+                    v.push(0);
+                    v
+                },
+                true,
+            ),
+            (
+                "fill bytes before a marker",
+                vec![0xFF, 0xD8, 0xFF, 0xFF, 0xFF, 0xC0, 0, 8, 8, 0, 1, 0, 1],
+                true,
+            ),
+            (
+                "a table segment is skipped",
+                vec![
+                    0xFF, 0xD8, 0xFF, 0xC4, 0, 4, 0, 0, 0xFF, 0xC0, 0, 8, 8, 0, 1, 0, 1,
+                ],
+                true,
+            ),
+            (
+                "start of scan before any frame",
+                vec![
+                    0xFF, 0xD8, 0xFF, 0xDA, 0, 4, 0, 0, 0xFF, 0xC0, 0, 8, 8, 0, 1, 0, 1,
+                ],
+                false,
+            ),
+            (
+                "end of image before any frame",
+                vec![0xFF, 0xD8, 0xFF, 0xD9, 0xFF, 0xC0, 0, 8, 8, 0, 1, 0, 1],
+                false,
+            ),
+            (
+                "a segment longer than the file",
+                vec![0xFF, 0xD8, 0xFF, 0xE0, 0xFF, 0xFF, 0, 0],
+                false,
+            ),
+            (
+                "a segment length of one",
+                vec![
+                    0xFF, 0xD8, 0xFF, 0xE0, 0, 1, 0, 0, 0xFF, 0xC0, 0, 8, 8, 0, 1, 0, 1,
+                ],
+                false,
+            ),
+            (
+                "junk between segments",
+                vec![
+                    0xFF, 0xD8, 0xFF, 0xE0, 0, 4, 0, 0, 0x41, 0x41, 0xFF, 0xC0, 0, 8, 8, 0, 1, 0, 1,
+                ],
+                false,
+            ),
+            (
+                "a stuffed zero is not a marker",
+                vec![0xFF, 0xD8, 0xFF, 0x00, 0, 4, 0, 0],
+                false,
+            ),
+            (
+                "frame header too short",
+                vec![0xFF, 0xD8, 0xFF, 0xC0, 0, 7, 8, 0, 1, 0, 1],
+                false,
+            ),
+            (
+                "cut inside the frame header",
+                vec![0xFF, 0xD8, 0xFF, 0xC0, 0, 8, 8, 0, 1],
+                false,
+            ),
+            ("soi alone", vec![0xFF, 0xD8, 0xFF], false),
+            (
+                "trailing garbage after a frame is fine",
+                {
+                    let mut v = sof(0xC0, 16, 16);
+                    v.extend(b"<html>");
+                    v
+                },
+                true,
+            ),
+        ] {
+            assert_eq!(sniff_image_mime(&bytes).is_some(), ok, "{label}");
+        }
+    }
+
+    #[test]
+    fn gif_structure_is_a_header_a_screen_descriptor_and_a_block() {
+        let real = fixtures::gif();
+        for (label, bytes, ok) in [
+            ("the real file", real.clone(), true),
+            (
+                "87a header and screen only",
+                b"GIF87a\x01\0\x01\0\x80\0\0".to_vec(),
+                true,
+            ),
+            (
+                "89a header and screen only",
+                b"GIF89a\x01\0\x01\0\0\0\0".to_vec(),
+                true,
+            ),
+            (
+                "with a trailer",
+                b"GIF89a\x01\0\x01\0\0\0\0;".to_vec(),
+                true,
+            ),
+            (
+                "with an image block",
+                b"GIF89a\x01\0\x01\0\0\0\0,junk".to_vec(),
+                true,
+            ),
+            (
+                "with an extension block",
+                b"GIF89a\x01\0\x01\0\0\0\0!\xf9".to_vec(),
+                true,
+            ),
+            (
+                "width and height only",
+                b"GIF89a\x01\0\x01\0".to_vec(),
+                false,
+            ),
+            ("zero width", b"GIF89a\0\0\x01\0\0\0\0".to_vec(), false),
+            ("zero height", b"GIF89a\x01\0\0\0\0\0\0".to_vec(), false),
+            ("width 20001", b"GIF89a\x21\x4e\x01\0\0\0\0".to_vec(), false),
+            (
+                "65535 by 65535",
+                b"GIF89a\xff\xff\xff\xff\0\0\0".to_vec(),
+                false,
+            ),
+            (
+                "a made-up version",
+                b"GIF88a\x01\0\x01\0\0\0\0".to_vec(),
+                false,
+            ),
+            ("lower case", b"gif89a\x01\0\x01\0\0\0\0".to_vec(), false),
+            (
+                "text after the screen",
+                b"GIF89a\x01\0\x01\0\0\0\0<html>".to_vec(),
+                false,
+            ),
+        ] {
+            assert_eq!(sniff_image_mime(&bytes).is_some(), ok, "{label}");
+        }
+    }
+
+    #[test]
+    fn webp_structure_is_a_riff_of_the_right_size_with_a_vp8_chunk() {
+        let lossy = fixtures::webp_lossy();
+        let declared = u32::from_le_bytes([lossy[4], lossy[5], lossy[6], lossy[7]]);
+        assert_eq!(declared as usize, lossy.len() - 8);
+        let resized = |delta: i64| {
+            patched(
+                &lossy,
+                4,
+                &u32::try_from(i64::from(declared) + delta)
+                    .expect("size")
+                    .to_le_bytes(),
+            )
+        };
+        let mut longer = lossy.clone();
+        longer.push(0);
+        let mut much_longer = lossy.clone();
+        much_longer.extend([0, 0]);
+        for (label, bytes, ok) in [
+            ("lossy", lossy.clone(), true),
+            ("lossless", fixtures::webp_lossless(), true),
+            ("extended", fixtures::webp_alpha(), true),
+            ("size one too small", resized(-1), true),
+            ("size one too large", resized(1), true),
+            ("a pad byte after the declared size", longer, true),
+            ("size two too small", resized(-2), false),
+            ("size two too large", resized(2), false),
+            (
+                "two stray bytes after the declared size",
+                much_longer,
+                false,
+            ),
+            ("size zero", patched(&lossy, 4, &[0, 0, 0, 0]), false),
+            ("another chunk first", patched(&lossy, 12, b"ALPH"), false),
+            ("a wave file", patched(&lossy, 8, b"WAVE"), false),
+            ("not riff", patched(&lossy, 0, b"RIFX"), false),
+            (
+                "first chunk larger than the file",
+                patched(&lossy, 16, &[0xFF, 0, 0, 0]),
+                false,
+            ),
+            ("cut inside the chunk header", lossy[..18].to_vec(), false),
+        ] {
+            assert_eq!(sniff_image_mime(&bytes).is_some(), ok, "{label}");
+        }
     }
 }

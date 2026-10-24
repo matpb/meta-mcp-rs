@@ -198,3 +198,106 @@ pub async fn mock_graph() -> MockServer {
 pub async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
     tokio::task::spawn_blocking(f).await.expect("join")
 }
+
+/// The Graph base URL to give the server under test for a mock at `uri`: the same mock under the
+/// name `localhost`, so its `127.0.0.1` media URLs are on another host than the Graph API.
+pub fn graph_base(uri: &str) -> String {
+    uri.replacen("127.0.0.1", "localhost", 1)
+}
+
+/// A second mock server on another loopback address, so its host differs from `127.0.0.1` and
+/// `localhost`. Gives the server and its host as written in URLs; `None` where none can be bound.
+pub async fn mock_on_other_loopback() -> Option<(MockServer, String)> {
+    for host in ["127.0.0.2", "[::1]"] {
+        let bare = host.trim_matches(['[', ']']);
+        if let Ok(listener) = TcpListener::bind((bare, 0)) {
+            let server = MockServer::builder().listener(listener).start().await;
+            return Some((server, host.to_string()));
+        }
+    }
+    None
+}
+
+// Real 2x2 pictures written by Pillow.
+const PNG_B64: &str = concat!(
+    "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFklEQVR42mM8ISfHwMDAxMDAwMDAAAANBAEIf62CUQAAAABJ",
+    "RU5ErkJggg=="
+);
+const JPEG_B64: &str = concat!(
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDABALDA4MChAODQ4SERATGCgaGBYWGDEjJR0oOjM9PDkzODdASFxOQERXRTc4UG1R",
+    "V19iZ2hnPk1xeXBkeFxlZ2P/2wBDARESEhgVGC8aGi9jQjhCY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2Nj",
+    "Y2NjY2NjY2NjY2NjY2P/wAARCAACAAIDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAA",
+    "AgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6",
+    "Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXG",
+    "x8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREA",
+    "AgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5",
+    "OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPE",
+    "xcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDHooorhPqD/9k="
+);
+const JPEG_PROGRESSIVE_B64: &str = concat!(
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDABALDA4MChAODQ4SERATGCgaGBYWGDEjJR0oOjM9PDkzODdASFxOQERXRTc4UG1R",
+    "V19iZ2hnPk1xeXBkeFxlZ2P/2wBDARESEhgVGC8aGi9jQjhCY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2Nj",
+    "Y2NjY2NjY2NjY2NjY2P/wgARCAACAAIDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAT/xAAVAQEBAAAAAAAAAAAA",
+    "AAAAAAADBf/aAAwDAQACEAMQAAABjAVP/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBEBAAAAAAAAAAAA",
+    "AAAAAAAAAP/aAAgBAwEBPwF//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwF//8QAFBABAAAAAAAAAAAAAAAAAAAA",
+    "AP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPyF//9oADAMBAAIAAwAAABAD/8QAFBEBAAAAAAAA",
+    "AAAAAAAAAAAAAP/aAAgBAwEBPxB//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPxB//8QAFBABAAAAAAAAAAAAAAAA",
+    "AAAAAP/aAAgBAQABPxB//9k="
+);
+const GIF_B64: &str = "R0lGODdhAgACAIEAAMgeHgAAAAAAAAAAACwAAAAAAgACAAAIBgABCAQQEAA7";
+const WEBP_LOSSY_B64: &str =
+    "UklGRjYAAABXRUJQVlA4ICoAAACQAQCdASoCAAIAAsBMJaACdLoAA5gA/u2QP4hd7G2//PTP62/j/xkAAAA=";
+const WEBP_LOSSLESS_B64: &str = "UklGRh4AAABXRUJQVlA4TBEAAAAvAUAAAAdQjyLXo/+BiOh/AAA=";
+const WEBP_ALPHA_B64: &str = concat!(
+    "UklGRlYAAABXRUJQVlA4WAoAAAAQAAAAAQAAAQAAQUxQSAUAAAAAgICAgABWUDggKgAAAJABAJ0BKgIAAgACwEwloAJ0ugAD",
+    "mAD+7ZA/iF3sbb/89M/rb+P/GQAAAA=="
+);
+
+fn decode(b64: &str) -> Vec<u8> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .expect("image fixture")
+}
+
+pub fn png_image() -> Vec<u8> {
+    decode(PNG_B64)
+}
+
+pub fn jpeg_image() -> Vec<u8> {
+    decode(JPEG_B64)
+}
+
+pub fn gif_image() -> Vec<u8> {
+    decode(GIF_B64)
+}
+
+pub fn webp_image() -> Vec<u8> {
+    decode(WEBP_LOSSY_B64)
+}
+
+/// Bodies that start like a picture and are not one, as found by the review: (label, bytes).
+pub fn polyglot_bodies() -> Vec<(&'static str, Vec<u8>)> {
+    vec![
+        (
+            "png_html",
+            [
+                b"\x89PNG\r\n\x1a\n".as_slice(),
+                b"<html><script>alert(1)</script>",
+            ]
+            .concat(),
+        ),
+        (
+            "jpeg_text",
+            [b"\xFF\xD8\xFF".as_slice(), b"not really a jpeg, just text"].concat(),
+        ),
+        (
+            "gif_php",
+            [b"GIF89a".as_slice(), b"<?php system($_GET[0]); ?>"].concat(),
+        ),
+        (
+            "webp_text",
+            [b"RIFF\0\0\0\0WEBP".as_slice(), b"garbage garbage"].concat(),
+        ),
+    ]
+}

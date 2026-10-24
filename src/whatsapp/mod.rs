@@ -14,7 +14,7 @@ use url::Url;
 
 use crate::config::Config;
 use crate::config::secret::Secret;
-use crate::files::{FileError, FileJail, clean_remote_filename, sanitize_filename};
+use crate::files::{FileError, FileJail, clean_remote_filename, inbound_dest, sanitize_filename};
 use crate::graph::download::{TokenMode, is_allowed_host};
 use crate::graph::error::as_i64;
 use crate::graph::{GraphClient, GraphError};
@@ -33,6 +33,7 @@ const WINDOW_SECS: i64 = 24 * 3600;
 const DEFAULT_LANGUAGE: &str = "en_US";
 const UNSURE_NOTE: &str =
     "the message may still have been delivered: check inbox status events before sending again";
+const INBOUND_PLATFORM: &str = "whatsapp";
 
 /// Reduces a phone number to digits (a `(0)` after the country code goes too) and refuses one
 /// that starts with 0, which is national or dialled. User ids such as `US.123` pass through.
@@ -364,8 +365,12 @@ fn read_for_upload(
     name: &str,
     kind: MediaKind,
     global_cap: u64,
+    allow_inbound: bool,
 ) -> Result<Vec<u8>, GraphError> {
     let resolved = jail.resolve_read(path)?;
+    if !allow_inbound && jail.is_inbound(&resolved) {
+        return Err(FileError::Inbound(path.to_string()).into());
+    }
     let size = std::fs::metadata(&resolved)
         .map_err(|e| GraphError::Refused(format!("cannot read `{path}`: {e}")))?
         .len();
@@ -381,7 +386,7 @@ fn read_for_upload(
     if size > kind.max_bytes() {
         return Err(too_big(kind.max_bytes(), size));
     }
-    let bytes = jail.read_capped(path, kind.max_bytes().min(global_cap))?;
+    let bytes = jail.read_upload(path, kind.max_bytes().min(global_cap), allow_inbound)?;
     let limit = media::limit_for(kind, &bytes);
     if bytes.len() as u64 > limit {
         return Err(too_big(limit, bytes.len() as u64));
@@ -583,7 +588,12 @@ impl WhatsApp {
             Source::Link(link) => MediaSource::Link(link),
             Source::Path(path) => {
                 let prepared = self
-                    .prepare_upload(path, Some(kind), present(&p.mime_type))
+                    .prepare_upload(
+                        path,
+                        Some(kind),
+                        present(&p.mime_type),
+                        p.allow_inbound.unwrap_or(false),
+                    )
                     .await?;
                 if p.voice == Some(true) && base_mime(&prepared.mime) != "audio/ogg" {
                     return Err(invalid(
@@ -677,7 +687,12 @@ impl WhatsApp {
         let kind = present(&p.kind).map(parse_kind).transpose()?;
         let line = self.line(p.phone_number_id.as_deref())?;
         let prepared = self
-            .prepare_upload(p.path.trim(), kind, present(&p.mime_type))
+            .prepare_upload(
+                p.path.trim(),
+                kind,
+                present(&p.mime_type),
+                p.allow_inbound.unwrap_or(false),
+            )
             .await?;
         let uploaded = self.upload_prepared(&line, prepared).await?;
         Ok(json!({
@@ -694,6 +709,7 @@ impl WhatsApp {
         path: &str,
         wanted: Option<MediaKind>,
         mime_override: Option<&str>,
+        allow_inbound: bool,
     ) -> Result<Prepared, GraphError> {
         if path.trim().is_empty() {
             return Err(invalid("path must not be empty"));
@@ -703,7 +719,9 @@ impl WhatsApp {
         let resolved = media::resolve(&file_name, wanted, mime_override).map_err(invalid)?;
         let (path, name, kind) = (path.to_string(), file_name.clone(), resolved.kind);
         let cap = self.cfg.max_file_bytes;
-        let bytes = blocking(move || read_for_upload(&jail, &path, &name, kind, cap)).await?;
+        let bytes =
+            blocking(move || read_for_upload(&jail, &path, &name, kind, cap, allow_inbound))
+                .await?;
         Ok(Prepared {
             bytes,
             mime: resolved.mime,
@@ -761,7 +779,9 @@ impl WhatsApp {
                     .into(),
             ));
         }
-        let named = present(&p.dest_name).map(str::to_string);
+        let named = present(&p.dest_name)
+            .map(|dest| inbound_dest(INBOUND_PLATFORM, dest))
+            .transpose()?;
         if let Some(dest) = &named {
             check_dest(&jail, dest, overwrite).await?;
         }
@@ -797,7 +817,8 @@ impl WhatsApp {
             Some(dest) => dest,
             None => {
                 let ext = extension_for_mime(reported_mime.as_deref().unwrap_or_default());
-                let dest = format!("whatsapp_{}.{ext}", sanitize_filename(media_id));
+                let name = format!("whatsapp_{}.{ext}", sanitize_filename(media_id));
+                let dest = inbound_dest(INBOUND_PLATFORM, &name)?;
                 check_dest(&jail, &dest, overwrite).await?;
                 dest
             }

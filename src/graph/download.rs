@@ -1,4 +1,4 @@
-//! Safe media download: host allowlist, manual redirects, token only on listed hosts, size cap.
+//! Safe media download: host allowlist, never the Graph host, manual redirects, token only on listed hosts, size cap.
 
 use bytes::{Bytes, BytesMut};
 use reqwest::header::{CONTENT_TYPE, LOCATION};
@@ -12,8 +12,6 @@ const MAX_HOPS: usize = 5;
 const DEFAULT_HOSTS: &[&str] = &[
     "*.fbcdn.net",
     "*.fbsbx.com",
-    "*.facebook.com",
-    "*.messenger.com",
     "*.whatsapp.net",
     "lookaside.fbsbx.com",
 ];
@@ -91,8 +89,28 @@ fn refused_host(url: &Url) -> GraphError {
     ))
 }
 
+fn refused_graph_host(url: &Url) -> GraphError {
+    GraphError::Refused(format!(
+        "refusing to download from `{}`: it is the Graph API host, where a fetch is an API call made with your credentials, not a media download; nothing was fetched",
+        url.host_str().unwrap_or("?")
+    ))
+}
+
+/// A host name without case or a trailing root dot, for comparing two spellings of one host.
+fn bare_host(host: &str) -> String {
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
 impl GraphClient {
-    /// Fetches `url` with every hop checked against the allowlist and the size cap.
+    /// True when `url` is on the Graph base URL's host, whatever the port or path.
+    pub fn is_graph_host(&self, url: &Url) -> bool {
+        match (url.host_str(), self.base.host_str()) {
+            (Some(a), Some(b)) => bare_host(a) == bare_host(b),
+            _ => false,
+        }
+    }
+
+    /// Fetches `url` with every hop checked against the allowlist, the Graph host and the size cap.
     pub async fn download(
         &self,
         url: &Url,
@@ -101,6 +119,9 @@ impl GraphClient {
     ) -> Result<Downloaded, GraphError> {
         let mut current = url.clone();
         for hop in 0..=MAX_HOPS {
+            if self.is_graph_host(&current) {
+                return Err(refused_graph_host(&current));
+            }
             if !is_allowed_host(&current, &self.download_hosts) {
                 return Err(refused_host(&current));
             }
@@ -188,15 +209,18 @@ mod tests {
             "https://scontent.xx.fbcdn.net/v/t1.0/a.jpg",
             "https://lookaside.fbsbx.com/whatsapp_business/attachments/?mid=1",
             "https://cdn.fbsbx.com/x",
-            "https://www.facebook.com/x",
             "https://static.xx.fbcdn.net/x",
             "https://mmg.whatsapp.net/x",
-            "https://api.messenger.com/x",
             "https://SCONTENT.xx.fbcdn.net/x",
         ] {
             assert!(is_allowed_host(&u(ok), &none), "{ok}");
         }
         for bad in [
+            "https://www.facebook.com/x",
+            "https://graph.facebook.com/v26.0/me?fields=access_token",
+            "https://business.facebook.com/x",
+            "https://api.messenger.com/x",
+            "https://facebook.com/x",
             "https://fbcdn.net/x",
             "https://evilfbcdn.net/x",
             "https://scontent.fbcdn.net.evil.com/x",
@@ -208,6 +232,68 @@ mod tests {
             "file:///etc/passwd",
         ] {
             assert!(!is_allowed_host(&u(bad), &none), "{bad}");
+        }
+    }
+
+    fn graph_client(base: &str, hosts: &[&str]) -> GraphClient {
+        let settings = crate::config::GraphSettings {
+            base_url: base.to_string(),
+            ..crate::config::GraphSettings::default()
+        };
+        let hosts = hosts.iter().map(|h| (*h).to_string()).collect();
+        GraphClient::new(&settings, hosts).expect("client")
+    }
+
+    #[test]
+    fn the_graph_host_is_recognised_in_every_spelling() {
+        let c = graph_client("https://graph.facebook.com", &[]);
+        for same in [
+            "https://graph.facebook.com/v26.0/me",
+            "https://GRAPH.facebook.com/x",
+            "https://graph.facebook.com./x",
+            "https://graph.facebook.com:8443/x",
+            "http://graph.facebook.com/x",
+        ] {
+            assert!(c.is_graph_host(&u(same)), "{same}");
+        }
+        for other in [
+            "https://scontent.xx.fbcdn.net/x",
+            "https://x.graph.facebook.com/x",
+            "https://graph.facebook.com.evil.example/x",
+            "https://facebook.com/x",
+            "https://lookaside.fbsbx.com/x",
+        ] {
+            assert!(!c.is_graph_host(&u(other)), "{other}");
+        }
+        let proxy = graph_client("http://127.0.0.1:4000/graph/", &[]);
+        assert!(proxy.is_graph_host(&u("http://127.0.0.1:9/x")));
+        assert!(proxy.is_graph_host(&u("http://127.1/x")));
+        assert!(!proxy.is_graph_host(&u("http://localhost:4000/x")));
+    }
+
+    #[tokio::test]
+    async fn the_graph_host_is_refused_in_every_mode_before_any_request() {
+        let c = graph_client("https://graph.facebook.com", &["graph.facebook.com"]);
+        let token = Secret::new("t");
+        let hosts = ["graph.facebook.com".to_string()];
+        let on_hosts = TokenMode::OnHosts {
+            token: &token,
+            hosts: &hosts,
+        };
+        for mode in [TokenMode::Never, on_hosts] {
+            for target in [
+                "https://graph.facebook.com/v26.0/me?fields=access_token",
+                "https://graph.facebook.com:443/v26.0/1234/conversations",
+            ] {
+                let err = c.download(&u(target), mode, 1024).await.expect_err(target);
+                let text = err.to_string();
+                assert!(
+                    matches!(err, GraphError::Refused(_))
+                        && text.contains("Graph API host")
+                        && text.contains("graph.facebook.com"),
+                    "{target}: {text}"
+                );
+            }
         }
     }
 
