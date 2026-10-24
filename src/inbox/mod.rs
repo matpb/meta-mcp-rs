@@ -49,6 +49,10 @@ pub enum Platform {
     Messenger,
     WhatsApp,
     Instagram,
+    #[serde(rename = "messenger_personal")]
+    MessengerPersonal,
+    #[serde(rename = "whatsapp_personal")]
+    WhatsAppPersonal,
 }
 
 impl Platform {
@@ -57,6 +61,8 @@ impl Platform {
             Self::Messenger => "messenger",
             Self::WhatsApp => "whatsapp",
             Self::Instagram => "instagram",
+            Self::MessengerPersonal => "messenger_personal",
+            Self::WhatsAppPersonal => "whatsapp_personal",
         }
     }
 
@@ -65,6 +71,8 @@ impl Platform {
             "messenger" => Some(Self::Messenger),
             "whatsapp" => Some(Self::WhatsApp),
             "instagram" => Some(Self::Instagram),
+            "messenger_personal" => Some(Self::MessengerPersonal),
+            "whatsapp_personal" => Some(Self::WhatsAppPersonal),
             _ => None,
         }
     }
@@ -627,8 +635,17 @@ mod tests {
 
     #[test]
     fn enums_round_trip_through_strings_and_serde() {
-        for p in [Platform::Messenger, Platform::WhatsApp, Platform::Instagram] {
+        for p in [
+            Platform::Messenger,
+            Platform::WhatsApp,
+            Platform::Instagram,
+            Platform::MessengerPersonal,
+            Platform::WhatsAppPersonal,
+        ] {
             assert_eq!(Platform::parse(p.as_str()), Some(p));
+            let json = serde_json::to_value(p).expect("serialize");
+            assert_eq!(json, serde_json::json!(p.as_str()));
+            assert_eq!(serde_json::from_value::<Platform>(json).expect("de"), p);
             assert_eq!(serde_json::to_value(p).expect("json"), json!(p.as_str()));
         }
         for k in EventKind::ALL {

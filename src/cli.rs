@@ -6,6 +6,7 @@ use std::process::ExitCode;
 use clap::{ArgGroup, Args, Parser, Subcommand};
 
 use crate::config::Config;
+use crate::personal::PersonalPlatform;
 use crate::setup::oauth::RedirectMode;
 use crate::{mcp, server, setup};
 
@@ -180,6 +181,97 @@ pub enum TokenCommand {
     },
 }
 
+/// The personal platforms a command can name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum PersonalPlatformArg {
+    Messenger,
+    Whatsapp,
+}
+
+impl PersonalPlatformArg {
+    fn platform(self) -> PersonalPlatform {
+        match self {
+            Self::Messenger => PersonalPlatform::Messenger,
+            Self::Whatsapp => PersonalPlatform::WhatsApp,
+        }
+    }
+}
+
+/// A personal-account login flow.
+#[derive(Debug, Clone, Subcommand)]
+pub enum LoginCommand {
+    /// Log in to Messenger with the cookies of a browser session
+    Messenger {
+        /// File holding a cURL command, a JSON object of cookies or a JSON array of {name, value}
+        #[arg(long, value_name = "PATH", conflicts_with = "cookies_json")]
+        cookies_file: Option<PathBuf>,
+        /// The same input as a string (visible in the process list: prefer --cookies-file)
+        #[arg(long, value_name = "JSON")]
+        cookies_json: Option<String>,
+    },
+    /// Link this machine to WhatsApp as a companion device (QR code, or a code typed on the phone)
+    Whatsapp {
+        /// Link with a code typed on the phone instead of a QR code: the phone number, digits only
+        #[arg(long, value_name = "PHONE")]
+        pair_code: Option<String>,
+        /// Ask the phone for the full message history (honoured on a first link only)
+        #[arg(long)]
+        full_history: bool,
+        /// Name shown in the phone's list of linked devices
+        #[arg(long, value_name = "NAME", default_value = "meta-mcp")]
+        device_name: String,
+    },
+}
+
+/// A personal-account command.
+#[derive(Debug, Clone, Subcommand)]
+pub enum PersonalCommand {
+    /// Run the long-lived daemon that owns the Messenger and WhatsApp sidecars
+    Daemon {
+        /// Unix socket to listen on (default: $XDG_RUNTIME_DIR/meta-mcp/personal.sock)
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+    },
+    /// Log in to a personal account through the daemon
+    #[command(subcommand)]
+    Login(LoginCommand),
+    /// Show both accounts: login, connection, sending state, versions
+    Status {
+        /// Print the daemon's answer as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Forget the stored session of an account
+    Logout {
+        #[arg(value_enum)]
+        platform: PersonalPlatformArg,
+    },
+    /// Restart an account's sidecar and clear a sending block
+    Restart {
+        #[arg(value_enum)]
+        platform: PersonalPlatformArg,
+    },
+    /// Install and start the daemon as systemd user units
+    Install {
+        /// Print the units and the commands without writing or running anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Stop the daemon and remove its systemd user units (sessions and audit log stay)
+    Uninstall {
+        /// Print what would happen without doing it
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+/// Options of `meta-mcp personal`.
+#[derive(Debug, Clone, Args)]
+pub struct PersonalArgs {
+    #[command(subcommand)]
+    pub command: PersonalCommand,
+}
+
 /// Options of `meta-mcp token`.
 #[derive(Debug, Clone, Args)]
 pub struct TokenArgs {
@@ -205,6 +297,8 @@ pub enum Command {
     Doctor(DoctorArgs),
     /// Refresh, import or show tokens
     Token(TokenArgs),
+    /// Personal Messenger and WhatsApp accounts through the local daemon
+    Personal(PersonalArgs),
     /// Print every tool name, one per line, honouring read-only mode
     Tools,
 }
@@ -227,11 +321,42 @@ pub async fn run() -> ExitCode {
     execute(cli.command.unwrap_or(Command::Stdio)).await
 }
 
+async fn run_personal(args: PersonalArgs) -> ExitCode {
+    use crate::personal::cli as pcli;
+    match args.command {
+        PersonalCommand::Daemon { socket } => {
+            crate::personal::daemon::run(crate::personal::daemon::DaemonOptions { socket }).await
+        }
+        PersonalCommand::Login(LoginCommand::Messenger {
+            cookies_file,
+            cookies_json,
+        }) => pcli::login_messenger(cookies_file, cookies_json).await,
+        PersonalCommand::Login(LoginCommand::Whatsapp {
+            pair_code,
+            full_history,
+            device_name,
+        }) => {
+            pcli::login_whatsapp(pcli::WhatsAppLogin {
+                pair_code,
+                full_history,
+                device_name,
+            })
+            .await
+        }
+        PersonalCommand::Status { json } => pcli::status(json).await,
+        PersonalCommand::Logout { platform } => pcli::logout(platform.platform()).await,
+        PersonalCommand::Restart { platform } => pcli::restart(platform.platform()).await,
+        PersonalCommand::Install { dry_run } => pcli::install(dry_run),
+        PersonalCommand::Uninstall { dry_run } => pcli::uninstall(dry_run),
+    }
+}
+
 async fn execute(command: Command) -> ExitCode {
     let command = match command {
         Command::Setup(args) => return setup::run_setup(*args).await,
         Command::Doctor(args) => return setup::run_doctor(args).await,
         Command::Token(args) => return setup::run_token(args).await,
+        Command::Personal(args) => return run_personal(args).await,
         other => other,
     };
     server::init_tracing();
@@ -249,7 +374,7 @@ async fn execute(command: Command) -> ExitCode {
         Command::Stdio => server::run_stdio(cfg).await,
         Command::Http { with_webhook } => server::run_http(cfg, with_webhook).await,
         Command::Webhook => server::run_webhook(cfg).await,
-        Command::Setup(_) | Command::Doctor(_) | Command::Token(_) => Ok(()),
+        Command::Setup(_) | Command::Doctor(_) | Command::Token(_) | Command::Personal(_) => Ok(()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -263,6 +388,25 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once("meta-mcp").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn personal_daemon_parses_with_an_optional_socket() {
+        assert!(matches!(
+            parse(&["personal", "daemon"]).expect("daemon").command,
+            Some(Command::Personal(PersonalArgs {
+                command: PersonalCommand::Daemon { socket: None }
+            }))
+        ));
+        let cli = parse(&["personal", "daemon", "--socket", "/tmp/x.sock"]).expect("socket");
+        let Some(Command::Personal(PersonalArgs {
+            command: PersonalCommand::Daemon { socket },
+        })) = cli.command
+        else {
+            panic!("not a personal daemon command");
+        };
+        assert_eq!(socket, Some(PathBuf::from("/tmp/x.sock")));
+        assert!(parse(&["personal"]).is_err());
     }
 
     #[test]

@@ -10,6 +10,7 @@ pub mod graph;
 pub mod inbox;
 pub mod mcp;
 pub mod messenger;
+pub mod personal;
 pub mod server;
 pub mod setup;
 pub mod webhook;

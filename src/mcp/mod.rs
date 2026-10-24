@@ -1,6 +1,7 @@
 //! MCP surface: the core tools (status and inbox) plus seams for Messenger and WhatsApp tools.
 
 pub mod messenger_tools;
+pub mod personal_tools;
 pub mod whatsapp_tools;
 
 use std::sync::Arc;
@@ -19,12 +20,13 @@ use crate::config::{Config, PageConfig, PhoneNumber, WhatsAppConfig};
 use crate::files::{FileError, FileJail};
 use crate::graph::{GraphClient, GraphError};
 use crate::inbox::{Event, EventKind, Inbox, InboxError, ListFilter, Platform, now_secs};
+use crate::personal::client::DaemonClient;
 
 /// Tools that change local state and disappear in read-only mode.
 pub const CORE_WRITE_TOOLS: &[&str] = &["inbox_mark_processed"];
 
 /// Every tool the server exposes, sorted.
-pub const ALL_TOOL_NAMES: [&str; 20] = [
+pub const ALL_TOOL_NAMES: [&str; 38] = [
     "inbox_list",
     "inbox_mark_processed",
     "inbox_wait",
@@ -32,13 +34,31 @@ pub const ALL_TOOL_NAMES: [&str; 20] = [
     "messenger_get_message",
     "messenger_get_profile",
     "messenger_list_conversations",
+    "messenger_personal_download_attachment",
+    "messenger_personal_list_threads",
+    "messenger_personal_mark_read",
+    "messenger_personal_react",
+    "messenger_personal_read_thread",
+    "messenger_personal_send_media",
+    "messenger_personal_send_text",
+    "messenger_personal_typing",
     "messenger_read_conversation",
     "messenger_send_attachment",
     "messenger_send_text",
     "messenger_sender_action",
     "meta_status",
+    "personal_status",
+    "personal_wait_for_message",
     "whatsapp_download_media",
     "whatsapp_mark_read",
+    "whatsapp_personal_download_media",
+    "whatsapp_personal_list_chats",
+    "whatsapp_personal_mark_read",
+    "whatsapp_personal_react",
+    "whatsapp_personal_read_chat",
+    "whatsapp_personal_send_media",
+    "whatsapp_personal_send_text",
+    "whatsapp_personal_typing",
     "whatsapp_send_location",
     "whatsapp_send_media",
     "whatsapp_send_reaction",
@@ -48,16 +68,24 @@ pub const ALL_TOOL_NAMES: [&str; 20] = [
 ];
 
 /// The tools left in read-only mode (downloads stay: they only write local files).
-pub const READ_ONLY_TOOL_NAMES: [&str; 9] = [
+pub const READ_ONLY_TOOL_NAMES: [&str; 17] = [
     "inbox_list",
     "inbox_wait",
     "messenger_download_attachment",
     "messenger_get_message",
     "messenger_get_profile",
     "messenger_list_conversations",
+    "messenger_personal_download_attachment",
+    "messenger_personal_list_threads",
+    "messenger_personal_read_thread",
     "messenger_read_conversation",
     "meta_status",
+    "personal_status",
+    "personal_wait_for_message",
     "whatsapp_download_media",
+    "whatsapp_personal_download_media",
+    "whatsapp_personal_list_chats",
+    "whatsapp_personal_read_chat",
 ];
 
 const DEFAULT_LIMIT: i64 = 50;
@@ -166,16 +194,20 @@ pub struct MetaMcp {
     pub graph: Arc<GraphClient>,
     pub inbox: Inbox,
     tool_router: ToolRouter<Self>,
+    personal: Arc<tokio::sync::Mutex<Option<Arc<DaemonClient>>>>,
 }
 
 fn build_router(read_only: bool) -> ToolRouter<MetaMcp> {
-    let mut router =
-        MetaMcp::core_router() + MetaMcp::messenger_router() + MetaMcp::whatsapp_router();
+    let mut router = MetaMcp::core_router()
+        + MetaMcp::messenger_router()
+        + MetaMcp::whatsapp_router()
+        + MetaMcp::personal_router();
     if read_only {
         let writes = CORE_WRITE_TOOLS
             .iter()
             .chain(messenger_tools::WRITE_TOOLS)
-            .chain(whatsapp_tools::WRITE_TOOLS);
+            .chain(whatsapp_tools::WRITE_TOOLS)
+            .chain(personal_tools::WRITE_TOOLS);
         for name in writes {
             router.remove_route(name);
         }
@@ -204,6 +236,7 @@ impl MetaMcp {
             cfg: Arc::new(cfg),
             graph: Arc::new(graph),
             inbox,
+            personal: Arc::default(),
         })
     }
 
@@ -232,8 +265,10 @@ impl MetaMcp {
 /// Arguments of `inbox_list`.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct InboxListParams {
-    /// Only events from this platform: messenger, whatsapp or instagram.
-    #[schemars(extend("enum" = ["messenger", "whatsapp", "instagram", null]))]
+    /// Only events from this platform: messenger, whatsapp, instagram, messenger_personal or whatsapp_personal.
+    #[schemars(
+        extend("enum" = ["messenger", "whatsapp", "instagram", "messenger_personal", "whatsapp_personal", null])
+    )]
     pub platform: Option<String>,
     /// Only these event kinds: message, echo, delivery, read, reaction, postback, referral, optin, status, standby, other.
     pub kinds: Option<Vec<String>>,
@@ -254,8 +289,10 @@ pub struct InboxListParams {
 pub struct InboxWaitParams {
     /// How long to wait for new events, in seconds (default 30, maximum 55).
     pub timeout_seconds: Option<i64>,
-    /// Only events from this platform: messenger, whatsapp or instagram.
-    #[schemars(extend("enum" = ["messenger", "whatsapp", "instagram", null]))]
+    /// Only events from this platform: messenger, whatsapp, instagram, messenger_personal or whatsapp_personal.
+    #[schemars(
+        extend("enum" = ["messenger", "whatsapp", "instagram", "messenger_personal", "whatsapp_personal", null])
+    )]
     pub platform: Option<String>,
     /// Only these event kinds: message, echo, delivery, read, reaction, postback, referral, optin, status, standby, other.
     pub kinds: Option<Vec<String>>,
@@ -284,7 +321,7 @@ fn parse_platform(raw: Option<&str>) -> Result<Option<Platform>, GraphError> {
     raw.map(|p| {
         Platform::parse(p).ok_or_else(|| {
             invalid(format!(
-                "unknown platform `{p}`: use messenger, whatsapp or instagram"
+                "unknown platform `{p}`: use messenger, whatsapp or instagram (or messenger_personal, whatsapp_personal)"
             ))
         })
     })
@@ -596,7 +633,10 @@ mod tests {
         for tool in build_router(false).list_all() {
             let d = tool.description.as_deref().expect("description");
             assert!(d.len() < 1000, "{}: {} chars", tool.name, d.len());
-            if tool.name.starts_with("inbox_l") || tool.name == "inbox_wait" {
+            if tool.name.starts_with("inbox_l")
+                || tool.name == "inbox_wait"
+                || tool.name.contains("personal")
+            {
                 assert!(d.contains("untrusted third-party content"), "{}", tool.name);
             }
         }
@@ -604,7 +644,8 @@ mod tests {
 
     #[test]
     fn schemas_use_signed_64_bit_integers_only() {
-        for name in CORE {
+        let personal = ALL_TOOL_NAMES.iter().filter(|n| n.contains("personal"));
+        for name in CORE.iter().chain(personal) {
             let s = schema_text(name);
             for bad in ["uint", "\"format\":\"int32\"", "\"format\":\"uint"] {
                 assert!(!s.contains(bad), "{name}: {s}");
@@ -616,6 +657,43 @@ mod tests {
             "platform enum missing: {list}"
         );
         assert!(list.contains("unprocessed_only") && list.contains("include_raw"));
+    }
+
+    #[test]
+    fn personal_tools_document_every_parameter() {
+        let names: Vec<&str> = ALL_TOOL_NAMES
+            .iter()
+            .copied()
+            .filter(|n| n.contains("personal"))
+            .collect();
+        assert_eq!(names.len(), 18);
+        for name in names {
+            let tool = build_router(false).get(name).cloned().expect("tool");
+            let props = tool
+                .input_schema
+                .get("properties")
+                .and_then(Value::as_object);
+            for (field, def) in props.into_iter().flatten() {
+                let doc = def.get("description").and_then(Value::as_str);
+                assert!(
+                    doc.is_some_and(|d| !d.is_empty()),
+                    "{name}.{field} undocumented"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn personal_write_tools_are_exactly_the_ten_sending_ones() {
+        assert_eq!(personal_tools::WRITE_TOOLS.len(), 10);
+        let left = tool_names_for(true);
+        for name in personal_tools::WRITE_TOOLS {
+            assert!(ALL_TOOL_NAMES.contains(name), "{name}");
+            assert!(
+                !left.iter().any(|n| n == name),
+                "{name} stays in read-only mode"
+            );
+        }
     }
 
     #[test]
