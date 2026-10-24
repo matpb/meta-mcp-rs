@@ -1,0 +1,6 @@
+target/
+*.local
+credentials.json
+*.db
+*.db-wal
+*.db-shm
