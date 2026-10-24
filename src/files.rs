@@ -6,6 +6,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 static TMP_COUNTER: AtomicU32 = AtomicU32::new(0);
 
+/// Longest destination name (any path component), so temp names stay under filesystem limits.
+pub const MAX_NAME_BYTES: usize = 200;
+
 /// Failures resolving a path inside the jail.
 #[derive(Debug, thiserror::Error)]
 pub enum FileError {
@@ -121,19 +124,43 @@ impl FileJail {
         self.resolve_dest(input, true)
     }
 
-    fn resolve_dest(&self, input: &str, overwrite: bool) -> Result<PathBuf, FileError> {
+    /// The verdict `resolve_write` would give, without creating anything. Blocking.
+    pub fn check_write(&self, input: &str, overwrite: bool) -> Result<(), FileError> {
+        let (rel, name) = self.plan_dest(input)?;
+        let mut dir = self.root.clone();
+        for comp in rel.components() {
+            let next = dir.join(comp.as_os_str());
+            match std::fs::symlink_metadata(&next) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(io_err(&next, e)),
+            }
+            dir = self.enter(&next, input)?;
+        }
+        check_target(&dir.join(name), overwrite, input)
+    }
+
+    /// Lexical checks shared by every write: containment, dot components and name lengths.
+    /// Returns the directories above the file (relative to the root) and the file name.
+    fn plan_dest(&self, input: &str) -> Result<(PathBuf, std::ffi::OsString), FileError> {
         let lexical = lexical_normalize(&self.join(input)?);
         if !lexical.starts_with(&self.root) {
             return Err(FileError::Escape(input.to_string()));
         }
         let rel_all = lexical.strip_prefix(&self.root).unwrap_or(&lexical);
-        if rel_all
-            .components()
-            .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
-        {
-            return Err(FileError::Invalid(
-                "destination components must not start with `.`".into(),
-            ));
+        for comp in rel_all.components() {
+            let part = comp.as_os_str();
+            if part.to_string_lossy().starts_with('.') {
+                return Err(FileError::Invalid(
+                    "destination components must not start with `.`".into(),
+                ));
+            }
+            if part.len() > MAX_NAME_BYTES {
+                return Err(FileError::Invalid(format!(
+                    "a destination name is {} bytes; names are limited to {MAX_NAME_BYTES} bytes",
+                    part.len()
+                )));
+            }
         }
         let name = lexical
             .file_name()
@@ -143,29 +170,37 @@ impl FileJail {
         let rel = parent
             .strip_prefix(&self.root)
             .map_err(|_| FileError::Escape(input.to_string()))?;
+        Ok((rel.to_path_buf(), name))
+    }
+
+    /// Canonical path of an existing path component, which must be a directory inside the root.
+    fn enter(&self, next: &Path, input: &str) -> Result<PathBuf, FileError> {
+        let dir = std::fs::canonicalize(next).map_err(|e| io_err(next, e))?;
+        if !dir.starts_with(&self.root) {
+            return Err(FileError::Escape(input.to_string()));
+        }
+        if !dir.is_dir() {
+            return Err(FileError::Invalid(format!(
+                "`{input}` needs a directory where a file already exists"
+            )));
+        }
+        Ok(dir)
+    }
+
+    fn resolve_dest(&self, input: &str, overwrite: bool) -> Result<PathBuf, FileError> {
+        let (rel, name) = self.plan_dest(input)?;
         let mut dir = self.root.clone();
         for comp in rel.components() {
             let next = dir.join(comp.as_os_str());
-            if std::fs::symlink_metadata(&next).is_err() {
-                std::fs::create_dir(&next).map_err(|e| io_err(&next, e))?;
+            match std::fs::create_dir(&next) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(io_err(&next, e)),
             }
-            dir = std::fs::canonicalize(&next).map_err(|e| io_err(&next, e))?;
-            if !dir.starts_with(&self.root) {
-                return Err(FileError::Escape(input.to_string()));
-            }
+            dir = self.enter(&next, input)?;
         }
         let target = dir.join(name);
-        if let Ok(meta) = std::fs::symlink_metadata(&target) {
-            if meta.file_type().is_symlink() {
-                return Err(FileError::Escape(input.to_string()));
-            }
-            if meta.is_dir() {
-                return Err(FileError::NotAFile(input.to_string()));
-            }
-            if !overwrite {
-                return Err(FileError::Exists(input.to_string()));
-            }
-        }
+        check_target(&target, overwrite, input)?;
         Ok(target)
     }
 
@@ -221,13 +256,26 @@ impl FileJail {
     }
 }
 
+/// A symlink, a directory or (without `overwrite`) an existing file at `target` is refused.
+fn check_target(target: &Path, overwrite: bool, input: &str) -> Result<(), FileError> {
+    if let Ok(meta) = std::fs::symlink_metadata(target) {
+        if meta.file_type().is_symlink() {
+            return Err(FileError::Escape(input.to_string()));
+        }
+        if meta.is_dir() {
+            return Err(FileError::NotAFile(input.to_string()));
+        }
+        if !overwrite {
+            return Err(FileError::Exists(input.to_string()));
+        }
+    }
+    Ok(())
+}
+
+/// A short sibling name, independent of the destination name.
 fn temp_path(dest: &Path) -> PathBuf {
     let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let name = dest
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    dest.with_file_name(format!(".{name}.{}.{n}.part", std::process::id()))
+    dest.with_file_name(format!(".meta-mcp-{}-{n}.part", std::process::id()))
 }
 
 fn write_temp(tmp: &Path, bytes: &[u8]) -> Result<(), FileError> {
@@ -448,5 +496,159 @@ mod tests {
         assert_eq!(sanitize_filename("../../etc/passwd"), "_.._etc_passwd");
         assert_eq!(sanitize_filename("..."), "file");
         assert_eq!(sanitize_filename("report 1.pdf"), "report_1.pdf");
+    }
+
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn check_write_creates_nothing() {
+        let (_guard, root) = canon_tmp();
+        let jail = FileJail::new(&root).expect("jail");
+        jail.check_write("deep/er/file.bin", false).expect("fine");
+        jail.check_write("deep/er/file.bin", true).expect("fine");
+        assert!(entries(&root).is_empty(), "no directory was created");
+        jail.resolve_write("deep/er/file.bin")
+            .expect("creating variant");
+        assert_eq!(entries(&root), ["deep"], "resolve_write still creates");
+    }
+
+    #[test]
+    fn check_write_gives_the_verdicts_of_resolve_write() {
+        let (_guard, root) = canon_tmp();
+        std::fs::write(root.join("have.txt"), b"x").expect("write");
+        std::fs::create_dir(root.join("adir")).expect("mkdir");
+        let jail = FileJail::new(&root).expect("jail");
+        assert!(jail.check_write("new.bin", false).is_ok());
+        assert!(matches!(
+            jail.check_write("have.txt", false),
+            Err(FileError::Exists(_))
+        ));
+        assert!(jail.check_write("have.txt", true).is_ok());
+        assert!(matches!(
+            jail.check_write("adir", true),
+            Err(FileError::NotAFile(_))
+        ));
+        assert!(matches!(
+            jail.check_write("../x", false),
+            Err(FileError::Escape(_))
+        ));
+        assert!(matches!(
+            jail.check_write("a/.b/c", false),
+            Err(FileError::Invalid(_))
+        ));
+        assert!(matches!(
+            jail.check_write("have.txt/inner.bin", false),
+            Err(FileError::Invalid(_))
+        ));
+        assert!(matches!(
+            jail.check_write("", false),
+            Err(FileError::Invalid(_))
+        ));
+        #[cfg(unix)]
+        {
+            let outside = canon_tmp();
+            std::os::unix::fs::symlink(&outside.1, root.join("link_dir")).expect("ln");
+            std::os::unix::fs::symlink(outside.1.join("f"), root.join("link_file")).expect("ln");
+            assert!(matches!(
+                jail.check_write("link_dir/new.bin", false),
+                Err(FileError::Escape(_))
+            ));
+            assert!(matches!(
+                jail.check_write("link_file", true),
+                Err(FileError::Escape(_))
+            ));
+            assert!(entries(&outside.1).is_empty());
+        }
+    }
+
+    #[test]
+    fn names_above_200_bytes_are_refused_before_anything_is_written() {
+        let (_guard, root) = canon_tmp();
+        let jail = FileJail::new(&root).expect("jail");
+        let ok = format!("{}.png", "n".repeat(196));
+        let long = format!("{}.png", "n".repeat(197));
+        assert_eq!((ok.len(), long.len()), (200, 201));
+        jail.check_write(&ok, false).expect("200 bytes fit");
+        for bad in [
+            long.clone(),
+            format!("{long}/file.bin"),
+            format!("d/{long}"),
+        ] {
+            let err = jail.check_write(&bad, false).expect_err("too long");
+            assert!(
+                matches!(err, FileError::Invalid(_)) && err.to_string().contains("200 bytes"),
+                "{err}"
+            );
+            assert!(matches!(
+                jail.write_new(&bad, b"x", false, 10),
+                Err(FileError::Invalid(_))
+            ));
+        }
+        let two_byte = "\u{e9}".repeat(101);
+        assert!(
+            jail.check_write(&two_byte, false).is_err(),
+            "the limit counts bytes"
+        );
+        assert!(jail.check_write(&"\u{e9}".repeat(100), false).is_ok());
+        assert!(entries(&root).is_empty());
+    }
+
+    #[test]
+    fn a_200_byte_name_is_written_with_a_short_temp_name() {
+        let (_guard, root) = canon_tmp();
+        let jail = FileJail::new(&root).expect("jail");
+        let name = format!("{}.png", "n".repeat(196));
+        let saved = jail.write_new(&name, b"bytes", false, 10).expect("written");
+        assert_eq!(std::fs::read(&saved).expect("read"), b"bytes");
+        assert_eq!(entries(&root), [name], "no temp file is left behind");
+    }
+
+    #[test]
+    fn a_file_where_a_directory_is_needed_is_refused() {
+        let (_guard, root) = canon_tmp();
+        std::fs::write(root.join("have.txt"), b"x").expect("write");
+        let jail = FileJail::new(&root).expect("jail");
+        assert!(matches!(
+            jail.write_new("have.txt/inner.bin", b"y", false, 10),
+            Err(FileError::Invalid(_))
+        ));
+        assert_eq!(entries(&root), ["have.txt"]);
+    }
+
+    #[test]
+    fn parallel_writes_into_a_new_subdirectory_all_succeed() {
+        let mut failures = Vec::new();
+        for round in 0..150 {
+            let (_guard, root) = canon_tmp();
+            let jail = FileJail::new(&root).expect("jail");
+            let handles: Vec<_> = (0..8)
+                .map(|i| {
+                    let jail = jail.clone();
+                    std::thread::spawn(move || {
+                        jail.write_new(&format!("new{round}/deep/f{i}.bin"), b"x", false, 10)
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    })
+                })
+                .collect();
+            for h in handles {
+                if let Err(e) = h.join().expect("join") {
+                    failures.push(e);
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} writes failed, first: {:?}",
+            failures.len(),
+            failures.first()
+        );
     }
 }

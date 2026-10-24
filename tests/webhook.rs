@@ -425,3 +425,81 @@ async fn messenger_echo_and_read_normalized() {
     );
     assert_eq!(delivery.text.as_deref(), Some("m_a,m_b"));
 }
+
+fn wa_value(value: Value) -> Value {
+    json!({"object": "whatsapp_business_account", "entry": [{"id": "W", "changes": [
+        {"field": "messages", "value": value}]}]})
+}
+
+fn stored(body: &Value, received_at: i64, inbox: &Inbox) -> usize {
+    inbox.insert(&normalize(body, received_at)).expect("insert")
+}
+
+#[test]
+fn a_repeated_whatsapp_error_or_other_webhook_is_stored_again_later() {
+    let dir = tempfile::tempdir().expect("dir");
+    let inbox = Inbox::open(&dir.path().join("inbox.db")).expect("inbox");
+    let error = wa_value(json!({"metadata": {"phone_number_id": "PN"},
+        "errors": [{"code": 131000, "title": "Something went wrong"}]}));
+    let template = json!({"object": "whatsapp_business_account", "entry": [{"id": "W", "changes": [
+        {"field": "message_template_status_update", "value": {"event": "PAUSED"}}]}]});
+    for body in [&error, &template] {
+        assert_eq!(stored(body, NOW, &inbox), 1);
+        assert_eq!(
+            stored(body, NOW, &inbox),
+            0,
+            "one delivery replayed keeps one event"
+        );
+        assert_eq!(
+            stored(body, NOW + 86_400, &inbox),
+            1,
+            "a day later it is news again"
+        );
+    }
+    let kinds: Vec<_> = inbox
+        .list(&ListFilter::default())
+        .expect("list")
+        .into_iter()
+        .map(|e| e.kind)
+        .collect();
+    assert_eq!(kinds, vec![EventKind::Other; 4]);
+}
+
+#[test]
+fn group_receipts_of_different_participants_are_distinct_events() {
+    let dir = tempfile::tempdir().expect("dir");
+    let inbox = Inbox::open(&dir.path().join("inbox.db")).expect("inbox");
+    let receipt = |participant: &str, ts: &str| {
+        json!({"id": "wamid.G", "status": "delivered", "timestamp": ts, "recipient_type": "group",
+               "recipient_id": "GRP", "recipient_participant_id": participant})
+    };
+    let body = wa_value(json!({"metadata": {"phone_number_id": "PN"},
+        "statuses": [receipt("111", "1"), receipt("222", "2")]}));
+    assert_eq!(stored(&body, NOW, &inbox), 2);
+    assert_eq!(
+        stored(&body, NOW, &inbox),
+        0,
+        "a replay is still deduplicated"
+    );
+    let direct = wa_value(json!({"metadata": {"phone_number_id": "PN"}, "statuses": [
+        {"id": "wamid.D", "status": "read", "timestamp": "3", "recipient_id": "15551"}]}));
+    assert_eq!(stored(&direct, NOW, &inbox), 1);
+    let ids: Vec<String> = inbox
+        .list(&ListFilter::default())
+        .expect("list")
+        .into_iter()
+        .map(|e| e.id)
+        .collect();
+    assert!(
+        ids.contains(&"whatsapp:status:wamid.D:read".to_string()),
+        "{ids:?}"
+    );
+    assert!(
+        ids.contains(&"whatsapp:status:wamid.G:delivered:111".to_string()),
+        "{ids:?}"
+    );
+    assert!(
+        ids.contains(&"whatsapp:status:wamid.G:delivered:222".to_string()),
+        "{ids:?}"
+    );
+}

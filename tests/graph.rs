@@ -759,6 +759,98 @@ async fn download_scopes_the_token_per_hop() {
     );
 }
 
+async fn redirecting_pair() -> (MockServer, MockServer) {
+    let first = MockServer::start().await;
+    let second = MockServer::start().await;
+    let second_port = second.address().port();
+    Mock::given(method("GET"))
+        .and(path("/media"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", format!("http://127.0.0.1:{second_port}/final")),
+        )
+        .mount(&first)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/final"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"payload".to_vec()))
+        .mount(&second)
+        .await;
+    (first, second)
+}
+
+#[tokio::test]
+async fn download_token_is_dropped_by_a_hop_that_changes_the_port() {
+    let (first, second) = redirecting_pair().await;
+    let token = Secret::new("WA-TOKEN");
+    let hosts = [format!("127.0.0.1:{}", first.address().port())];
+    let url = url::Url::parse(&format!("{}/media", first.uri())).expect("url");
+    let got = client(&first, None)
+        .download(
+            &url,
+            TokenMode::OnHosts {
+                token: &token,
+                hosts: &hosts,
+            },
+            1024,
+        )
+        .await
+        .expect("download");
+    assert_eq!(&got.bytes[..], b"payload");
+    let before = first.received_requests().await.expect("recording");
+    let after = second.received_requests().await.expect("recording");
+    assert!(before[0].headers.get("authorization").is_some());
+    assert_eq!(after.len(), 1);
+    assert!(
+        after[0].headers.get("authorization").is_none(),
+        "same host on another port must not receive the token"
+    );
+}
+
+#[tokio::test]
+async fn download_token_stays_for_a_bare_host_entry_and_for_the_same_port() {
+    let (first, second) = redirecting_pair().await;
+    let token = Secret::new("WA-TOKEN");
+    let url = url::Url::parse(&format!("{}/media", first.uri())).expect("url");
+    let bare = ["127.0.0.1".to_string()];
+    client(&first, None)
+        .download(
+            &url,
+            TokenMode::OnHosts {
+                token: &token,
+                hosts: &bare,
+            },
+            1024,
+        )
+        .await
+        .expect("download");
+    let after = second.received_requests().await.expect("recording");
+    assert!(
+        after[0].headers.get("authorization").is_some(),
+        "a bare host entry has no port rule"
+    );
+    let both = [
+        format!("127.0.0.1:{}", first.address().port()),
+        format!("127.0.0.1:{}", second.address().port()),
+    ];
+    client(&first, None)
+        .download(
+            &url,
+            TokenMode::OnHosts {
+                token: &token,
+                hosts: &both,
+            },
+            1024,
+        )
+        .await
+        .expect("download");
+    let after = second.received_requests().await.expect("recording");
+    assert!(
+        after[1].headers.get("authorization").is_some(),
+        "an entry for the new port keeps the token"
+    );
+}
+
 #[tokio::test]
 async fn download_never_sends_a_token_without_a_mode() {
     let server = MockServer::start().await;

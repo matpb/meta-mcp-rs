@@ -266,7 +266,10 @@ fn whatsapp(body: &Value, received_at: i64) -> Vec<Event> {
                 Vec::new()
             };
             if produced.is_empty() {
-                let id = format!("whatsapp:other:{field}:{waba}:{}", digest8(change));
+                let id = format!(
+                    "whatsapp:other:{field}:{waba}:{received_at}:{}",
+                    digest8(change)
+                );
                 out.push(other_event(
                     id,
                     Platform::WhatsApp,
@@ -280,7 +283,10 @@ fn whatsapp(body: &Value, received_at: i64) -> Vec<Event> {
             }
         }
         if out.len() == before {
-            let id = format!("whatsapp:other:entry:{waba}:{}", digest8(entry));
+            let id = format!(
+                "whatsapp:other:entry:{waba}:{received_at}:{}",
+                digest8(entry)
+            );
             out.push(other_event(
                 id,
                 Platform::WhatsApp,
@@ -339,7 +345,10 @@ fn whatsapp_value(value: &Value, waba: &str, received_at: i64) -> Vec<Event> {
         out.push(whatsapp_status(s, &phone_id, received_at));
     }
     if let Some(errors) = value.get("errors").filter(|e| !e.is_null()) {
-        let id = format!("whatsapp:error:{phone_id}:{}", digest8(errors));
+        let id = format!(
+            "whatsapp:error:{phone_id}:{received_at}:{}",
+            digest8(errors)
+        );
         let raw = json!({"errors": errors, "waba_id": waba});
         out.push(other_event(
             id,
@@ -511,6 +520,11 @@ fn whatsapp_status(s: &Value, phone_id: &str, received_at: i64) -> Event {
     let recipient = text_of(s.get("recipient_id"))
         .or_else(|| text_of(s.get("recipient_user_id")))
         .unwrap_or_default();
+    let mut id = format!("whatsapp:status:{}:{status}", id_of(s.get("id")));
+    if let Some(participant) = text_of(s.get("recipient_participant_id")) {
+        id.push(':');
+        id.push_str(&participant);
+    }
     Event {
         ts: s.get("timestamp").and_then(as_i64).unwrap_or(received_at),
         account_id: phone_id.to_string(),
@@ -519,11 +533,7 @@ fn whatsapp_status(s: &Value, phone_id: &str, received_at: i64) -> Event {
         text: text_of(s.get("status")),
         raw: s.clone(),
         received_at,
-        ..Event::new(
-            format!("whatsapp:status:{}:{status}", id_of(s.get("id"))),
-            Platform::WhatsApp,
-            EventKind::Status,
-        )
+        ..Event::new(id, Platform::WhatsApp, EventKind::Status)
     }
 }
 
@@ -640,6 +650,66 @@ mod tests {
         assert_eq!(a[1].title.as_deref(), Some("A link"));
         assert_eq!(a[2].kind, "location");
         assert_eq!(evs[0].text, None);
+    }
+
+    fn wa_change(field: &str, value: Value) -> Value {
+        json!({"object": "whatsapp_business_account", "entry": [{"id": "W", "changes": [
+            {"field": field, "value": value}]}]})
+    }
+
+    #[test]
+    fn repeated_whatsapp_other_and_error_payloads_get_new_ids() {
+        let error = wa_change(
+            "messages",
+            json!({"metadata": {"phone_number_id": "PN"},
+                   "errors": [{"code": 131000, "title": "Something went wrong"}]}),
+        );
+        let template = wa_change("message_template_status_update", json!({"event": "PAUSED"}));
+        let empty_entry = json!({"object": "whatsapp_business_account", "entry": [{"id": "W"}]});
+        for body in [&error, &template, &empty_entry] {
+            let first = normalize(body, 1_800_000_000);
+            let again = normalize(body, 1_800_000_000);
+            let later = normalize(body, 1_800_086_400);
+            assert_eq!(first[0].id, again[0].id, "one delivery keeps one id");
+            assert_ne!(first[0].id, later[0].id, "{body}");
+            assert!(first[0].id.contains(":1800000000:"), "{}", first[0].id);
+        }
+        assert!(
+            normalize(&error, 5)[0]
+                .id
+                .starts_with("whatsapp:error:PN:5:")
+        );
+    }
+
+    #[test]
+    fn group_status_ids_include_the_participant() {
+        let status = |extra: Value| {
+            let mut s = json!({"id": "wamid.G", "status": "delivered", "timestamp": "1",
+                               "recipient_type": "group", "recipient_id": "GRP"});
+            s.as_object_mut()
+                .expect("object")
+                .extend(extra.as_object().expect("object").clone());
+            s
+        };
+        let body = wa_change(
+            "messages",
+            json!({"metadata": {"phone_number_id": "PN"}, "statuses": [
+                status(json!({"recipient_participant_id": "111"})),
+                status(json!({"recipient_participant_id": "222"})),
+                status(json!({"recipient_participant_id": 333})),
+                status(json!({})),
+            ]}),
+        );
+        let ids: Vec<String> = normalize(&body, 9).into_iter().map(|e| e.id).collect();
+        assert_eq!(
+            ids,
+            [
+                "whatsapp:status:wamid.G:delivered:111",
+                "whatsapp:status:wamid.G:delivered:222",
+                "whatsapp:status:wamid.G:delivered:333",
+                "whatsapp:status:wamid.G:delivered",
+            ]
+        );
     }
 
     #[test]

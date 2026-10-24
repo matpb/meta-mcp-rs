@@ -12,6 +12,10 @@ pub const MAX_TEXT_CHARS: usize = 4096;
 pub const MAX_CAPTION_CHARS: usize = 1024;
 const MAX_TEMPLATE_NAME: usize = 512;
 const MAX_EMOJI_CHARS: usize = 64;
+const MAX_WAMID_BYTES: usize = 200;
+const MAX_MEDIA_ID_DIGITS: usize = 32;
+/// Prefix of the inbox event ids built from WhatsApp message ids.
+const INBOX_ID_PREFIX: &str = "whatsapp:";
 
 /// Arguments of `whatsapp_send_text`.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -50,7 +54,7 @@ pub struct SendMediaParams {
     pub filename: Option<String>,
     /// Send audio as a voice note; needs audio/ogg with the Opus codec.
     pub voice: Option<bool>,
-    /// MIME type to send with a path upload when the extension is not enough (for example audio/ogg; codecs=opus).
+    /// MIME type to send with a path upload: it must match the file extension and only adds parameters (for example audio/ogg; codecs=opus).
     pub mime_type: Option<String>,
     /// WhatsApp message id (wamid...) to quote as a reply.
     pub reply_to_message_id: Option<String>,
@@ -128,10 +132,10 @@ pub struct MarkReadParams {
 pub struct UploadMediaParams {
     /// File inside META_MCP_FILES_DIR to upload.
     pub path: String,
-    /// Media type the file will be sent as; inferred from the MIME type when omitted.
+    /// Media type the file will be sent as; inferred from the file extension when omitted.
     #[schemars(extend("enum" = ["image", "video", "audio", "document", "sticker", null]))]
     pub kind: Option<String>,
-    /// MIME type to send with the upload when the extension is not enough.
+    /// MIME type to send with the upload: it must match the file extension and only adds parameters (for example codecs=opus).
     pub mime_type: Option<String>,
     /// WhatsApp phone number ID to upload to; optional when only one number is configured.
     pub phone_number_id: Option<String>,
@@ -144,7 +148,7 @@ pub struct DownloadMediaParams {
     pub media_id: String,
     /// File name inside META_MCP_FILES_DIR to save to (default: whatsapp_ plus the media id and the file extension).
     pub dest_name: Option<String>,
-    /// Also return images up to 2 MiB inline so you can look at them (default true).
+    /// Also return real PNG, JPEG, GIF or WEBP pictures up to 2 MiB inline so you can look at them (default true); inline_skipped says why one is not shown.
     pub inline: Option<bool>,
     /// Replace the destination file when it already exists (default false).
     pub overwrite: Option<bool>,
@@ -178,6 +182,46 @@ pub fn required_id<'a>(label: &str, v: &'a str) -> Result<&'a str, GraphError> {
     } else {
         Err(invalid(format!("{label} is empty or not a valid id")))
     }
+}
+
+/// A WhatsApp message id for a request body: `wamid.` then printable ASCII without spaces.
+/// An inbox event id is accepted too; its `whatsapp:` prefix is dropped.
+pub fn wamid<'a>(label: &str, raw: &'a str) -> Result<&'a str, GraphError> {
+    let trimmed = raw.trim();
+    let id = trimmed.strip_prefix(INBOX_ID_PREFIX).unwrap_or(trimmed);
+    let ok = id.len() > "wamid.".len()
+        && id.len() <= MAX_WAMID_BYTES
+        && id.starts_with("wamid.")
+        && id.bytes().all(|b| b.is_ascii_graphic());
+    if ok {
+        Ok(id)
+    } else {
+        Err(invalid(format!(
+            "{label} is not a valid WhatsApp message id: it starts with wamid. and has no spaces (the whatsapp: prefix of an inbox message id is fine)"
+        )))
+    }
+}
+
+/// An optional message id argument: blank counts as absent.
+pub fn opt_wamid<'a>(label: &str, v: &'a Option<String>) -> Result<Option<&'a str>, GraphError> {
+    present(v).map(|id| wamid(label, id)).transpose()
+}
+
+/// A WhatsApp media id: 1 to 32 digits.
+pub fn media_id<'a>(label: &str, raw: &'a str) -> Result<&'a str, GraphError> {
+    let id = raw.trim();
+    if (1..=MAX_MEDIA_ID_DIGITS).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_digit()) {
+        Ok(id)
+    } else {
+        Err(invalid(format!(
+            "{label} is not a valid id: a WhatsApp media id is 1 to {MAX_MEDIA_ID_DIGITS} digits"
+        )))
+    }
+}
+
+/// An optional media id argument: blank counts as absent.
+pub fn opt_media_id<'a>(label: &str, v: &'a Option<String>) -> Result<Option<&'a str>, GraphError> {
+    present(v).map(|id| media_id(label, id)).transpose()
 }
 
 /// True for business-scoped user ids: two letters, a dot, then letters, digits and dots.
@@ -375,11 +419,58 @@ pub fn template_content(name: &str, language: &str, components: Option<Value>) -
     template
 }
 
-pub fn reaction_content(message_id: &str, emoji: &str) -> Result<Value, GraphError> {
-    if emoji.chars().count() > MAX_EMOJI_CHARS {
-        return Err(invalid("emoji must be a single emoji, or empty to remove"));
+/// The scalars of the emoji blocks; generous on purpose, so a real emoji is never turned away.
+fn is_pictograph(c: char) -> bool {
+    matches!(u32::from(c),
+        0xA9 | 0xAE | 0x203C | 0x2049 | 0x2122 | 0x2139 | 0x24C2 | 0x3030 | 0x303D | 0x3297 | 0x3299
+        | 0x2190..=0x21FF | 0x2300..=0x23FF | 0x25A0..=0x25FF | 0x2600..=0x27BF
+        | 0x2900..=0x297F | 0x2B00..=0x2BFF
+        | 0x1F000..=0x1F0FF | 0x1F170..=0x1F171 | 0x1F17E..=0x1F17F | 0x1F18E | 0x1F191..=0x1F19A
+        | 0x1F1E6..=0x1F1FF | 0x1F201..=0x1F202 | 0x1F21A | 0x1F22F | 0x1F232..=0x1F23A
+        | 0x1F250..=0x1F251 | 0x1F300..=0x1FAFF)
+}
+
+/// True when every char is an emoji scalar, a joiner, a variation selector, a skin tone, a tag or
+/// part of a keycap sequence (digit, `#` or `*`, optional variation selector, then U+20E3).
+fn is_emoji_text(s: &str) -> bool {
+    let mut chars = s.chars().peekable();
+    let mut has_base = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '0'..='9' | '#' | '*' => {
+                if chars.peek() == Some(&'\u{FE0F}') {
+                    chars.next();
+                }
+                if chars.next() != Some('\u{20E3}') {
+                    return false;
+                }
+            }
+            '\u{200D}' | '\u{FE0E}' | '\u{FE0F}' | '\u{E0020}'..='\u{E007F}' => {
+                if !has_base {
+                    return false;
+                }
+            }
+            c if is_pictograph(c) => {}
+            _ => return false,
+        }
+        has_base = true;
     }
-    Ok(json!({"message_id": message_id, "emoji": emoji}))
+    has_base
+}
+
+/// A reaction body: an emoji, or the empty string that removes the reaction. Text and
+/// whitespace-only values are refused rather than sent as a removal.
+pub fn reaction_content(message_id: &str, emoji: &str) -> Result<Value, GraphError> {
+    if emoji.is_empty() {
+        return Ok(json!({"message_id": message_id, "emoji": ""}));
+    }
+    let shown = emoji.trim();
+    if shown.chars().count() > MAX_EMOJI_CHARS || !is_emoji_text(shown) {
+        return Err(invalid(
+            "emoji must be a single emoji (no words or spaces), or an empty string to remove your reaction",
+        ));
+    }
+    Ok(json!({"message_id": message_id, "emoji": shown}))
 }
 
 pub fn location_content(
@@ -633,6 +724,132 @@ mod tests {
             read_body("wamid.X", true)["typing_indicator"],
             json!({"type": "text"})
         );
+    }
+
+    #[test]
+    fn message_ids_are_body_safe_wamids() {
+        let longest = format!("wamid.{}", "A".repeat(194));
+        let too_long = format!("wamid.{}", "A".repeat(195));
+        assert_eq!((longest.len(), too_long.len()), (200, 201));
+        for ok in [
+            "wamid.HBgLMTY1MDM4Nzk0MzkVAgASGBQzQUZC",
+            "wamid.HBg/Lab+c=",
+            "wamid.A==",
+            longest.as_str(),
+        ] {
+            assert_eq!(wamid("m", ok).expect(ok), ok);
+        }
+        assert_eq!(
+            wamid("m", " whatsapp:wamid.HBgLabc= ").expect("inbox id"),
+            "wamid.HBgLabc="
+        );
+        for bad in [
+            "",
+            " ",
+            "a/b",
+            "wamid.",
+            "wamid.a b",
+            "wamid.a\nb",
+            "wamid.\u{e9}",
+            "whatsapp:",
+            "whatsapp:whatsapp:wamid.A",
+            "whatsapp:status:wamid.X:sent",
+            "status:wamid.X:sent",
+            "WAMID.A",
+            too_long.as_str(),
+        ] {
+            let err = wamid("message_id", bad).expect_err(bad).to_string();
+            assert!(
+                err.contains("message_id is not a valid WhatsApp message id"),
+                "{bad:?}: {err}"
+            );
+        }
+        assert_eq!(opt_wamid("m", &None).expect("none"), None);
+        assert_eq!(opt_wamid("m", &Some("  ".into())).expect("blank"), None);
+        assert_eq!(
+            opt_wamid("m", &Some("whatsapp:wamid.Q".into())).expect("id"),
+            Some("wamid.Q")
+        );
+        assert!(opt_wamid("m", &Some("a/b".into())).is_err());
+    }
+
+    #[test]
+    fn media_ids_are_one_to_32_digits() {
+        let longest = "9".repeat(32);
+        for ok in ["1", "999", " 1037543291543636 ", longest.as_str()] {
+            assert_eq!(media_id("media_id", ok).expect(ok), ok.trim());
+        }
+        for bad in [
+            "",
+            " ",
+            "me",
+            "..",
+            "v26.0",
+            "a/b",
+            "1 2",
+            "12a",
+            "-1",
+            "\u{661}\u{662}",
+            "9".repeat(33).as_str(),
+        ] {
+            let err = media_id("media_id", bad).expect_err(bad).to_string();
+            assert!(err.contains("media_id is not a valid id"), "{bad:?}: {err}");
+        }
+        assert_eq!(opt_media_id("m", &None).expect("none"), None);
+        assert_eq!(opt_media_id("m", &Some(" ".into())).expect("blank"), None);
+        assert!(opt_media_id("m", &Some("a/b".into())).is_err());
+    }
+
+    #[test]
+    fn reactions_are_one_emoji_or_empty() {
+        let emoji_of = |e: &str| reaction_content("wamid.X", e).map(|v| v["emoji"].clone());
+        for ok in [
+            "\u{1F44D}",
+            "\u{2764}\u{FE0F}",
+            "\u{1F600}",
+            "\u{1F64F}",
+            "\u{2B50}",
+            "\u{A9}\u{FE0F}",
+            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}",
+            "\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}",
+            "\u{1F44D}\u{1F3FD}",
+            "\u{1F1E8}\u{1F1E6}",
+            "\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}",
+            "1\u{FE0F}\u{20E3}",
+            "#\u{20E3}",
+            "*\u{FE0F}\u{20E3}",
+        ] {
+            assert_eq!(emoji_of(ok).expect(ok), json!(ok));
+        }
+        assert_eq!(
+            emoji_of(" \u{1F44D}\n").expect("trimmed"),
+            json!("\u{1F44D}")
+        );
+        assert_eq!(emoji_of("").expect("removal"), json!(""));
+        for bad in [
+            "thumbs up",
+            "ok",
+            "ab",
+            "123",
+            "1",
+            "#",
+            "<script>",
+            "\u{1F44D} ok",
+            "ok \u{1F44D}",
+            " ",
+            "\t",
+            "\n",
+            "\u{200D}",
+            "\u{FE0F}",
+            "\u{200D}\u{1F44D}",
+            "\u{20E3}",
+            "1\u{20E3}x",
+            "\u{1F44D}\u{200B}",
+            "\u{FF11}",
+        ] {
+            let err = emoji_of(bad).expect_err(bad).to_string();
+            assert!(err.contains("single emoji"), "{bad:?}: {err}");
+        }
     }
 
     #[test]

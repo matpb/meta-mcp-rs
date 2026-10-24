@@ -19,6 +19,7 @@ const DEFAULT_HOSTS: &[&str] = &[
 ];
 
 /// Whether `download` attaches a Bearer token, and on which exact hosts.
+/// An entry is `host` (any port) or `host:port` (only that port).
 #[derive(Debug, Clone, Copy)]
 pub enum TokenMode<'a> {
     Never,
@@ -56,14 +57,28 @@ pub fn is_allowed_host(url: &Url, extra: &[String]) -> bool {
             })
 }
 
+/// Splits `host` or `host:port` (a bracketed IPv6 host is fine); a bare entry has no port.
+fn split_entry(entry: &str) -> (&str, Option<u16>) {
+    match entry.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') || host.ends_with(']') => {
+            port.parse().map_or((entry, None), |p| (host, Some(p)))
+        }
+        _ => (entry, None),
+    }
+}
+
 fn token_for<'a>(mode: &TokenMode<'a>, url: &Url) -> Option<&'a Secret> {
     match mode {
         TokenMode::Never => None,
         TokenMode::OnHosts { token, hosts } => {
             let host = url.host_str()?;
+            let port = url.port_or_known_default();
             hosts
                 .iter()
-                .any(|h| h.eq_ignore_ascii_case(host))
+                .any(|entry| {
+                    let (name, wanted) = split_entry(entry);
+                    name.eq_ignore_ascii_case(host) && wanted.is_none_or(|p| Some(p) == port)
+                })
                 .then_some(*token)
         }
     }
@@ -221,5 +236,61 @@ mod tests {
         assert!(token_for(&mode, &u("https://other.fbsbx.com/x")).is_none());
         assert!(token_for(&mode, &u("https://x.lookaside.fbsbx.com/x")).is_none());
         assert!(token_for(&TokenMode::Never, &u("https://lookaside.fbsbx.com/x")).is_none());
+    }
+
+    #[test]
+    fn an_explicit_port_in_the_host_list_must_match() {
+        let token = Secret::new("t");
+        let send = |hosts: &[&str], url: &str| {
+            let hosts: Vec<String> = hosts.iter().map(|h| (*h).to_string()).collect();
+            let mode = TokenMode::OnHosts {
+                token: &token,
+                hosts: &hosts,
+            };
+            token_for(&mode, &u(url)).is_some()
+        };
+        assert!(send(&["127.0.0.1:9000"], "http://127.0.0.1:9000/x"));
+        assert!(!send(&["127.0.0.1:9000"], "http://127.0.0.1:9001/x"));
+        assert!(!send(&["127.0.0.1:9000"], "https://127.0.0.1/x"));
+        assert!(send(
+            &["lookaside.fbsbx.com:443"],
+            "https://lookaside.fbsbx.com/x"
+        ));
+        assert!(!send(
+            &["lookaside.fbsbx.com:443"],
+            "https://lookaside.fbsbx.com:8443/x"
+        ));
+        assert!(send(
+            &["LOOKASIDE.fbsbx.com:443"],
+            "https://lookaside.fbsbx.com:443/x"
+        ));
+        assert!(send(&["[::1]:8080"], "http://[::1]:8080/x"));
+        assert!(!send(&["[::1]:8080"], "http://[::1]:8081/x"));
+        assert!(
+            send(&["[::1]"], "http://[::1]:8081/x"),
+            "a bare host has no port rule"
+        );
+        assert!(send(
+            &["lookaside.fbsbx.com"],
+            "https://lookaside.fbsbx.com:8443/x"
+        ));
+        assert!(!send(
+            &["lookaside.fbsbx.com:abc"],
+            "https://lookaside.fbsbx.com/x"
+        ));
+        assert!(!send(&[], "https://lookaside.fbsbx.com/x"));
+    }
+
+    #[test]
+    fn host_entries_split_into_name_and_port() {
+        assert_eq!(split_entry("example.org"), ("example.org", None));
+        assert_eq!(split_entry("example.org:8443"), ("example.org", Some(8443)));
+        assert_eq!(split_entry("[::1]:80"), ("[::1]", Some(80)));
+        assert_eq!(split_entry("[::1]"), ("[::1]", None));
+        assert_eq!(split_entry("::1"), ("::1", None));
+        assert_eq!(
+            split_entry("example.org:99999"),
+            ("example.org:99999", None)
+        );
     }
 }

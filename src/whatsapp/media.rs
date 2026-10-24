@@ -156,37 +156,41 @@ fn accepted_extensions() -> String {
     TYPES.iter().map(|t| t.ext).collect::<Vec<_>>().join(", ")
 }
 
-/// Works out kind and MIME from the file name or an explicit `mime_type`, checking `wanted`.
+/// Works out kind and MIME from the file name, which must carry a known extension, checking
+/// `wanted`. A `mime_type` may only restate that extension's MIME type, with parameters.
 pub fn resolve(
     file_name: &str,
     wanted: Option<MediaKind>,
     mime_override: Option<&str>,
 ) -> Result<Resolved, String> {
-    let (found, mime) = match mime_override.map(str::trim).filter(|m| !m.is_empty()) {
+    let found = by_extension(file_name).ok_or_else(|| {
+        format!(
+            "cannot tell the media type of `{file_name}`: use one of the extensions {}; mime_type cannot replace a missing or unknown extension",
+            accepted_extensions()
+        )
+    })?;
+    let mime = match mime_override.map(str::trim).filter(|m| !m.is_empty()) {
+        None => found.mime.to_string(),
         Some(raw) => {
             if !raw.is_ascii() || raw.len() > 100 || raw.chars().any(char::is_control) {
                 return Err("mime_type must be a plain ASCII MIME type such as image/png".into());
             }
-            let found = by_mime(raw).ok_or_else(|| {
-                format!(
+            if by_mime(raw).is_none() {
+                return Err(format!(
                     "unsupported mime_type `{raw}`: WhatsApp accepts {}",
                     accepted_mimes()
-                )
-            })?;
-            let mime = match raw.split_once(';') {
+                ));
+            }
+            if base_mime(raw) != found.mime {
+                return Err(format!(
+                    "mime_type `{raw}` does not match `{file_name}`, which is {}: rename the file instead",
+                    found.mime
+                ));
+            }
+            match raw.split_once(';') {
                 Some((base, params)) => format!("{};{params}", base.trim().to_ascii_lowercase()),
                 None => raw.to_ascii_lowercase(),
-            };
-            (found, mime)
-        }
-        None => {
-            let found = by_extension(file_name).ok_or_else(|| {
-                format!(
-                    "cannot tell the media type of `{file_name}`: use one of the extensions {} or pass mime_type",
-                    accepted_extensions()
-                )
-            })?;
-            (found, found.mime.to_string())
+            }
         }
     };
     if let Some(kind) = wanted
@@ -219,6 +223,20 @@ pub fn limit_for(kind: MediaKind, head: &[u8]) -> u64 {
     } else {
         kind.max_bytes()
     }
+}
+
+/// Largest picture a download returns inline.
+pub const INLINE_IMAGE_MAX: usize = 2 * 1024 * 1024;
+
+/// The MIME type to show `bytes` inline with, judged by the bytes alone: the type a sender
+/// reports is never trusted. The error says why the picture cannot be shown.
+pub fn inline_image(bytes: &[u8]) -> Result<&'static str, &'static str> {
+    let mime = crate::messenger::media::sniff_image_mime(bytes)
+        .ok_or("the bytes are not a PNG, JPEG, GIF or WEBP picture")?;
+    if bytes.len() > INLINE_IMAGE_MAX {
+        return Err("the picture is larger than 2 MiB");
+    }
+    Ok(mime)
 }
 
 /// `5 MiB`, `100 KiB` or `1234 bytes`.
@@ -304,7 +322,7 @@ mod tests {
     fn resolve_by_extension_and_override() {
         let r = resolve("cat.PNG", Some(MediaKind::Image), None).expect("png");
         assert_eq!((r.kind, r.mime.as_str()), (MediaKind::Image, "image/png"));
-        let r = resolve("blob.bin", None, Some("Application/PDF")).expect("override");
+        let r = resolve("report.PDF", None, Some("Application/PDF")).expect("override");
         assert_eq!(
             (r.kind, r.mime.as_str()),
             (MediaKind::Document, "application/pdf")
@@ -335,6 +353,96 @@ mod tests {
         );
         assert!(resolve("x.png", None, Some("image/png\r\nX: y")).is_err());
         assert!(resolve("x.png", None, Some("imagé/png")).is_err());
+    }
+
+    #[test]
+    fn a_mime_override_cannot_admit_an_unlisted_extension() {
+        for (name, mime) in [
+            ("blob.bin", "application/pdf"),
+            ("credentials.json", "text/plain"),
+            (".env", "text/plain"),
+            ("inbox.db", "application/pdf"),
+            ("archive", "application/pdf"),
+            ("a.exe", "image/png"),
+            ("a.png.exe", "image/png"),
+        ] {
+            let err = resolve(name, None, Some(mime)).expect_err(name);
+            assert!(
+                err.contains("cannot tell the media type") && err.contains("mime_type"),
+                "{name}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mime_override_must_restate_the_extension_type() {
+        for (name, mime) in [
+            ("cat.png", "application/pdf"),
+            ("cat.png", "image/jpeg"),
+            ("clip.mp4", "application/pdf"),
+            ("report.pdf", "text/plain"),
+            ("note.ogg", "audio/mpeg"),
+        ] {
+            let err = resolve(name, None, Some(mime)).expect_err(name);
+            assert!(
+                err.contains("does not match") && err.contains(name),
+                "{name}: {err}"
+            );
+        }
+        for (name, mime, want) in [
+            ("cat.png", "image/png", "image/png"),
+            ("cat.JPG", "IMAGE/JPEG", "image/jpeg"),
+            ("cat.jpeg", "image/jpeg; q=1", "image/jpeg; q=1"),
+            ("note.ogg", "audio/ogg;codecs=opus", "audio/ogg;codecs=opus"),
+            (
+                "note.ogg",
+                "audio/ogg; codecs=opus",
+                "audio/ogg; codecs=opus",
+            ),
+        ] {
+            let r = resolve(name, None, Some(mime)).expect(name);
+            assert_eq!(r.mime, want, "{name}");
+        }
+        assert_eq!(
+            resolve("cat.png", None, Some("  ")).expect("blank").mime,
+            "image/png",
+            "a blank override is no override"
+        );
+    }
+
+    #[test]
+    fn inline_images_are_judged_by_their_bytes() {
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0];
+        jpeg.extend([0u8; 16]);
+        let mut webp = b"RIFF\0\0\0\0WEBPVP8 ".to_vec();
+        webp.extend([0u8; 8]);
+        for (bytes, want) in [
+            (b"\x89PNG\r\n\x1a\nrest".to_vec(), "image/png"),
+            (jpeg, "image/jpeg"),
+            (b"GIF89a\x01\0\x01\0".to_vec(), "image/gif"),
+            (b"GIF87a\x01\0\x01\0".to_vec(), "image/gif"),
+            (webp, "image/webp"),
+        ] {
+            assert_eq!(inline_image(&bytes), Ok(want));
+        }
+        for bytes in [
+            b"MZ\x90\x00 a program".to_vec(),
+            b"<svg xmlns='http://www.w3.org/2000/svg'/>".to_vec(),
+            b"\x00\x00\x00\x18ftypheic\0\0\0\0".to_vec(),
+            b"II*\x00\x08\0\0\0".to_vec(),
+            b"%PDF-1.7".to_vec(),
+            b"RIFF\0\0\0\0WAVEfmt ".to_vec(),
+            Vec::new(),
+        ] {
+            let why = inline_image(&bytes).expect_err("not a raster picture");
+            assert!(why.contains("not a PNG, JPEG, GIF or WEBP"), "{why}");
+        }
+        let mut edge = b"\x89PNG\r\n\x1a\n".to_vec();
+        edge.resize(INLINE_IMAGE_MAX, 0);
+        assert_eq!(inline_image(&edge), Ok("image/png"));
+        edge.push(0);
+        let why = inline_image(&edge).expect_err("too big");
+        assert!(why.contains("2 MiB"), "{why}");
     }
 
     #[test]

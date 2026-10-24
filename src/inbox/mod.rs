@@ -397,13 +397,24 @@ impl Inbox {
 
     /// Newest events first, honouring every filter field.
     pub fn list(&self, filter: &ListFilter) -> Result<Vec<Event>, InboxError> {
-        self.list_after(filter, None)
+        self.list_after(filter, None, &[])
+    }
+
+    /// Like `list`, keeping only events from one of `senders` (empty means anyone): the stored
+    /// sender, or the `_sender_user_id` or `from_parent_user_id` recorded in `raw`.
+    pub fn list_from(
+        &self,
+        filter: &ListFilter,
+        senders: &[String],
+    ) -> Result<Vec<Event>, InboxError> {
+        self.list_after(filter, None, senders)
     }
 
     fn list_after(
         &self,
         f: &ListFilter,
         after_rowid: Option<i64>,
+        senders: &[String],
     ) -> Result<Vec<Event>, InboxError> {
         let mut sql = format!("SELECT {COLUMNS} FROM events WHERE 1=1");
         let mut args: Vec<Sql> = Vec::new();
@@ -429,6 +440,17 @@ impl Inbox {
         if let Some(a) = &f.account_id {
             sql.push_str(" AND account_id = ?");
             args.push(Sql::Text(a.clone()));
+        }
+        if !senders.is_empty() {
+            let marks = placeholders(senders.len());
+            sql.push_str(&format!(
+                " AND (sender IN ({marks}) \
+                 OR json_extract(raw, '$._sender_user_id') IN ({marks}) \
+                 OR json_extract(raw, '$.from_parent_user_id') IN ({marks}))"
+            ));
+            for _ in 0..3 {
+                args.extend(senders.iter().map(|s| Sql::Text(s.clone())));
+            }
         }
         if let Some(r) = after_rowid {
             sql.push_str(" AND rowid > ?");
@@ -512,6 +534,14 @@ impl Inbox {
         self.blocking(move |i| i.list(&filter)).await
     }
 
+    pub async fn list_from_async(
+        &self,
+        filter: ListFilter,
+        senders: Vec<String>,
+    ) -> Result<Vec<Event>, InboxError> {
+        self.blocking(move |i| i.list_from(&filter, &senders)).await
+    }
+
     pub async fn mark_processed_async(&self, ids: Vec<String>) -> Result<usize, InboxError> {
         self.blocking(move |i| i.mark_processed(&ids)).await
     }
@@ -532,7 +562,7 @@ impl Inbox {
         loop {
             let f = filter.clone();
             let found = self
-                .blocking(move |i| i.list_after(&f, Some(baseline)))
+                .blocking(move |i| i.list_after(&f, Some(baseline), &[]))
                 .await?;
             if !found.is_empty() {
                 return Ok(found);
@@ -729,6 +759,110 @@ mod tests {
             vec![("messenger".to_string(), 2), ("whatsapp".to_string(), 3)]
         );
         assert_eq!(s.to_json()["by_platform"]["whatsapp"], json!(3));
+    }
+
+    fn from_sender(id: &str, sender: &str, ts: i64, raw: Value) -> Event {
+        Event {
+            ts,
+            account_id: "phone1".into(),
+            sender: sender.into(),
+            raw,
+            received_at: ts + 1,
+            ..Event::new(id, Platform::WhatsApp, EventKind::Message)
+        }
+    }
+
+    #[test]
+    fn list_from_matches_the_sender_and_the_recorded_user_ids() {
+        let (_dir, inbox) = open_tmp();
+        inbox
+            .insert(&[
+                from_sender("a", "16505551234", 100, json!({})),
+                from_sender(
+                    "b",
+                    "447911123456",
+                    200,
+                    json!({"_sender_user_id": "US.55"}),
+                ),
+                from_sender(
+                    "c",
+                    "33612345678",
+                    300,
+                    json!({"from_parent_user_id": "US.ENT.9"}),
+                ),
+                from_sender("d", "US.77", 400, json!({"_sender_user_id": "US.77"})),
+                from_sender("e", "49301234567", 500, json!({"_sender_user_id": 5})),
+            ])
+            .expect("insert");
+        let from = |senders: &[&str]| -> Vec<String> {
+            let senders: Vec<String> = senders.iter().map(|s| (*s).to_string()).collect();
+            let found = inbox
+                .list_from(&ListFilter::default(), &senders)
+                .expect("list_from");
+            found.into_iter().map(|e| e.id).collect()
+        };
+        assert_eq!(from(&["16505551234"]), ["a"]);
+        assert_eq!(from(&["US.55"]), ["b"], "business-scoped id kept in raw");
+        assert_eq!(from(&["US.ENT.9"]), ["c"], "parent id kept in raw");
+        assert_eq!(from(&["US.77"]), ["d"]);
+        assert_eq!(from(&["16505551234", "US.55", "US.ENT.9"]), ["c", "b", "a"]);
+        assert_eq!(from(&["nobody"]), Vec::<String>::new());
+        assert_eq!(
+            from(&["1650555123"]),
+            Vec::<String>::new(),
+            "whole ids only"
+        );
+        assert_eq!(from(&["x') OR 1=1 --"]), Vec::<String>::new());
+        assert_eq!(
+            from(&[]),
+            ["e", "d", "c", "b", "a"],
+            "no senders means anyone"
+        );
+        let one = ListFilter {
+            limit: Some(1),
+            ..ListFilter::default()
+        };
+        let senders = ["US.55".to_string(), "16505551234".to_string()];
+        let newest = inbox.list_from(&one, &senders).expect("limit");
+        assert_eq!(
+            ids(&newest),
+            ["b"],
+            "the limit applies after the sender match"
+        );
+        let other_account = ListFilter {
+            account_id: Some("phone2".into()),
+            ..ListFilter::default()
+        };
+        assert!(
+            inbox
+                .list_from(&other_account, &senders)
+                .expect("account")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn list_from_async_finds_a_sender_behind_many_newer_events() {
+        let (_dir, inbox) = open_tmp();
+        let mut events = vec![from_sender("target", "16505551234", 10, json!({}))];
+        events.extend((0..300).map(|i| {
+            from_sender(
+                &format!("other{i}"),
+                &format!("4479{i:07}"),
+                1000 + i,
+                json!({}),
+            )
+        }));
+        inbox.insert_async(events).await.expect("insert");
+        let one = ListFilter {
+            limit: Some(1),
+            ..ListFilter::default()
+        };
+        let found = inbox
+            .list_from_async(one, vec!["16505551234".into()])
+            .await
+            .expect("list");
+        assert_eq!(ids(&found), ["target"]);
     }
 
     #[tokio::test]

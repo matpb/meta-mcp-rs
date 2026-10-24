@@ -11,7 +11,10 @@ use meta_mcp::config::Config;
 use meta_mcp::graph::GraphClient;
 use meta_mcp::inbox::{Event, EventKind, Inbox, Platform, now_secs};
 use meta_mcp::webhook::normalize::normalize;
-use meta_mcp::whatsapp::types::SendTextParams;
+use meta_mcp::whatsapp::types::{
+    DownloadMediaParams, MarkReadParams, SendMediaParams, SendReactionParams, SendTextParams,
+    UploadMediaParams,
+};
 use meta_mcp::whatsapp::{WhatsApp, normalize_phone};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -1794,4 +1797,874 @@ fn read_only_hides_whatsapp_write_tools() {
         resp["error"].is_object(),
         "a hidden tool is unknown: {resp}"
     );
+}
+
+// ---- review fixes: the library API against a mock Graph API ----------------------------------
+
+/// The library API on a mock Graph API, with a files directory and an inbox of its own.
+struct Lib {
+    wa: WhatsApp,
+    inbox: Inbox,
+    files: tempfile::TempDir,
+    _home: tempfile::TempDir,
+}
+
+impl Lib {
+    fn new(graph_uri: &str) -> Self {
+        Self::build(graph_uri, &[], None)
+    }
+
+    fn with_env(graph_uri: &str, extra: &[(&str, &str)]) -> Self {
+        Self::build(graph_uri, extra, None)
+    }
+
+    /// `client_hosts` replaces the download hosts of the Graph client only, not of the config.
+    fn build(graph_uri: &str, extra: &[(&str, &str)], client_hosts: Option<Vec<String>>) -> Self {
+        let home = tempfile::tempdir().expect("home");
+        let files = tempfile::tempdir().expect("files");
+        let mut env: Vec<(String, String)> = vec![
+            ("META_WHATSAPP_ACCESS_TOKEN".into(), TOKEN.into()),
+            ("META_WHATSAPP_PHONE_NUMBER_ID".into(), PNID.into()),
+            ("META_APP_SECRET".into(), "secret".into()),
+            ("META_GRAPH_BASE_URL".into(), graph_uri.into()),
+            (
+                "META_MCP_INBOX_DB".into(),
+                home.path().join("inbox.db").display().to_string(),
+            ),
+            (
+                "META_MCP_FILES_DIR".into(),
+                files.path().display().to_string(),
+            ),
+            ("META_MCP_DOWNLOAD_HOSTS".into(), "127.0.0.1".into()),
+        ];
+        for (k, v) in extra {
+            env.retain(|(name, _)| name != k);
+            env.push(((*k).into(), (*v).into()));
+        }
+        let cfg = Config::from_lookup(
+            |k| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()),
+            Some(home.path().to_path_buf()),
+        )
+        .expect("config");
+        let hosts = client_hosts.unwrap_or_else(|| cfg.download_hosts.clone());
+        let client = GraphClient::new(&cfg.graph, hosts).expect("client");
+        let inbox = Inbox::open(&cfg.inbox_db).expect("inbox");
+        let wa = WhatsApp::new(Arc::new(cfg), Arc::new(client), inbox.clone());
+        Self {
+            wa,
+            inbox,
+            files,
+            _home: home,
+        }
+    }
+
+    fn file(&self, name: &str) -> PathBuf {
+        self.files.path().join(name)
+    }
+
+    fn files_are_empty(&self) -> bool {
+        std::fs::read_dir(self.files.path())
+            .expect("dir")
+            .next()
+            .is_none()
+    }
+}
+
+fn dl() -> DownloadMediaParams {
+    DownloadMediaParams {
+        media_id: "999".into(),
+        ..DownloadMediaParams::default()
+    }
+}
+
+fn text_to(to: &str) -> SendTextParams {
+    SendTextParams {
+        to: to.into(),
+        body: "hi".into(),
+        ..SendTextParams::default()
+    }
+}
+
+async fn mount_sends(graph: &MockServer, answer: Value) {
+    Mock::given(method("POST"))
+        .and(path(format!("/v26.0/{PNID}/messages")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(answer))
+        .mount(graph)
+        .await;
+}
+
+fn answer_for(input: &str, contact: Value) -> Value {
+    let mut c = json!({"input": input});
+    c.as_object_mut()
+        .expect("object")
+        .extend(contact.as_object().expect("object").clone());
+    json!({"messaging_product": "whatsapp", "contacts": [c], "messages": [{"id": "wamid.OUT"}]})
+}
+
+fn jpeg() -> Vec<u8> {
+    let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xE0];
+    bytes.extend([0u8; 32]);
+    bytes
+}
+
+fn gif() -> Vec<u8> {
+    b"GIF89a\x01\0\x01\0\x80\0\0".to_vec()
+}
+
+fn webp() -> Vec<u8> {
+    let mut bytes = b"RIFF\0\0\0\0WEBPVP8 ".to_vec();
+    bytes.extend([0u8; 16]);
+    bytes
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inline_images_follow_the_bytes_and_not_the_reported_type() {
+    type Case = (&'static str, Vec<u8>, Option<&'static str>, Option<bool>);
+    let cases: Vec<Case> = vec![
+        (
+            "image/png",
+            b"MZ\x90\x00 not a picture".to_vec(),
+            None,
+            None,
+        ),
+        ("image/svg+xml", b"<svg onload='x()'/>".to_vec(), None, None),
+        (
+            "image/heic",
+            b"\0\0\0\x18ftypheic\0\0\0\0".to_vec(),
+            None,
+            None,
+        ),
+        ("image/tiff", b"II*\0\x08\0\0\0".to_vec(), None, None),
+        ("application/pdf", b"%PDF-1.4 hello".to_vec(), None, None),
+        ("image/png", png(), Some("image/png"), None),
+        ("application/pdf", png(), Some("image/png"), None),
+        ("image/png", jpeg(), Some("image/jpeg"), None),
+        ("image/gif", gif(), Some("image/gif"), None),
+        ("image/webp", webp(), Some("image/webp"), None),
+        ("image/png", png(), None, Some(false)),
+    ];
+    for (label, bytes, shown, inline) in cases {
+        let graph = mock_graph().await;
+        mount_media(&graph, &bytes, label, None).await;
+        let lib = Lib::new(&graph.uri());
+        let params = DownloadMediaParams { inline, ..dl() };
+        let (out, image) = lib.wa.download_media(params).await.expect(label);
+        let got = image.as_ref().map(|(_, mime)| mime.as_str());
+        assert_eq!(got, shown, "{label}: {out}");
+        if let Some((data, _)) = &image {
+            assert_eq!(
+                data,
+                &base64::engine::general_purpose::STANDARD.encode(&bytes)
+            );
+        }
+        let skipped = out.get("inline_skipped").and_then(Value::as_str);
+        if label.starts_with("image/") && shown.is_none() && inline.is_none() {
+            let why = skipped.expect("a reason");
+            assert!(
+                why.contains("not a PNG, JPEG, GIF or WEBP"),
+                "{label}: {out}"
+            );
+        } else {
+            assert!(skipped.is_none(), "{label}: {out}");
+        }
+        let saved = out["path"].as_str().expect("path");
+        assert_eq!(std::fs::read(saved).expect("saved"), bytes, "{label}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inline_images_stop_at_two_mebibytes() {
+    let mut edge = png();
+    edge.resize(2 * 1024 * 1024, 0);
+    let graph = mock_graph().await;
+    mount_media(&graph, &edge, "image/png", None).await;
+    let (out, image) = Lib::new(&graph.uri())
+        .wa
+        .download_media(dl())
+        .await
+        .expect("download");
+    assert!(
+        image.is_some() && out.get("inline_skipped").is_none(),
+        "{out}"
+    );
+
+    edge.push(0);
+    let graph = mock_graph().await;
+    mount_media(&graph, &edge, "image/png", None).await;
+    let (out, image) = Lib::new(&graph.uri())
+        .wa
+        .download_media(dl())
+        .await
+        .expect("download");
+    assert!(image.is_none(), "{out}");
+    let why = out["inline_skipped"].as_str().expect("a reason");
+    assert!(why.contains("2 MiB"), "{why}");
+    assert_eq!(out["bytes"], json!(edge.len()), "the file is still saved");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mime_type_cannot_upload_a_file_the_extension_table_does_not_know() {
+    let graph = mock_graph().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "777"})))
+        .mount(&graph)
+        .await;
+    let lib = Lib::new(&graph.uri());
+    for (name, mime) in [
+        ("credentials.json", "text/plain"),
+        (".env", "text/plain"),
+        ("inbox.db", "application/pdf"),
+        ("notes.md", "text/plain"),
+        ("cat.png", "application/pdf"),
+        ("clip.mp4", "application/pdf"),
+    ] {
+        std::fs::write(lib.file(name), b"TOKEN=EAAsecret").expect("write");
+        let upload = UploadMediaParams {
+            path: name.into(),
+            mime_type: Some(mime.into()),
+            ..UploadMediaParams::default()
+        };
+        let err = lib.wa.upload_media(upload).await.expect_err(name);
+        assert!(err.to_string().contains("mime_type"), "{name}: {err}");
+        let send = SendMediaParams {
+            to: "16505551234".into(),
+            kind: "document".into(),
+            path: Some(name.into()),
+            mime_type: Some(mime.into()),
+            ..SendMediaParams::default()
+        };
+        lib.wa.send_media(send).await.expect_err(name);
+        assert!(requests(&graph).await.is_empty(), "{name}: a request left");
+    }
+    std::fs::write(lib.file("note.ogg"), b"OggS....").expect("write");
+    let ok = UploadMediaParams {
+        path: "note.ogg".into(),
+        mime_type: Some("audio/ogg; codecs=opus".into()),
+        ..UploadMediaParams::default()
+    };
+    let out = lib.wa.upload_media(ok).await.expect("matching type");
+    assert_eq!(out["mime"], json!("audio/ogg; codecs=opus"));
+    assert_eq!(requests(&graph).await.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_window_check_finds_a_message_behind_hundreds_of_newer_ones() {
+    let graph = mock_graph().await;
+    let lib = Lib::new(&graph.uri());
+    let now = now_secs();
+    let mut events = vec![
+        inbound("16505551234", now - 3 * 3600),
+        inbound("447911123456", now - 30 * 3600),
+    ];
+    events.extend((0..300).map(|i| inbound(&format!("4479111{i:05}"), now - 3000 + i)));
+    lib.inbox.insert(&events).expect("insert");
+    assert_eq!(lib.wa.window_warning(PNID, "16505551234").await, None);
+    let stale = lib
+        .wa
+        .window_warning(PNID, "447911123456")
+        .await
+        .expect("stale");
+    assert!(
+        stale.contains("30 hours") && stale.contains("131047"),
+        "{stale}"
+    );
+    let never = lib
+        .wa
+        .window_warning(PNID, "33612345678")
+        .await
+        .expect("never wrote");
+    assert!(
+        never.contains("no inbound message from this user"),
+        "{never}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_window_check_uses_the_ids_in_metas_answer() {
+    let now = now_secs();
+    let bsuid_only = Event {
+        raw: json!({"from_user_id": "US.77", "_sender_user_id": "US.77"}),
+        ..inbound("US.77", now - 60)
+    };
+    let by_parent = Event {
+        raw: json!({"from": "16505551234", "from_parent_user_id": "US.ENT.9"}),
+        ..inbound("16505551234", now - 60)
+    };
+    let cases: Vec<(&str, Value, Event, bool)> = vec![
+        (
+            "+52 55 1234 5678",
+            answer_for("525512345678", json!({"wa_id": "5215512345678"})),
+            inbound("5215512345678", now - 60),
+            false,
+        ),
+        (
+            "16505551234",
+            answer_for(
+                "16505551234",
+                json!({"wa_id": "16505551234", "user_id": "US.77"}),
+            ),
+            bsuid_only,
+            false,
+        ),
+        (
+            "US.ENT.9",
+            answer_for("US.ENT.9", json!({"user_id": "US.ENT.9"})),
+            by_parent,
+            false,
+        ),
+        (
+            "US.1",
+            answer_for("US.1", json!({"wa_id": "16505551234", "user_id": "US.1"})),
+            inbound("16505551234", now - 60),
+            false,
+        ),
+        (
+            "33612345678",
+            answer_for("+1 (650) 555-1234", json!({"wa_id": "16505551234"})),
+            inbound("16505551234", now - 60),
+            true,
+        ),
+    ];
+    for (to, answer, event, warns) in cases {
+        let graph = mock_graph().await;
+        mount_sends(&graph, answer).await;
+        let lib = Lib::new(&graph.uri());
+        lib.inbox.insert(&[event]).expect("insert");
+        let out = lib.wa.send_text(text_to(to)).await.expect(to);
+        assert_eq!(out.get("window_warning").is_some(), warns, "{to}: {out}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_send_that_may_have_gone_through_says_so() {
+    use tokio::io::AsyncReadExt;
+    const NOTE: &str = "(the message may still have been delivered: check inbox status events before sending again)";
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let mut buf = vec![0u8; 8192];
+            let _ = sock.read(&mut buf).await;
+        }
+    });
+    let dropped = Lib::new(&format!("http://127.0.0.1:{port}"))
+        .wa
+        .send_text(text_to("16505551234"))
+        .await
+        .expect_err("connection dropped")
+        .to_string();
+    assert!(dropped.contains(NOTE), "{dropped}");
+
+    let graph = mock_graph().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v26.0/{PNID}/messages")))
+        .respond_with(ResponseTemplate::new(503).set_body_json(json!({"error": {
+            "message": "Service unavailable", "type": "OAuthException", "code": 2, "fbtrace_id": "T"}})))
+        .expect(1)
+        .mount(&graph)
+        .await;
+    let lib = Lib::new(&graph.uri());
+    let server = lib
+        .wa
+        .send_text(text_to("16505551234"))
+        .await
+        .expect_err("503")
+        .to_string();
+    assert!(
+        server.contains(NOTE) && server.contains("Service unavailable"),
+        "{server}"
+    );
+
+    let graph = mock_graph().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v26.0/{PNID}/messages")))
+        .respond_with(ResponseTemplate::new(400).set_body_json(wa_error(
+            131047,
+            "(#131047) Re-engagement",
+            "late",
+        )))
+        .mount(&graph)
+        .await;
+    let rejected = Lib::new(&graph.uri())
+        .wa
+        .send_text(text_to("16505551234"))
+        .await
+        .expect_err("400")
+        .to_string();
+    assert!(!rejected.contains("delivered"), "{rejected}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn after_an_upload_only_a_definite_rejection_says_to_resend() {
+    let graph = mock_graph().await;
+    upload_mock("777").mount(&graph).await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v26.0/{PNID}/messages")))
+        .respond_with(ResponseTemplate::new(502).set_body_json(json!({"error": {
+            "message": "Bad gateway", "type": "OAuthException", "code": 1, "fbtrace_id": "T"}})))
+        .mount(&graph)
+        .await;
+    let lib = Lib::new(&graph.uri());
+    std::fs::write(lib.file("cat.png"), png()).expect("write");
+    let send = SendMediaParams {
+        to: "16505551234".into(),
+        kind: "image".into(),
+        path: Some("cat.png".into()),
+        ..SendMediaParams::default()
+    };
+    let text = lib.wa.send_media(send).await.expect_err("502").to_string();
+    assert!(text.contains("may still have been delivered"), "{text}");
+    assert!(text.contains("media_id 777"), "{text}");
+    assert!(!text.contains("resend it with media_id"), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reactions_take_one_emoji_or_nothing_at_all() {
+    let graph = mock_graph().await;
+    mount_sends(&graph, sent("wamid.R")).await;
+    let lib = Lib::new(&graph.uri());
+    let react = |emoji: &str| SendReactionParams {
+        to: "16505551234".into(),
+        message_id: "wamid.TARGET".into(),
+        emoji: emoji.into(),
+        ..SendReactionParams::default()
+    };
+    for bad in [
+        "thumbs up",
+        "ok",
+        "ab",
+        " ",
+        "\n",
+        "\t",
+        "<script>",
+        "123",
+        "\u{1F44D} ok",
+    ] {
+        let err = lib.wa.send_reaction(react(bad)).await.expect_err(bad);
+        assert!(err.to_string().contains("single emoji"), "{bad:?}: {err}");
+    }
+    assert!(
+        requests(&graph).await.is_empty(),
+        "nothing left for a word or a blank"
+    );
+    let good = [
+        "\u{1F44D}",
+        "\u{2764}\u{FE0F}",
+        "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}",
+        "1\u{FE0F}\u{20E3}",
+        "",
+    ];
+    for emoji in good {
+        lib.wa.send_reaction(react(emoji)).await.expect(emoji);
+    }
+    let sent_emoji: Vec<String> = requests(&graph)
+        .await
+        .iter()
+        .map(|r| {
+            body_of(r)["reaction"]["emoji"]
+                .as_str()
+                .unwrap_or("?")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(sent_emoji, good);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inbox_event_ids_and_slashes_are_handled_as_message_ids() {
+    let graph = mock_graph().await;
+    mount_sends(
+        &graph,
+        json!({"success": true, "messages": [{"id": "wamid.X"}]}),
+    )
+    .await;
+    let lib = Lib::new(&graph.uri());
+    let read = |id: &str| MarkReadParams {
+        message_id: id.into(),
+        ..MarkReadParams::default()
+    };
+    lib.wa
+        .mark_read(read("whatsapp:wamid.HBgLabc="))
+        .await
+        .expect("inbox id");
+    lib.wa
+        .mark_read(read("wamid.HBg/Lab+c="))
+        .await
+        .expect("slash and plus");
+    let react = SendReactionParams {
+        to: "16505551234".into(),
+        message_id: "whatsapp:wamid.T".into(),
+        emoji: "\u{1F44D}".into(),
+        ..SendReactionParams::default()
+    };
+    lib.wa.send_reaction(react).await.expect("reaction");
+    let reply = SendTextParams {
+        reply_to_message_id: Some("whatsapp:wamid.Q".into()),
+        ..text_to("16505551234")
+    };
+    lib.wa.send_text(reply).await.expect("reply");
+    let bodies: Vec<Value> = requests(&graph).await.iter().map(body_of).collect();
+    assert_eq!(bodies[0]["message_id"], json!("wamid.HBgLabc="));
+    assert_eq!(bodies[1]["message_id"], json!("wamid.HBg/Lab+c="));
+    assert_eq!(bodies[2]["reaction"]["message_id"], json!("wamid.T"));
+    assert_eq!(bodies[3]["context"]["message_id"], json!("wamid.Q"));
+    for body in &bodies {
+        assert!(!body.to_string().contains("whatsapp:"), "{body}");
+    }
+    for bad in [
+        "a/b",
+        "whatsapp:status:wamid.X:sent",
+        "wamid.a b",
+        " ",
+        "wamid.\u{e9}",
+    ] {
+        lib.wa.mark_read(read(bad)).await.expect_err(bad);
+    }
+    assert_eq!(requests(&graph).await.len(), 4, "the bad ids never left");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn read_only_mode_never_replaces_a_file_but_still_saves_new_ones() {
+    let graph = mock_graph().await;
+    mount_media(&graph, b"%PDF attacker", "application/pdf", None).await;
+    let uri = graph.uri();
+    let rig = Rig::new();
+    std::fs::write(rig.file("contract.pdf"), b"ORIGINAL").expect("write");
+    let (rig, refused, fresh) = blocking(move || {
+        let mut s = rig.session(&uri, &[("META_MCP_READ_ONLY", "1")]);
+        let refused = s.call_tool(
+            "whatsapp_download_media",
+            json!({"media_id": "999", "dest_name": "contract.pdf", "overwrite": true, "inline": false}),
+        );
+        let fresh = s.call_tool(
+            "whatsapp_download_media",
+            json!({"media_id": "999", "dest_name": "new.pdf", "inline": false}),
+        );
+        drop(s);
+        (rig, refused, fresh)
+    })
+    .await;
+    assert!(is_error(&refused), "{refused}");
+    let text = tool_text(&refused);
+    assert!(
+        text.contains("read-only") && text.contains("META_MCP_READ_ONLY"),
+        "{text}"
+    );
+    assert_eq!(
+        std::fs::read(rig.file("contract.pdf")).expect("kept"),
+        b"ORIGINAL"
+    );
+    assert!(!is_error(&fresh), "{fresh}");
+    assert_eq!(
+        std::fs::read(rig.file("new.pdf")).expect("new"),
+        b"%PDF attacker"
+    );
+    assert_eq!(
+        requests(&graph).await.len(),
+        2,
+        "the refused call sent nothing"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn download_media_refuses_an_unlisted_host_without_leaning_on_the_graph_client() {
+    let graph = mock_graph().await;
+    mount_media(&graph, &png(), "image/png", None).await;
+    let lib = Lib::build(
+        &graph.uri(),
+        &[("META_MCP_DOWNLOAD_HOSTS", "")],
+        Some(vec!["127.0.0.1".into()]),
+    );
+    let err = lib
+        .wa
+        .download_media(dl())
+        .await
+        .expect_err("refused")
+        .to_string();
+    assert!(
+        err.contains("refusing")
+            && err.contains("127.0.0.1")
+            && err.contains("META_MCP_DOWNLOAD_HOSTS"),
+        "{err}"
+    );
+    assert!(!err.contains(TOKEN));
+    assert!(
+        requests_to(&graph, "/blob/999").await.is_empty(),
+        "the media URL was never fetched"
+    );
+    assert_eq!(requests(&graph).await.len(), 1, "only the id lookup");
+    assert!(lib.files_are_empty());
+}
+
+async fn mount_redirecting_media(graph: &MockServer, to: &str) {
+    Mock::given(method("GET"))
+        .and(path("/v26.0/999"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "url": format!("{}/blob/999", graph.uri()), "mime_type": "application/pdf",
+            "file_size": "7", "id": "999"})))
+        .mount(graph)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/blob/999"))
+        .respond_with(ResponseTemplate::new(302).insert_header("location", to))
+        .mount(graph)
+        .await;
+}
+
+fn has_token(req: &Request) -> bool {
+    req.headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        == Some(bearer().as_str())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_the_url_host_gets_the_token_when_two_operator_hosts_are_listed() {
+    let graph = mock_graph().await;
+    let port = graph.address().port();
+    mount_redirecting_media(&graph, &format!("http://localhost:{port}/final")).await;
+    Mock::given(method("GET"))
+        .and(path("/final"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"payload".to_vec()))
+        .mount(&graph)
+        .await;
+    let lib = Lib::with_env(
+        &graph.uri(),
+        &[("META_MCP_DOWNLOAD_HOSTS", "127.0.0.1,localhost")],
+    );
+    lib.wa.download_media(dl()).await.expect("download");
+    let first = requests_to(&graph, "/blob/999").await;
+    let second = requests_to(&graph, "/final").await;
+    assert!(has_token(&first[0]), "the URL host gets the token");
+    assert_eq!(second.len(), 1);
+    assert!(!has_token(&second[0]), "the other operator host does not");
+    assert!(second[0].headers.get("authorization").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_redirect_to_another_port_of_the_same_host_does_not_carry_the_token() {
+    let graph = mock_graph().await;
+    let other = mock_graph().await;
+    mount_redirecting_media(
+        &graph,
+        &format!("http://127.0.0.1:{}/second", other.address().port()),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"payload".to_vec()))
+        .mount(&other)
+        .await;
+    Lib::new(&graph.uri())
+        .wa
+        .download_media(dl())
+        .await
+        .expect("download");
+    assert!(has_token(&requests_to(&graph, "/blob/999").await[0]));
+    let second = requests(&other).await;
+    assert_eq!(second.len(), 1);
+    assert!(
+        second[0].headers.get("authorization").is_none(),
+        "another port, no token"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_download_creates_no_directories() {
+    let graph = mock_graph().await;
+    Mock::given(method("GET"))
+        .and(path("/v26.0/999"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({"error": {
+            "message": "Unsupported get request", "code": 100}})))
+        .mount(&graph)
+        .await;
+    let lib = Lib::new(&graph.uri());
+    let params = DownloadMediaParams {
+        dest_name: Some("inbox/2026/doc.pdf".into()),
+        ..dl()
+    };
+    lib.wa.download_media(params).await.expect_err("404");
+    assert!(
+        lib.files_are_empty(),
+        "left behind: {:?}",
+        std::fs::read_dir(lib.files.path()).map(|d| d.count())
+    );
+
+    let graph = mock_graph().await;
+    mount_media(&graph, &png(), "image/png", Some(&"a".repeat(64))).await;
+    let lib = Lib::new(&graph.uri());
+    let params = DownloadMediaParams {
+        dest_name: Some("deep/er/pic.png".into()),
+        ..dl()
+    };
+    let err = lib
+        .wa
+        .download_media(params)
+        .await
+        .expect_err("sha mismatch");
+    assert!(err.to_string().contains("SHA-256"), "{err}");
+    assert!(lib.files_are_empty());
+
+    let params = DownloadMediaParams {
+        dest_name: Some("deep/er/pic.png".into()),
+        inline: Some(false),
+        ..dl()
+    };
+    let graph = mock_graph().await;
+    mount_media(&graph, &png(), "image/png", None).await;
+    let lib = Lib::new(&graph.uri());
+    lib.wa
+        .download_media(params)
+        .await
+        .expect("the write creates them");
+    assert_eq!(
+        std::fs::read(lib.file("deep/er/pic.png")).expect("saved"),
+        png()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dest_names_above_200_bytes_are_refused_before_any_request() {
+    let graph = mock_graph().await;
+    let lib = Lib::new(&graph.uri());
+    let at_limit = format!("{}.png", "n".repeat(196));
+    for dest in [
+        format!("{}.png", "n".repeat(197)),
+        format!("{}.png", "n".repeat(246)),
+        format!("inbox/{}.png", "n".repeat(250)),
+        format!("{}/file.png", "d".repeat(201)),
+    ] {
+        let params = DownloadMediaParams {
+            dest_name: Some(dest.clone()),
+            ..dl()
+        };
+        let err = lib.wa.download_media(params).await.expect_err("too long");
+        assert!(err.to_string().contains("200 bytes"), "{err}");
+    }
+    assert!(requests(&graph).await.is_empty(), "nothing reached Meta");
+    assert!(lib.files_are_empty());
+    mount_media(&graph, &png(), "image/png", None).await;
+    let params = DownloadMediaParams {
+        dest_name: Some(at_limit.clone()),
+        ..dl()
+    };
+    lib.wa.download_media(params).await.expect("200 bytes fit");
+    assert_eq!(std::fs::read(lib.file(&at_limit)).expect("saved"), png());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bare_http_404_on_the_media_lookup_does_not_blame_the_token() {
+    let graph = mock_graph().await;
+    let err = Lib::new(&graph.uri())
+        .wa
+        .download_media(dl())
+        .await
+        .expect_err("404")
+        .to_string();
+    assert!(err.contains("404"), "{err}");
+    assert!(!err.contains("access token is invalid"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn media_ids_are_digits_only() {
+    let graph = mock_graph().await;
+    let lib = Lib::new(&graph.uri());
+    for id in ["me", "..", "v26.0", "debug_token", "1/2", "12a", ""] {
+        let params = DownloadMediaParams {
+            media_id: id.into(),
+            ..DownloadMediaParams::default()
+        };
+        let err = lib.wa.download_media(params).await.expect_err(id);
+        assert!(err.to_string().contains("not a valid id"), "{id}: {err}");
+        let send = SendMediaParams {
+            to: "16505551234".into(),
+            kind: "image".into(),
+            media_id: Some(id.into()),
+            ..SendMediaParams::default()
+        };
+        if !id.is_empty() {
+            lib.wa.send_media(send).await.expect_err(id);
+        }
+    }
+    assert!(requests(&graph).await.is_empty(), "the token went nowhere");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn trunk_zeros_are_dropped_and_national_numbers_never_leave() {
+    let graph = mock_graph().await;
+    mount_sends(&graph, sent("wamid.UK")).await;
+    let lib = Lib::new(&graph.uri());
+    lib.wa
+        .send_text(text_to("+44 (0) 7911 123456"))
+        .await
+        .expect("trunk zero");
+    for national in ["06 12 34 56 78", "0033 6 12 34 56 78"] {
+        let err = lib
+            .wa
+            .send_text(text_to(national))
+            .await
+            .expect_err(national);
+        assert!(
+            err.to_string().contains("country code"),
+            "{national}: {err}"
+        );
+    }
+    let sent_to: Vec<Value> = requests(&graph)
+        .await
+        .iter()
+        .map(|r| body_of(r)["to"].clone())
+        .collect();
+    assert_eq!(sent_to, [json!("447911123456")]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_global_file_cap_limits_uploads_and_downloads() {
+    let graph = mock_graph().await;
+    upload_mock("555").mount(&graph).await;
+    let lib = Lib::with_env(&graph.uri(), &[("META_MCP_MAX_FILE_BYTES", "1000")]);
+    let mut over = png();
+    over.resize(1001, 1);
+    std::fs::write(lib.file("over.png"), &over).expect("write");
+    let upload = |name: &str| UploadMediaParams {
+        path: name.into(),
+        ..UploadMediaParams::default()
+    };
+    let err = lib
+        .wa
+        .upload_media(upload("over.png"))
+        .await
+        .expect_err("above the cap");
+    assert!(err.to_string().contains("META_MCP_MAX_FILE_BYTES"), "{err}");
+    let send = SendMediaParams {
+        to: "16505551234".into(),
+        kind: "image".into(),
+        path: Some("over.png".into()),
+        ..SendMediaParams::default()
+    };
+    lib.wa.send_media(send).await.expect_err("above the cap");
+    assert!(
+        requests(&graph).await.is_empty(),
+        "refused before any request"
+    );
+    over.truncate(1000);
+    std::fs::write(lib.file("exact.png"), &over).expect("write");
+    let out = lib
+        .wa
+        .upload_media(upload("exact.png"))
+        .await
+        .expect("at the cap");
+    assert_eq!(out["bytes"], json!(1000));
+
+    let graph = mock_graph().await;
+    mount_media(&graph, &vec![9u8; 5000], "application/pdf", None).await;
+    let lib = Lib::with_env(&graph.uri(), &[("META_MCP_MAX_FILE_BYTES", "1000")]);
+    let err = lib
+        .wa
+        .download_media(dl())
+        .await
+        .expect_err("above the cap")
+        .to_string();
+    assert!(err.contains("META_MCP_MAX_FILE_BYTES"), "{err}");
+    assert!(requests_to(&graph, "/blob/999").await.is_empty());
 }

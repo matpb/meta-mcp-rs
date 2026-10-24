@@ -190,6 +190,47 @@ pub fn default_home() -> Result<PathBuf, ConfigError> {
     Ok(default_dirs()?.config_dir().to_path_buf())
 }
 
+/// The real path of `path`, which may not exist yet: its deepest existing ancestor is resolved
+/// and the missing tail appended.
+fn canonical_lenient(path: &Path) -> PathBuf {
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut tail = Vec::new();
+    let mut cur = abs.as_path();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(cur) {
+            return tail.iter().rev().fold(real, |acc, part| acc.join(part));
+        }
+        match (cur.file_name(), cur.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name.to_os_string());
+                cur = parent;
+            }
+            _ => return abs,
+        }
+    }
+}
+
+/// The file tools must not be able to reach the configuration home, the credentials file or the
+/// inbox database, whatever the media extension or `mime_type` says.
+fn check_files_dir(files: &FileJail, home: &Path, inbox_db: &Path) -> Result<(), ConfigError> {
+    let credentials = store::credentials_path(home);
+    for (what, path) in [
+        ("META_MCP_HOME", home),
+        ("the credentials file", credentials.as_path()),
+        ("the inbox database (META_MCP_INBOX_DB)", inbox_db),
+    ] {
+        let real = canonical_lenient(path);
+        if real.starts_with(files.root()) {
+            return Err(ConfigError(format!(
+                "META_MCP_FILES_DIR ({}) contains {what} ({}): the file tools could read or replace it, so use a dedicated directory for exchanged files",
+                files.root().display(),
+                real.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn whatsapp_from(
     env_token: Option<Secret>,
     waba_env: Option<String>,
@@ -312,6 +353,9 @@ impl Config {
             ),
             None => None,
         };
+        if let Some(jail) = &files {
+            check_files_dir(jail, &home, &inbox_db)?;
+        }
         let port = match non_empty(get("META_MCP_PORT")) {
             Some(s) => s
                 .parse::<u16>()
@@ -748,9 +792,109 @@ mod tests {
         let missing = dir.path().join("missing");
         let missing = missing.to_str().expect("utf8");
         assert!(cfg_in(dir.path(), &[("META_MCP_FILES_DIR", missing)]).is_err());
-        let ok = dir.path().to_str().expect("utf8");
+        let exchange = tempfile::tempdir().expect("tmp");
+        let ok = exchange.path().to_str().expect("utf8");
         let c = cfg_in(dir.path(), &[("META_MCP_FILES_DIR", ok)]).expect("config");
         assert!(c.files.is_some());
+    }
+
+    #[test]
+    fn files_dir_may_not_contain_the_home_the_credentials_or_the_inbox() {
+        let base = tempfile::tempdir().expect("tmp");
+        let root = std::fs::canonicalize(base.path()).expect("canon");
+        let (home, data, exchange) = (root.join("config"), root.join("data"), root.join("files"));
+        for dir in [&home, &data, &exchange] {
+            std::fs::create_dir_all(dir).expect("mkdir");
+        }
+        let inbox = data.join("inbox.db").display().to_string();
+        let with_files = |dir: &Path| {
+            let dir = dir.display().to_string();
+            cfg_in(
+                &home,
+                &[("META_MCP_FILES_DIR", &dir), ("META_MCP_INBOX_DB", &inbox)],
+            )
+        };
+        let refused = |dir: &Path| with_files(dir).expect_err("overlap").to_string();
+
+        let err = refused(&home);
+        assert!(
+            err.contains("META_MCP_FILES_DIR") && err.contains("META_MCP_HOME"),
+            "{err}"
+        );
+        assert!(err.contains(&home.display().to_string()), "{err}");
+        assert!(
+            refused(&root).contains("META_MCP_HOME"),
+            "an ancestor of the home"
+        );
+
+        with_files(&exchange).expect("a dedicated directory is fine");
+        std::fs::create_dir_all(home.join("files")).expect("mkdir");
+        with_files(&home.join("files")).expect("a directory inside the home is fine");
+
+        let err = refused(&data);
+        assert!(
+            err.contains("inbox database") && err.contains(&inbox),
+            "{err}"
+        );
+        std::fs::write(&inbox, b"").expect("db");
+        assert!(
+            refused(&data).contains("inbox database"),
+            "an existing database too"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_credentials_file_linked_into_the_files_dir_is_refused() {
+        let base = tempfile::tempdir().expect("tmp");
+        let root = std::fs::canonicalize(base.path()).expect("canon");
+        let (home, shared) = (root.join("config"), root.join("shared"));
+        for dir in [&home, &shared] {
+            std::fs::create_dir_all(dir).expect("mkdir");
+        }
+        std::fs::write(shared.join("credentials.json"), b"{}").expect("creds");
+        std::os::unix::fs::symlink(
+            shared.join("credentials.json"),
+            home.join("credentials.json"),
+        )
+        .expect("ln");
+        let shared_s = shared.display().to_string();
+        let err = cfg_in(&home, &[("META_MCP_FILES_DIR", &shared_s)])
+            .expect_err("credentials inside the files dir")
+            .to_string();
+        assert!(err.contains("credentials file"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_home_or_database_is_compared_through_its_existing_parent() {
+        let base = tempfile::tempdir().expect("tmp");
+        let root = std::fs::canonicalize(base.path()).expect("canon");
+        let files = root.join("shared");
+        std::fs::create_dir_all(&files).expect("mkdir");
+        let files_s = files.display().to_string();
+        let not_yet = files.join("config").join("deeper");
+        let err = cfg_in(&not_yet, &[("META_MCP_FILES_DIR", &files_s)])
+            .expect_err("home below the files dir")
+            .to_string();
+        assert!(err.contains("META_MCP_HOME"), "{err}");
+        let db = files.join("new").join("inbox.db").display().to_string();
+        let err = cfg_in(
+            &root.join("home"),
+            &[("META_MCP_FILES_DIR", &files_s), ("META_MCP_INBOX_DB", &db)],
+        )
+        .expect_err("database below the files dir")
+        .to_string();
+        assert!(err.contains("inbox database"), "{err}");
+        let db = root
+            .join("elsewhere")
+            .join("inbox.db")
+            .display()
+            .to_string();
+        cfg_in(
+            &root.join("home"),
+            &[("META_MCP_FILES_DIR", &files_s), ("META_MCP_INBOX_DB", &db)],
+        )
+        .expect("no overlap");
     }
 
     #[test]

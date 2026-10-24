@@ -19,36 +19,49 @@ use crate::graph::download::{TokenMode, is_allowed_host};
 use crate::graph::error::as_i64;
 use crate::graph::{GraphClient, GraphError};
 use crate::inbox::{Event, EventKind, Inbox, ListFilter, Platform, now_secs};
-use media::{MediaKind, base_mime, extension_for_mime, human_size};
+use media::{MediaKind, base_mime, extension_for_mime, human_size, inline_image};
 use types::{
     DownloadMediaParams, MarkReadParams, MediaSource, Recipient, SendLocationParams,
     SendMediaParams, SendReactionParams, SendTemplateParams, SendTextParams, UploadMediaParams,
     check_caption, check_language, check_link, check_template_name, check_text, components_array,
-    invalid, location_content, media_content, message_body, opt_id, present, reaction_content,
-    read_body, required_id, sent_summary, template_content, text_content, uploaded_id,
+    invalid, location_content, media_content, media_id as check_media_id, message_body, opt_id,
+    opt_media_id, opt_wamid, present, reaction_content, read_body, scalar, sent_summary,
+    template_content, text_content, uploaded_id, wamid,
 };
 
 const WINDOW_SECS: i64 = 24 * 3600;
-const WINDOW_SCAN_LIMIT: usize = 200;
-const INLINE_IMAGE_MAX: usize = 2 * 1024 * 1024;
 const DEFAULT_LANGUAGE: &str = "en_US";
+const UNSURE_NOTE: &str =
+    "the message may still have been delivered: check inbox status events before sending again";
 
-/// Strips spaces, dashes, dots, parentheses and a leading plus from a phone number.
-/// Business-scoped user ids such as `US.123` pass through unchanged.
+/// Reduces a phone number to digits (a `(0)` after the country code goes too) and refuses one
+/// that starts with 0, which is national or dialled. User ids such as `US.123` pass through.
 pub fn normalize_phone(raw: &str) -> Result<String, GraphError> {
     let s = raw.trim();
     if types::is_bsuid(s) {
         return Ok(s.to_string());
     }
+    let chars: Vec<char> = s.chars().collect();
     let mut digits = String::new();
-    for (i, c) in s.chars().enumerate() {
-        match c {
-            '0'..='9' => digits.push(c),
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            c @ '0'..='9' => digits.push(c),
             '+' if i == 0 => {}
+            '(' if !digits.is_empty() && chars[i..].starts_with(&['(', '0', ')']) => {
+                i += 3;
+                continue;
+            }
             '-' | '(' | ')' | '.' => {}
             c if c.is_whitespace() => {}
             _ => return Err(not_a_recipient(s)),
         }
+        i += 1;
+    }
+    if digits.starts_with('0') {
+        return Err(invalid(format!(
+            "`{s}` is not a recipient: a phone number starts with its country code, never with 0 or 00 (that is a national number or a dialling prefix)"
+        )));
     }
     if (6..=15).contains(&digits.len()) {
         Ok(digits)
@@ -129,12 +142,21 @@ pub fn whatsapp_hint(code: i64) -> Option<&'static str> {
     })
 }
 
-/// Swaps in the WhatsApp-specific hint on API errors.
+/// Swaps in the WhatsApp-specific hint on API errors. Code 0 with no Meta error type or trace id
+/// is the client's own note for a bare HTTP failure, which says nothing about the token.
 fn enrich(mut e: GraphError) -> GraphError {
-    if let GraphError::Api { code, hint, .. } = &mut e
-        && let Some(h) = whatsapp_hint(*code)
+    if let GraphError::Api {
+        code,
+        error_type,
+        fbtrace_id,
+        hint,
+        ..
+    } = &mut e
     {
-        *hint = Some(h);
+        let bare_http = *code == 0 && error_type.is_none() && fbtrace_id.is_none();
+        if !bare_http && let Some(h) = whatsapp_hint(*code) {
+            *hint = Some(h);
+        }
     }
     e
 }
@@ -151,24 +173,116 @@ fn with_note(mut e: GraphError, note: &str) -> GraphError {
     e
 }
 
+/// True when a failed send may still have reached the person: the request left, so a dropped
+/// connection, a server error or an unreadable answer proves nothing about delivery.
+fn outcome_unknown(e: &GraphError) -> bool {
+    match e {
+        GraphError::Api { http_status, .. } => *http_status >= 500,
+        GraphError::Transport(_) | GraphError::Json(_) => true,
+        GraphError::Config(_) | GraphError::Refused(_) => false,
+    }
+}
+
+/// Adds what the agent needs after a failed send: the delivery caveat when the outcome is
+/// unknown, and the media id of a file uploaded for this send.
+fn explain_failed_send(e: GraphError, uploaded: Option<&str>) -> GraphError {
+    let unknown = outcome_unknown(&e);
+    let needs_caveat = match &e {
+        GraphError::Json(m) => !m.contains("may still have been"),
+        _ => unknown,
+    };
+    let e = if needs_caveat {
+        with_note(e, UNSURE_NOTE)
+    } else {
+        e
+    };
+    match uploaded {
+        Some(id) if unknown => with_note(
+            e,
+            &format!("the uploaded file stays available as media_id {id} for 30 days"),
+        ),
+        Some(id) => with_note(
+            e,
+            &format!(
+                "the file was uploaded as media_id {id}, valid for 30 days: resend it with media_id"
+            ),
+        ),
+        None => e,
+    }
+}
+
 enum Window {
     Open,
     Stale { hours: i64 },
     NoInbound,
 }
 
-fn is_from(event: &Event, to: &Recipient) -> bool {
-    match to {
-        Recipient::Phone(digits) => event.sender == *digits,
-        Recipient::Bsuid(id) => {
-            event.sender == *id
-                || event.raw.get("_sender_user_id").and_then(Value::as_str) == Some(id.as_str())
-        }
+/// The ids a person's inbound messages may carry in the inbox.
+struct Senders(Vec<String>);
+
+impl From<&Recipient> for Senders {
+    fn from(to: &Recipient) -> Self {
+        Self(vec![to.as_str().to_string()])
     }
 }
 
-fn assess_window(events: &[Event], to: &Recipient, now: i64) -> Window {
-    let newest = events.iter().filter(|e| is_from(e, to)).map(|e| e.ts).max();
+/// True when the contact Meta echoed names a different phone number or user id than `to`.
+fn names_someone_else(to: &Recipient, echoed: Option<&str>) -> bool {
+    let Some(echoed) = echoed.map(str::trim).filter(|e| !e.is_empty()) else {
+        return false;
+    };
+    match to {
+        Recipient::Phone(digits) => {
+            let echoed_digits: String = echoed.chars().filter(char::is_ascii_digit).collect();
+            !echoed_digits.is_empty() && echoed_digits != *digits
+        }
+        Recipient::Bsuid(id) => echoed != id,
+    }
+}
+
+impl Senders {
+    /// The recipient plus the `wa_id` and `user_id` Meta answered with, which can differ from the
+    /// number as dialled. Ids of a contact that echoes another recipient are left out.
+    fn with_answer(to: &Recipient, answer: &Value) -> Self {
+        let mut ids = vec![to.as_str().to_string()];
+        let echoed = answer.get("input").and_then(Value::as_str);
+        if !names_someone_else(to, echoed) {
+            for key in ["wa_id", "user_id"] {
+                if let Some(id) = scalar(answer.get(key))
+                    && !ids.contains(&id)
+                {
+                    ids.push(id);
+                }
+            }
+        }
+        Self(ids)
+    }
+
+    fn has(&self, id: &str) -> bool {
+        self.0.iter().any(|s| s == id)
+    }
+}
+
+fn is_from(event: &Event, who: &Senders) -> bool {
+    who.has(&event.sender)
+        || ["_sender_user_id", "from_parent_user_id"]
+            .iter()
+            .any(|key| {
+                event
+                    .raw
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| who.has(id))
+            })
+}
+
+fn assess_window(events: &[Event], who: impl Into<Senders>, now: i64) -> Window {
+    let who = who.into();
+    let newest = events
+        .iter()
+        .filter(|e| is_from(e, &who))
+        .map(|e| e.ts)
+        .max();
     match newest.map(|ts| now.saturating_sub(ts)) {
         None => Window::NoInbound,
         Some(age) if age > WINDOW_SECS => Window::Stale { hours: age / 3600 },
@@ -203,7 +317,7 @@ enum Source<'a> {
 }
 
 fn pick_source(p: &SendMediaParams) -> Result<Source<'_>, GraphError> {
-    let id = opt_id("media_id", &p.media_id)?;
+    let id = opt_media_id("media_id", &p.media_id)?;
     match (id, present(&p.url), present(&p.path)) {
         (Some(id), None, None) => Ok(Source::Id(id)),
         (None, Some(url), None) => Ok(Source::Link(check_link(url)?)),
@@ -283,18 +397,30 @@ async fn blocking<T: Send + 'static>(
         .map_err(|e| GraphError::Refused(format!("file task failed: {e}")))?
 }
 
-/// Fails early when the destination is outside the jail or already taken.
+/// Fails early when the destination is outside the jail, too long or already taken. Creates
+/// nothing: directories appear when the file is written.
 async fn check_dest(jail: &FileJail, dest: &str, overwrite: bool) -> Result<(), GraphError> {
     let (jail, dest) = (jail.clone(), dest.to_string());
-    blocking(move || {
-        if overwrite {
-            jail.resolve_write_overwrite(&dest)?;
-        } else {
-            jail.resolve_write(&dest)?;
-        }
-        Ok(())
-    })
-    .await
+    blocking(move || Ok(jail.check_write(&dest, overwrite)?)).await
+}
+
+/// The `host:port` entries allowed to receive the access token for this media URL: Meta's
+/// `lookaside.fbsbx.com`, a `*.whatsapp.net` host, or an operator host. Empty for any other host.
+fn token_hosts(url: &Url, operator_hosts: &[String]) -> Vec<String> {
+    let Some(host) = url.host_str().map(str::to_ascii_lowercase) else {
+        return Vec::new();
+    };
+    let meta = host == "lookaside.fbsbx.com"
+        || host
+            .strip_suffix(".whatsapp.net")
+            .is_some_and(|label| !label.is_empty());
+    if !meta && !operator_hosts.iter().any(|h| h.eq_ignore_ascii_case(&host)) {
+        return Vec::new();
+    }
+    match url.port_or_known_default() {
+        Some(port) => vec![format!("{host}:{port}")],
+        None => vec![host],
+    }
 }
 
 fn media_url(info: &Value) -> Result<Url, GraphError> {
@@ -355,6 +481,7 @@ impl WhatsApp {
             .map_err(enrich)
     }
 
+    /// Sends `body`; `uploaded` is the media id of a file uploaded for this very send.
     async fn deliver(
         &self,
         line: &Line<'_>,
@@ -362,12 +489,19 @@ impl WhatsApp {
         input: &str,
         body: &Value,
         check_window: bool,
+        uploaded: Option<&str>,
     ) -> Result<Value, GraphError> {
-        let answer = self.post_message(line, body).await?;
-        let mut out = sent_summary(&answer, input)?;
+        let answer = self
+            .post_message(line, body)
+            .await
+            .map_err(|e| explain_failed_send(e, uploaded))?;
+        let mut out = sent_summary(&answer, input).map_err(|e| explain_failed_send(e, uploaded))?;
         out["phone_number_id"] = json!(line.id);
-        if check_window && let Some(warning) = self.window_warning_for(line.id, to).await {
-            out["window_warning"] = json!(warning);
+        if check_window {
+            let who = Senders::with_answer(to, &out);
+            if let Some(warning) = self.window_warning_by(line.id, who).await {
+                out["window_warning"] = json!(warning);
+            }
         }
         Ok(out)
     }
@@ -384,31 +518,36 @@ impl WhatsApp {
         phone_number_id: &str,
         to: &Recipient,
     ) -> Option<String> {
+        self.window_warning_by(phone_number_id, Senders::from(to))
+            .await
+    }
+
+    /// Looks up the newest message from any of the person's ids, wherever it sits in the inbox.
+    async fn window_warning_by(&self, phone_number_id: &str, who: Senders) -> Option<String> {
         let filter = ListFilter {
             platform: Some(Platform::WhatsApp),
             kinds: vec![EventKind::Message],
             account_id: Some(phone_number_id.to_string()),
-            limit: Some(WINDOW_SCAN_LIMIT),
+            limit: Some(1),
             ..ListFilter::default()
         };
-        let events = self.inbox.list_async(filter).await.ok()?;
-        match assess_window(&events, to, now_secs()) {
+        let newest = self
+            .inbox
+            .list_from_async(filter, who.0.clone())
+            .await
+            .ok()?;
+        match assess_window(&newest, who, now_secs()) {
             Window::Open => None,
             Window::Stale { hours } => Some(format!(
                 "last inbound message from this user was {hours} hours ago: a free-form message will fail with 131047, send a template"
             )),
             Window::NoInbound => {
-                if events.is_empty() {
-                    let stats = self.inbox.stats_async().await.ok()?;
-                    let known = stats
-                        .by_platform
-                        .iter()
-                        .any(|(platform, n)| platform == "whatsapp" && *n > 0);
-                    if !known {
-                        return None;
-                    }
-                }
-                Some("no inbound message from this user in the local inbox: outside a 24-hour window only templates deliver".into())
+                let stats = self.inbox.stats_async().await.ok()?;
+                let webhook_feeds_inbox = stats
+                    .by_platform
+                    .iter()
+                    .any(|(platform, n)| platform == "whatsapp" && *n > 0);
+                webhook_feeds_inbox.then(|| "no inbound message from this user in the local inbox: outside a 24-hour window only templates deliver".into())
             }
         }
     }
@@ -416,12 +555,13 @@ impl WhatsApp {
     pub async fn send_text(&self, p: SendTextParams) -> Result<Value, GraphError> {
         let to = Recipient::parse(&p.to)?;
         check_text(&p.body)?;
-        let reply = opt_id("reply_to_message_id", &p.reply_to_message_id)?;
+        let reply = opt_wamid("reply_to_message_id", &p.reply_to_message_id)?;
         let account = opt_id("messaging_account_id", &p.messaging_account_id)?;
         let line = self.line(p.phone_number_id.as_deref())?;
         let content = text_content(&p.body, p.preview_url);
         let body = message_body(&to, "text", content, reply, account);
-        self.deliver(&line, &to, p.to.trim(), &body, true).await
+        self.deliver(&line, &to, p.to.trim(), &body, true, None)
+            .await
     }
 
     pub async fn send_media(&self, p: SendMediaParams) -> Result<Value, GraphError> {
@@ -429,7 +569,7 @@ impl WhatsApp {
         let kind = parse_kind(&p.kind)?;
         let source = pick_source(&p)?;
         check_media_options(kind, &p)?;
-        let reply = opt_id("reply_to_message_id", &p.reply_to_message_id)?;
+        let reply = opt_wamid("reply_to_message_id", &p.reply_to_message_id)?;
         let account = opt_id("messaging_account_id", &p.messaging_account_id)?;
         let line = self.line(p.phone_number_id.as_deref())?;
         let mut filename = present(&p.filename).map(str::to_string);
@@ -466,20 +606,10 @@ impl WhatsApp {
             p.voice,
         );
         let body = message_body(&to, kind.as_str(), content, reply, account);
-        let mut out = match self.deliver(&line, &to, p.to.trim(), &body, true).await {
-            Ok(out) => out,
-            Err(e) => {
-                return Err(match (&media_id, uploaded_bytes) {
-                    (Some(id), Some(_)) => with_note(
-                        e,
-                        &format!(
-                            "the file was uploaded as media_id {id}, valid for 30 days: resend it with media_id"
-                        ),
-                    ),
-                    _ => e,
-                });
-            }
-        };
+        let uploaded = media_id.as_deref().filter(|_| uploaded_bytes.is_some());
+        let mut out = self
+            .deliver(&line, &to, p.to.trim(), &body, true, uploaded)
+            .await?;
         if let Some(id) = media_id {
             out["media_id"] = json!(id);
         }
@@ -498,17 +628,19 @@ impl WhatsApp {
         let line = self.line(p.phone_number_id.as_deref())?;
         let content = template_content(name, language, components);
         let body = message_body(&to, "template", content, None, account);
-        self.deliver(&line, &to, p.to.trim(), &body, false).await
+        self.deliver(&line, &to, p.to.trim(), &body, false, None)
+            .await
     }
 
     pub async fn send_reaction(&self, p: SendReactionParams) -> Result<Value, GraphError> {
         let to = Recipient::parse(&p.to)?;
-        let message_id = required_id("message_id", &p.message_id)?;
-        let content = reaction_content(message_id, p.emoji.trim())?;
+        let message_id = wamid("message_id", &p.message_id)?;
+        let content = reaction_content(message_id, &p.emoji)?;
         let account = opt_id("messaging_account_id", &p.messaging_account_id)?;
         let line = self.line(p.phone_number_id.as_deref())?;
         let body = message_body(&to, "reaction", content, None, account);
-        self.deliver(&line, &to, p.to.trim(), &body, false).await
+        self.deliver(&line, &to, p.to.trim(), &body, false, None)
+            .await
     }
 
     pub async fn send_location(&self, p: SendLocationParams) -> Result<Value, GraphError> {
@@ -522,11 +654,12 @@ impl WhatsApp {
         let account = opt_id("messaging_account_id", &p.messaging_account_id)?;
         let line = self.line(p.phone_number_id.as_deref())?;
         let body = message_body(&to, "location", content, None, account);
-        self.deliver(&line, &to, p.to.trim(), &body, true).await
+        self.deliver(&line, &to, p.to.trim(), &body, true, None)
+            .await
     }
 
     pub async fn mark_read(&self, p: MarkReadParams) -> Result<Value, GraphError> {
-        let message_id = required_id("message_id", &p.message_id)?;
+        let message_id = wamid("message_id", &p.message_id)?;
         let line = self.line(p.phone_number_id.as_deref())?;
         let typing = p.typing.unwrap_or(false);
         let answer = self
@@ -618,10 +751,16 @@ impl WhatsApp {
         &self,
         p: DownloadMediaParams,
     ) -> Result<(Value, Option<(String, String)>), GraphError> {
-        let media_id = required_id("media_id", &p.media_id)?;
+        let media_id = check_media_id("media_id", &p.media_id)?;
         let line = self.line(p.phone_number_id.as_deref())?;
         let jail = self.jail()?.clone();
         let overwrite = p.overwrite.unwrap_or(false);
+        if overwrite && self.cfg.read_only {
+            return Err(GraphError::Refused(
+                "overwrite=true is refused in read-only mode (META_MCP_READ_ONLY): a download may only create a new file"
+                    .into(),
+            ));
+        }
         let named = present(&p.dest_name).map(str::to_string);
         if let Some(dest) = &named {
             check_dest(&jail, dest, overwrite).await?;
@@ -633,6 +772,13 @@ impl WhatsApp {
             .await
             .map_err(enrich)?;
         let url = media_url(&info)?;
+        if !is_allowed_host(&url, &self.cfg.download_hosts) {
+            return Err(GraphError::Refused(format!(
+                "refusing to download from `{}://{}`: only https on a Meta media host or a host in META_MCP_DOWNLOAD_HOSTS is fetched (plain http for loopback only); nothing was fetched",
+                url.scheme(),
+                url.host_str().unwrap_or("?")
+            )));
+        }
         let max = self.cfg.max_file_bytes;
         if let Some(size) = info.get("file_size").and_then(as_i64)
             && size > 0
@@ -656,14 +802,14 @@ impl WhatsApp {
                 dest
             }
         };
-        let hosts: Vec<String> = url.host_str().map(str::to_string).into_iter().collect();
-        let mode = if is_allowed_host(&url, &self.cfg.download_hosts) {
+        let hosts = token_hosts(&url, &self.cfg.download_hosts);
+        let mode = if hosts.is_empty() {
+            TokenMode::Never
+        } else {
             TokenMode::OnHosts {
                 token: line.token,
                 hosts: &hosts,
             }
-        } else {
-            TokenMode::Never
         };
         let got = self.graph.download(&url, mode, max).await?;
         let (sha256, checked) =
@@ -673,21 +819,31 @@ impl WhatsApp {
             .unwrap_or_else(|| "application/octet-stream".into());
         let bytes = got.bytes;
         let size = bytes.len();
-        let inline_image =
-            (p.inline.unwrap_or(true) && mime.starts_with("image/") && size <= INLINE_IMAGE_MAX)
-                .then(|| (STANDARD.encode(&bytes), mime.clone()));
+        let mut inline_skipped = None;
+        let inline_image = if p.inline.unwrap_or(true) {
+            match inline_image(&bytes) {
+                Ok(shown) => Some((STANDARD.encode(&bytes), shown.to_string())),
+                Err(why) => {
+                    inline_skipped = mime.starts_with("image/").then_some(why);
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let saved = blocking(move || Ok(jail.write_new(&dest, &bytes, overwrite, max)?)).await?;
-        Ok((
-            json!({
-                "path": saved.display().to_string(),
-                "bytes": size,
-                "mime": mime,
-                "sha256": sha256,
-                "sha256_checked": checked,
-                "media_id": media_id,
-            }),
-            inline_image,
-        ))
+        let mut out = json!({
+            "path": saved.display().to_string(),
+            "bytes": size,
+            "mime": mime,
+            "sha256": sha256,
+            "sha256_checked": checked,
+            "media_id": media_id,
+        });
+        if let Some(why) = inline_skipped {
+            out["inline_skipped"] = json!(why);
+        }
+        Ok((out, inline_image))
     }
 }
 
@@ -788,6 +944,272 @@ mod tests {
         ));
         let edge = event("16505551234", now - WINDOW_SECS, json!({}));
         assert!(matches!(assess_window(&[edge], &phone, now), Window::Open));
+    }
+
+    #[test]
+    fn a_trunk_zero_in_parentheses_is_dropped_and_national_numbers_are_refused() {
+        for (raw, want) in [
+            ("+44 (0) 7911 123456", "447911123456"),
+            ("+44(0)7911123456", "447911123456"),
+            ("+33 (0)6 12 34 56 78", "33612345678"),
+            ("33 (0) 6 12 34 56 78", "33612345678"),
+            ("+1 (650) 555-0123", "16505550123"),
+            ("(650) 555-1234", "6505551234"),
+        ] {
+            assert_eq!(normalize_phone(raw).expect(raw), want, "{raw}");
+        }
+        for raw in [
+            "06 12 34 56 78",
+            "0033 6 12 34 56 78",
+            "00 1 650 555 1234",
+            "011 44 7911 123456",
+            "+0 6 12 34 56 78",
+            "(0) 7911 123456",
+            "(0)6 12 34 56 78",
+            "0",
+        ] {
+            let err = normalize_phone(raw).expect_err(raw).to_string();
+            assert!(err.contains("not a recipient"), "{raw}: {err}");
+        }
+        let err = normalize_phone("06 12 34 56 78")
+            .expect_err("national")
+            .to_string();
+        assert!(err.contains("country code"), "{err}");
+    }
+
+    fn bare_http_error(status: u16) -> GraphError {
+        GraphError::Api {
+            code: 0,
+            subcode: None,
+            message: format!("HTTP {status}"),
+            error_type: None,
+            fbtrace_id: None,
+            user_msg: None,
+            hint: None,
+            http_status: status,
+        }
+    }
+
+    #[test]
+    fn a_bare_http_failure_does_not_blame_the_token() {
+        let shown = enrich(bare_http_error(404)).to_string();
+        assert_eq!(shown, "Graph API error 0: HTTP 404");
+        let plain_string_error = json!({"error": "invalid_request", "error_description": "bad"});
+        let api = GraphError::from_body(&plain_string_error, 400).expect("api error");
+        assert!(!enrich(api).to_string().contains("access token"));
+        let real = json!({"error": {"message": "x", "type": "OAuthException", "code": 0}});
+        let shown = enrich(GraphError::from_body(&real, 401).expect("api error")).to_string();
+        assert!(shown.contains("access token is invalid"), "{shown}");
+        let traced = json!({"error": {"message": "x", "code": 0, "fbtrace_id": "T"}});
+        let shown = enrich(GraphError::from_body(&traced, 400).expect("api error")).to_string();
+        assert!(shown.contains("META_WHATSAPP_ACCESS_TOKEN"), "{shown}");
+        let expired = json!({"error": {"message": "x", "type": "OAuthException", "code": 190}});
+        let shown = enrich(GraphError::from_body(&expired, 401).expect("api error")).to_string();
+        assert!(shown.contains("access token is invalid"), "{shown}");
+    }
+
+    #[test]
+    fn a_failed_send_says_what_the_agent_needs_to_know() {
+        let rejected = |code: i64| {
+            GraphError::from_body(&json!({"error": {"message": "no", "code": code}}), 400)
+                .expect("api error")
+        };
+        let server = GraphError::from_body(&json!({"error": {"message": "oops", "code": 2}}), 503)
+            .expect("api error");
+        for e in [
+            GraphError::transport("connection closed before message completed"),
+            server,
+            GraphError::Json("the response is not valid JSON (HTTP 200)".into()),
+        ] {
+            let shown = explain_failed_send(e, None).to_string();
+            assert!(shown.contains(&format!("({UNSURE_NOTE})")), "{shown}");
+        }
+        let shown = explain_failed_send(rejected(131047), None).to_string();
+        assert!(!shown.contains("may still have been delivered"), "{shown}");
+        for local in [
+            GraphError::Config("bad".into()),
+            GraphError::Refused("no".into()),
+        ] {
+            assert!(
+                !explain_failed_send(local, None)
+                    .to_string()
+                    .contains("delivered")
+            );
+        }
+        let own_caveat = GraphError::Json(
+            "the send answer has no message id, so the message may still have been accepted: check the inbox status events before sending again".into(),
+        );
+        let shown = explain_failed_send(own_caveat, None).to_string();
+        assert_eq!(
+            shown.matches("check the inbox status events").count(),
+            1,
+            "{shown}"
+        );
+        assert!(!shown.contains(UNSURE_NOTE), "{shown}");
+
+        let definite = explain_failed_send(rejected(131047), Some("777")).to_string();
+        assert!(
+            definite.contains("uploaded as media_id 777")
+                && definite.contains("resend it with media_id"),
+            "{definite}"
+        );
+        let unsure =
+            explain_failed_send(GraphError::transport("connection reset"), Some("777")).to_string();
+        assert!(
+            unsure.contains(UNSURE_NOTE) && unsure.contains("media_id 777"),
+            "{unsure}"
+        );
+        assert!(!unsure.contains("resend"), "{unsure}");
+    }
+
+    #[test]
+    fn only_a_definite_rejection_is_safe_to_resend() {
+        assert!(outcome_unknown(&GraphError::transport("reset")));
+        assert!(outcome_unknown(&GraphError::Json("x".into())));
+        assert!(outcome_unknown(&bare_http_error(500)));
+        assert!(outcome_unknown(&bare_http_error(503)));
+        assert!(!outcome_unknown(&bare_http_error(499)));
+        assert!(!outcome_unknown(&bare_http_error(400)));
+        assert!(!outcome_unknown(&GraphError::Refused("no".into())));
+        assert!(!outcome_unknown(&GraphError::Config("no".into())));
+    }
+
+    fn host_entries(url: &str, operators: &[&str]) -> Vec<String> {
+        let operators: Vec<String> = operators.iter().map(|h| (*h).to_string()).collect();
+        token_hosts(&Url::parse(url).expect("url"), &operators)
+    }
+
+    #[test]
+    fn the_token_goes_only_to_lookaside_whatsapp_and_operator_hosts() {
+        assert_eq!(
+            host_entries(
+                "https://lookaside.fbsbx.com/whatsapp_business/attachments/?mid=1",
+                &[]
+            ),
+            ["lookaside.fbsbx.com:443"]
+        );
+        assert_eq!(
+            host_entries("https://mmg.whatsapp.net/v/t62/x", &[]),
+            ["mmg.whatsapp.net:443"]
+        );
+        assert_eq!(
+            host_entries("https://LOOKASIDE.fbsbx.com:8443/x", &[]),
+            ["lookaside.fbsbx.com:8443"]
+        );
+        assert_eq!(
+            host_entries("http://127.0.0.1:41234/blob", &["127.0.0.1"]),
+            ["127.0.0.1:41234"]
+        );
+        assert_eq!(
+            host_entries("http://[::1]:8080/blob", &["[::1]"]),
+            ["[::1]:8080"]
+        );
+        assert_eq!(
+            host_entries(
+                "https://files.example.org/x",
+                &["other.example.org", "FILES.example.org"]
+            ),
+            ["files.example.org:443"],
+            "only the host of the URL, never the other operator hosts"
+        );
+        for url in [
+            "https://www.facebook.com/x",
+            "https://api.messenger.com/x",
+            "https://scontent.xx.fbcdn.net/x",
+            "https://cdn.fbsbx.com/x",
+            "https://x.lookaside.fbsbx.com/x",
+            "https://evilwhatsapp.net/x",
+            "https://whatsapp.net/x",
+            "https://mmg.whatsapp.net.evil.example/x",
+            "https://files.example.org/x",
+        ] {
+            assert!(host_entries(url, &[]).is_empty(), "{url}");
+        }
+        assert!(host_entries("https://files.example.org/x", &["a.example.org"]).is_empty());
+    }
+
+    #[test]
+    fn answer_ids_count_unless_the_contact_names_someone_else() {
+        let phone = Recipient::Phone("525512345678".into());
+        let ids = |to: &Recipient, answer: Value| Senders::with_answer(to, &answer).0;
+        assert_eq!(
+            ids(
+                &phone,
+                json!({"input": "525512345678", "wa_id": "5215512345678"})
+            ),
+            ["525512345678", "5215512345678"]
+        );
+        assert_eq!(
+            ids(
+                &phone,
+                json!({"input": "+52 55 1234 5678", "wa_id": "5215512345678", "user_id": "US.9"})
+            ),
+            ["525512345678", "5215512345678", "US.9"]
+        );
+        assert_eq!(
+            ids(&phone, json!({"wa_id": "525512345678"})),
+            ["525512345678"],
+            "no repeats"
+        );
+        assert_eq!(
+            ids(&phone, json!({"input": "x", "wa_id": "5215512345678"})),
+            ["525512345678", "5215512345678"],
+            "an echo without digits says nothing"
+        );
+        assert_eq!(
+            ids(
+                &phone,
+                json!({"input": "+1 (650) 555-1234", "wa_id": "16505551234"})
+            ),
+            ["525512345678"]
+        );
+        let bsuid = Recipient::Bsuid("US.1".into());
+        assert_eq!(
+            ids(
+                &bsuid,
+                json!({"input": "US.1", "wa_id": "16505551234", "user_id": "US.1"})
+            ),
+            ["US.1", "16505551234"]
+        );
+        assert_eq!(
+            ids(&bsuid, json!({"input": "US.2", "wa_id": "16505551234"})),
+            ["US.1"]
+        );
+        assert_eq!(Senders::from(&bsuid).0, ["US.1"]);
+    }
+
+    #[test]
+    fn windows_follow_every_id_the_person_is_known_by() {
+        let now = 2_000_000_000;
+        let mexico = Senders(vec!["525512345678".into(), "5215512345678".into()]);
+        let fresh = event("5215512345678", now - 60, json!({}));
+        assert!(matches!(assess_window(&[fresh], mexico, now), Window::Open));
+        let parent = event(
+            "16505551234",
+            now - 60,
+            json!({"from_parent_user_id": "US.ENT.9"}),
+        );
+        let by_parent = Recipient::Bsuid("US.ENT.9".into());
+        assert!(matches!(
+            assess_window(&[parent], &by_parent, now),
+            Window::Open
+        ));
+        let by_user_id = event(
+            "US.77",
+            now - 26 * 3600,
+            json!({"_sender_user_id": "US.77"}),
+        );
+        let who = Senders(vec!["16505551234".into(), "US.77".into()]);
+        assert!(matches!(
+            assess_window(&[by_user_id], who, now),
+            Window::Stale { hours: 26 }
+        ));
+        let stranger = event("4479", now - 60, json!({"_sender_user_id": 7}));
+        let phone = Recipient::Phone("16505551234".into());
+        assert!(matches!(
+            assess_window(&[stranger], &phone, now),
+            Window::NoInbound
+        ));
     }
 
     #[test]
