@@ -23,6 +23,43 @@ use crate::inbox::{Event, EventKind, Inbox, InboxError, ListFilter, Platform, no
 /// Tools that change local state and disappear in read-only mode.
 pub const CORE_WRITE_TOOLS: &[&str] = &["inbox_mark_processed"];
 
+/// Every tool the server exposes, sorted.
+pub const ALL_TOOL_NAMES: [&str; 20] = [
+    "inbox_list",
+    "inbox_mark_processed",
+    "inbox_wait",
+    "messenger_download_attachment",
+    "messenger_get_message",
+    "messenger_get_profile",
+    "messenger_list_conversations",
+    "messenger_read_conversation",
+    "messenger_send_attachment",
+    "messenger_send_text",
+    "messenger_sender_action",
+    "meta_status",
+    "whatsapp_download_media",
+    "whatsapp_mark_read",
+    "whatsapp_send_location",
+    "whatsapp_send_media",
+    "whatsapp_send_reaction",
+    "whatsapp_send_template",
+    "whatsapp_send_text",
+    "whatsapp_upload_media",
+];
+
+/// The tools left in read-only mode (downloads stay: they only write local files).
+pub const READ_ONLY_TOOL_NAMES: [&str; 9] = [
+    "inbox_list",
+    "inbox_wait",
+    "messenger_download_attachment",
+    "messenger_get_message",
+    "messenger_get_profile",
+    "messenger_list_conversations",
+    "messenger_read_conversation",
+    "meta_status",
+    "whatsapp_download_media",
+];
+
 const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 200;
 const DEFAULT_WAIT_SECS: i64 = 30;
@@ -530,11 +567,14 @@ mod tests {
 
     #[test]
     fn core_tools_and_read_only_filter() {
-        assert_eq!(tool_names_for(false), CORE);
-        assert_eq!(
-            tool_names_for(true),
-            ["inbox_list", "inbox_wait", "meta_status"]
-        );
+        assert_eq!(tool_names_for(false), ALL_TOOL_NAMES);
+        assert_eq!(tool_names_for(true), READ_ONLY_TOOL_NAMES);
+        for name in CORE {
+            assert!(ALL_TOOL_NAMES.contains(&name), "{name}");
+        }
+        let mut sorted = ALL_TOOL_NAMES.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(sorted, ALL_TOOL_NAMES, "ALL_TOOL_NAMES must stay sorted");
     }
 
     #[test]

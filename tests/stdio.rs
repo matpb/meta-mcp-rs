@@ -10,12 +10,7 @@ use serde_json::{Value, json};
 use wiremock::matchers::{header, method, path, query_param_is_missing};
 use wiremock::{Mock, ResponseTemplate};
 
-const CORE_TOOLS: [&str; 4] = [
-    "inbox_list",
-    "inbox_mark_processed",
-    "inbox_wait",
-    "meta_status",
-];
+use meta_mcp::mcp::{ALL_TOOL_NAMES, READ_ONLY_TOOL_NAMES};
 const OFFLINE: &str = "http://127.0.0.1:9";
 
 fn sample_event(id: &str, ts: i64) -> Event {
@@ -39,7 +34,7 @@ fn sample_event(id: &str, ts: i64) -> Event {
 fn lists_core_tools() {
     let home = TempHome::new();
     let mut s = Session::start(&home, OFFLINE, &[]);
-    assert_eq!(s.tool_names(), CORE_TOOLS);
+    assert_eq!(s.tool_names(), ALL_TOOL_NAMES);
 }
 
 #[test]
@@ -80,7 +75,7 @@ fn read_only_hides_write_tools() {
         !names.contains(&"inbox_mark_processed".to_string()),
         "{names:?}"
     );
-    assert_eq!(names, ["inbox_list", "inbox_wait", "meta_status"]);
+    assert_eq!(names, READ_ONLY_TOOL_NAMES);
 }
 
 #[test]
@@ -530,19 +525,8 @@ fn tools_subcommand_honours_read_only() {
             .map(str::to_string)
             .collect::<Vec<_>>()
     };
-    assert_eq!(
-        run(&[]),
-        [
-            "inbox_list",
-            "inbox_mark_processed",
-            "inbox_wait",
-            "meta_status"
-        ]
-    );
-    assert_eq!(
-        run(&[("META_MCP_READ_ONLY", "true")]),
-        ["inbox_list", "inbox_wait", "meta_status"]
-    );
+    assert_eq!(run(&[]), ALL_TOOL_NAMES);
+    assert_eq!(run(&[("META_MCP_READ_ONLY", "true")]), READ_ONLY_TOOL_NAMES);
     assert!(
         !home.inbox_db().exists(),
         "listing tools must not create the inbox"

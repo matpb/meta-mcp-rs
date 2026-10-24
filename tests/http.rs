@@ -65,18 +65,39 @@ impl Drop for KillOnDrop {
     }
 }
 
+/// True once `GET /health` on the port answers with HTTP 200.
+fn health_answers(port: u16) -> bool {
+    use std::io::{Read, Write};
+    let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    if stream
+        .write_all(b"GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+    let mut buf = Vec::new();
+    let _ = stream.read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).starts_with("HTTP/1.1 200")
+        || String::from_utf8_lossy(&buf).starts_with("HTTP/1.0 200")
+}
+
+/// Waits until the server answers `/health`, not only until the port accepts connections.
 fn wait_for_port(child: &mut Child, port: u16) {
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
         if let Some(status) = child.try_wait().expect("wait") {
             panic!("the server exited early with {status}");
         }
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+        if health_answers(port) {
             return;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    panic!("server did not start listening on {port}");
+    panic!("server did not start serving on {port}");
 }
 
 fn client() -> reqwest::Client {
@@ -202,15 +223,7 @@ async fn accepts_with_key() {
         .map(|t| t["name"].as_str().expect("name"))
         .collect();
     names.sort_unstable();
-    assert_eq!(
-        names,
-        [
-            "inbox_list",
-            "inbox_mark_processed",
-            "inbox_wait",
-            "meta_status"
-        ]
-    );
+    assert_eq!(names, meta_mcp::mcp::ALL_TOOL_NAMES);
 }
 
 #[tokio::test]

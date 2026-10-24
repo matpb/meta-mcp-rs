@@ -294,17 +294,33 @@ fn whatsapp(body: &Value, received_at: i64) -> Vec<Event> {
     out
 }
 
-fn whatsapp_value(value: &Value, waba: &str, received_at: i64) -> Vec<Event> {
-    let phone_id = id_of(value.pointer("/metadata/phone_number_id"));
-    let names: Vec<(String, String)> = value
+struct WaContact {
+    wa_id: String,
+    user_id: String,
+    name: Option<String>,
+    username: Option<String>,
+}
+
+fn whatsapp_contacts(value: &Value) -> Vec<WaContact> {
+    value
         .get("contacts")
         .and_then(Value::as_array)
         .map(|list| {
             list.iter()
-                .filter_map(|c| Some((id_of(c.get("wa_id")), text_of(c.pointer("/profile/name"))?)))
+                .map(|c| WaContact {
+                    wa_id: id_of(c.get("wa_id")),
+                    user_id: id_of(c.get("user_id")),
+                    name: text_of(c.pointer("/profile/name")),
+                    username: text_of(c.pointer("/profile/username")),
+                })
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+fn whatsapp_value(value: &Value, waba: &str, received_at: i64) -> Vec<Event> {
+    let phone_id = id_of(value.pointer("/metadata/phone_number_id"));
+    let contacts = whatsapp_contacts(value);
     let mut out = Vec::new();
     for m in value
         .get("messages")
@@ -312,7 +328,7 @@ fn whatsapp_value(value: &Value, waba: &str, received_at: i64) -> Vec<Event> {
         .into_iter()
         .flatten()
     {
-        out.push(whatsapp_message(m, &phone_id, &names, received_at));
+        out.push(whatsapp_message(m, &phone_id, &contacts, received_at));
     }
     for s in value
         .get("statuses")
@@ -337,63 +353,137 @@ fn whatsapp_value(value: &Value, waba: &str, received_at: i64) -> Vec<Event> {
     out
 }
 
-fn whatsapp_message(
-    m: &Value,
-    phone_id: &str,
-    names: &[(String, String)],
-    received_at: i64,
-) -> Event {
+fn set_raw(raw: &mut Value, key: &str, value: Value) {
+    if let Some(obj) = raw.as_object_mut() {
+        obj.insert(key.to_string(), value);
+    }
+}
+
+fn whatsapp_message(m: &Value, phone_id: &str, contacts: &[WaContact], received_at: i64) -> Event {
     let from = id_of(m.get("from"));
+    let from_user_id = id_of(m.get("from_user_id"));
+    let sender = [&from, &from_user_id]
+        .into_iter()
+        .find(|s| !s.is_empty())
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
     let kind_name = id_of(m.get("type"));
-    let reaction = kind_name == "reaction";
     let mut raw = m.clone();
-    if let Some((_, name)) = names.iter().find(|(wa_id, _)| *wa_id == from) {
-        raw["_sender_name"] = json!(name);
+    if !from_user_id.is_empty() {
+        set_raw(&mut raw, "_sender_user_id", json!(from_user_id));
+    }
+    let contact = contacts.iter().find(|c| {
+        (!from.is_empty() && c.wa_id == from)
+            || (!from_user_id.is_empty() && c.user_id == from_user_id)
+    });
+    if let Some(c) = contact {
+        if let Some(name) = &c.name {
+            set_raw(&mut raw, "_sender_name", json!(name));
+        }
+        if let Some(username) = &c.username {
+            set_raw(&mut raw, "_sender_username", json!(username));
+        }
+    }
+    if let Some(group) = text_of(m.get("group_id")) {
+        set_raw(&mut raw, "_group_id", json!(group));
     }
     let media = WA_MEDIA
         .contains(&kind_name.as_str())
         .then(|| m.get(kind_name.as_str()))
         .flatten();
-    let text = match kind_name.as_str() {
-        "text" => text_of(m.pointer("/text/body")),
-        "interactive" => text_of(m.pointer("/interactive/button_reply/title"))
-            .or_else(|| text_of(m.pointer("/interactive/list_reply/title"))),
-        "button" => text_of(m.pointer("/button/text")),
-        "reaction" => text_of(m.pointer("/reaction/emoji")),
-        "location" => location_text(m.get("location")),
-        _ => media.and_then(|x| text_of(x.get("caption"))),
+    for (media_kind, flag) in [("audio", "voice"), ("sticker", "animated")] {
+        let set = media.and_then(|x| x.get(flag)).and_then(Value::as_bool);
+        if kind_name == media_kind && set == Some(true) {
+            set_raw(&mut raw, &format!("_{flag}"), json!(true));
+        }
+    }
+    let context_id = text_of(m.pointer("/context/id"));
+    let (kind, text, reply_to) = match kind_name.as_str() {
+        "reaction" => (
+            EventKind::Reaction,
+            text_of(m.pointer("/reaction/emoji")),
+            text_of(m.pointer("/reaction/message_id")),
+        ),
+        "edit" => (
+            EventKind::Other,
+            edited_text(m),
+            text_of(m.pointer("/edit/original_message_id")),
+        ),
+        "revoke" => (
+            EventKind::Other,
+            None,
+            text_of(m.pointer("/revoke/original_message_id")),
+        ),
+        "system" => (
+            EventKind::Other,
+            text_of(m.pointer("/system/body")),
+            context_id,
+        ),
+        other => (
+            EventKind::Message,
+            whatsapp_text(other, m, media),
+            context_id,
+        ),
     };
     Event {
         ts: m.get("timestamp").and_then(as_i64).unwrap_or(received_at),
         account_id: phone_id.to_string(),
-        sender: from,
+        sender,
         recipient: phone_id.to_string(),
         text,
         attachments: media
             .map(|x| vec![whatsapp_attachment(&kind_name, x)])
             .unwrap_or_default(),
-        reply_to: if reaction {
-            text_of(m.pointer("/reaction/message_id"))
-        } else {
-            text_of(m.pointer("/context/id"))
-        },
+        reply_to,
         raw,
         received_at,
         ..Event::new(
             format!("whatsapp:{}", id_of(m.get("id"))),
             Platform::WhatsApp,
-            if reaction {
-                EventKind::Reaction
-            } else {
-                EventKind::Message
-            },
+            kind,
         )
     }
+}
+
+fn whatsapp_text(kind: &str, m: &Value, media: Option<&Value>) -> Option<String> {
+    match kind {
+        "text" => text_of(m.pointer("/text/body")),
+        "interactive" => text_of(m.pointer("/interactive/button_reply/title"))
+            .or_else(|| text_of(m.pointer("/interactive/list_reply/title"))),
+        "button" => text_of(m.pointer("/button/text")),
+        "location" => location_text(m.get("location")),
+        "contacts" => contact_names(m.get("contacts")),
+        "order" => text_of(m.pointer("/order/text")),
+        "unsupported" => None,
+        _ => media.and_then(|x| text_of(x.get("caption"))),
+    }
+}
+
+fn edited_text(m: &Value) -> Option<String> {
+    let edited = m.pointer("/edit/message")?;
+    text_of(edited.pointer("/text/body")).or_else(|| {
+        WA_MEDIA
+            .iter()
+            .find_map(|k| text_of(edited.pointer(&format!("/{k}/caption"))))
+    })
+}
+
+fn contact_names(contacts: Option<&Value>) -> Option<String> {
+    let names: Vec<String> = contacts?
+        .as_array()?
+        .iter()
+        .filter_map(|c| {
+            text_of(c.pointer("/name/formatted_name"))
+                .or_else(|| text_of(c.pointer("/name/first_name")))
+        })
+        .collect();
+    (!names.is_empty()).then(|| names.join(", "))
 }
 
 fn whatsapp_attachment(kind: &str, media: &Value) -> Attachment {
     Attachment {
         kind: kind.to_string(),
+        url: text_of(media.get("url")),
         media_id: text_of(media.get("id")),
         mime_type: text_of(media.get("mime_type")),
         caption: text_of(media.get("caption")),
@@ -418,11 +508,14 @@ fn location_text(loc: Option<&Value>) -> Option<String> {
 
 fn whatsapp_status(s: &Value, phone_id: &str, received_at: i64) -> Event {
     let status = id_of(s.get("status"));
+    let recipient = text_of(s.get("recipient_id"))
+        .or_else(|| text_of(s.get("recipient_user_id")))
+        .unwrap_or_default();
     Event {
         ts: s.get("timestamp").and_then(as_i64).unwrap_or(received_at),
         account_id: phone_id.to_string(),
         sender: phone_id.to_string(),
-        recipient: id_of(s.get("recipient_id")),
+        recipient,
         text: text_of(s.get("status")),
         raw: s.clone(),
         received_at,

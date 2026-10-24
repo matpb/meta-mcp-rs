@@ -112,7 +112,8 @@ impl GraphError {
             message: text(err, "message").unwrap_or_else(|| "unknown error".into()),
             error_type: text(err, "type"),
             fbtrace_id: text(err, "fbtrace_id"),
-            user_msg: text(err, "error_user_msg"),
+            user_msg: text(err, "error_user_msg")
+                .or_else(|| text(err.get("error_data").unwrap_or(&Value::Null), "details")),
             hint: hint(code, subcode),
             http_status,
         })
@@ -254,6 +255,23 @@ mod tests {
         );
         assert!(!shown.contains("1234567890"), "{shown}");
         assert_eq!(e.code(), Some(190));
+    }
+
+    #[test]
+    fn whatsapp_error_data_details_are_kept() {
+        let body = json!({"error": {
+            "message": "(#130429) Rate limit hit", "type": "OAuthException", "code": 130429,
+            "error_data": {"messaging_product": "whatsapp",
+                           "details": "Cloud API message throughput has been reached."},
+            "fbtrace_id": "T"
+        }});
+        let shown = GraphError::from_body(&body, 400)
+            .expect("error")
+            .to_string();
+        assert!(
+            shown.contains("(Cloud API message throughput has been reached.)"),
+            "{shown}"
+        );
     }
 
     #[test]
