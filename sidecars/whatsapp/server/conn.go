@@ -36,6 +36,9 @@ func (s *server) connect(ctx context.Context, req ipc.Request) ipc.Reply {
 	if !cl.HasDevice() {
 		return fail(req.ID, api.CodeNotLoggedIn, "no WhatsApp account is linked")
 	}
+	if r := s.blockedReason(); r != "" {
+		return failErr(req.ID, notConnectedBlocked(r))
+	}
 	if cl.IsConnected() {
 		return ok(req.ID, struct{}{})
 	}
@@ -75,9 +78,18 @@ func blockedError(reason string) *api.Error {
 	return api.Errorf(api.CodeSendingBlocked, "sending is blocked (%s); restart the sidecar after the cause is resolved", reason)
 }
 
-// fatal blocks sends with reason and tells the daemon.
+// notConnectedBlocked is the connect refusal while a fatal signal holds the account.
+func notConnectedBlocked(reason string) *api.Error {
+	return api.Errorf(api.CodeNotConnected, "not connected; the account is blocked (%s); restart the sidecar after the cause is resolved", reason)
+}
+
+// fatal blocks sends with reason and tells the daemon. Except for the reach-out time-lock, which leaves the
+// connection up, it also ends the wish to be connected, so the socket closing is not reported as a retryable drop.
 func (s *server) fatal(reason, action string) error {
 	s.setBlocked(reason)
+	if reason != api.FatalReachoutTimelock {
+		s.setWantConn(false)
+	}
 	s.log.Info().Str("reason", reason).Msg("fatal connection state")
 	return s.emit(api.EvConnection, api.ConnectionEvent{State: api.ConnFatal, Reason: reason, Action: action})
 }
@@ -114,7 +126,14 @@ func (s *server) chatFor(ctx context.Context, threadID string) (store.Chat, erro
 }
 
 // handleEvent runs on whatsmeow's goroutine: it commits to the store and stdout, never waits on the network.
-func (s *server) handleEvent(cl wa.Client, evt any) bool {
+// A panic is recovered and answered with false, so the event stays unacknowledged.
+func (s *server) handleEvent(cl wa.Client, evt any) (handled bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.recovered("event", fmt.Sprintf("%T", evt), r)
+			handled = false
+		}
+	}()
 	if s.closed.Load() {
 		return false
 	}
@@ -122,7 +141,7 @@ func (s *server) handleEvent(cl wa.Client, evt any) bool {
 		return true
 	}
 	if err := s.dispatch(s.ctx, cl, evt); err != nil {
-		s.log.Error().Str("event_type", fmt.Sprintf("%T", evt)).Msg("event handling failed")
+		s.log.Error().Str("event", fmt.Sprintf("%T", evt)).Msg("event handling failed")
 		return false
 	}
 	return true
@@ -160,6 +179,9 @@ func (s *server) dispatch(ctx context.Context, cl wa.Client, evt any) error {
 	case *events.KeepAliveRestored:
 		return s.emit(api.EvConnection, api.ConnectionEvent{State: api.ConnConnected})
 	case *events.ConnectFailure:
+		if e.Reason == events.ConnectFailureBadUserAgent {
+			return s.fatal(api.FatalStreamReplaced, api.ActionNone)
+		}
 		return s.emit(api.EvConnection, api.ConnectionEvent{
 			State: api.ConnDisconnected, Reason: "connect_failure_" + strconv.Itoa(int(e.Reason)), Action: api.ActionRetry,
 		})
@@ -185,6 +207,7 @@ func (s *server) onConnected(cl wa.Client) error {
 	s.bg.Add(1)
 	go func() {
 		defer s.bg.Done()
+		defer s.recoverPanic("presence")
 		ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
 		defer cancel()
 		_ = cl.SendPresence(ctx, types.PresenceUnavailable)
@@ -211,10 +234,17 @@ func (s *server) onLoggedOut(cl wa.Client, e *events.LoggedOut) error {
 	s.bg.Add(1)
 	go func() {
 		defer s.bg.Done()
-		s.mu.Lock()
-		same := s.client == cl
-		s.mu.Unlock()
-		if !same || s.closed.Load() {
+		defer s.recoverPanic("logged_out")
+		unlinked := s.awaitUnlinked(cl)
+		if !s.isCurrent(cl) || s.closed.Load() {
+			return
+		}
+		if !unlinked {
+			s.log.Info().Msg("the device record was not removed in time, the session database wipe is skipped")
+		} else if err := s.factory.Scrub(s.ctx); err != nil {
+			s.log.Error().Msg("could not wipe the session database after the unlink")
+		}
+		if !s.isCurrent(cl) {
 			return
 		}
 		if err := s.freshClient(s.ctx); err != nil {
@@ -222,6 +252,29 @@ func (s *server) onLoggedOut(cl wa.Client, e *events.LoggedOut) error {
 		}
 	}()
 	return nil
+}
+
+// isCurrent reports whether cl is still the client the server uses.
+func (s *server) isCurrent(cl wa.Client) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.client == cl
+}
+
+// awaitUnlinked waits for whatsmeow to finish deleting the device record it announced with LoggedOut.
+func (s *server) awaitUnlinked(cl wa.Client) bool {
+	deadline := time.Now().Add(s.tm.unlink)
+	for cl.HasDevice() {
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		select {
+		case <-time.After(20 * time.Millisecond):
+		case <-s.ctx.Done():
+			return false
+		}
+	}
+	return true
 }
 
 // sendError maps a whatsmeow send failure to a protocol error and raises the 463 fatal state.

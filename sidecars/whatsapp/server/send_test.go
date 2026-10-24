@@ -13,10 +13,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
 
 	"github.com/matpb/meta-mcp-rs/sidecars/whatsapp/api"
 )
@@ -480,5 +482,139 @@ func TestMarkReadFailureKeepsUnreadState(t *testing.T) {
 	h.wantErr(h.call("mark_read", map[string]any{"thread_id": peerPN}), api.CodeNotConnected)
 	if chat, _, _ := h.srv.store.GetChat(context.Background(), peerPN); chat.UnreadCount != 1 || chat.ReadUpToTS != 0 {
 		t.Fatalf("chat %+v", chat)
+	}
+}
+
+// Review W5: a group read marks one receipt batch per participant, and a message in the same second as the mark is still unread.
+func TestReviewMarkReadGroupSemantics(t *testing.T) {
+	h, c := startPaired(t, true, fastTiming)
+	for i, m := range []struct{ sender, id string }{{aliceGrpPN, "G1"}, {malloryPN, "G2"}, {aliceGrpPN, "G3"}} {
+		if !c.deliver(groupMsg(m.sender, m.id, int64(1700000100+i*10), text("t"+m.id))) {
+			t.Fatal("refused")
+		}
+	}
+	h.consume("thread")
+	h.consume("message")
+	h.mustCall("mark_read", map[string]any{"thread_id": group})
+	c.mu.Lock()
+	marks := append([]markCall(nil), c.marks...)
+	c.mu.Unlock()
+	if len(marks) != 2 {
+		t.Errorf("want one receipt batch per participant, got %d", len(marks))
+	}
+	for _, m := range marks {
+		if m.chat.String() != group || (m.sender.String() != aliceGrpPN && m.sender.String() != malloryPN) {
+			t.Errorf("receipt for %v from %v", m.chat, m.sender)
+		}
+	}
+	// second call: nothing unread is left, nothing is sent
+	h.mustCall("mark_read", map[string]any{"thread_id": group})
+	c.mu.Lock()
+	n := len(c.marks)
+	c.mu.Unlock()
+	if n != len(marks) {
+		t.Errorf("a repeated mark_read re-sent receipts (%d -> %d)", len(marks), n)
+	}
+	// a new message in the same second as the newest read message is unread and gets its receipt
+	if !c.deliver(groupMsg(aliceGrpPN, "G4", 1700000120, text("same second as the newest read message"))) {
+		t.Fatal("refused")
+	}
+	if th := h.threads(); th[0]["unread"] != true {
+		t.Errorf("a message in the same second as the mark must make the thread unread: %v", th[0])
+	}
+	h.mustCall("mark_read", map[string]any{"thread_id": group})
+	c.mu.Lock()
+	after := append([]markCall(nil), c.marks...)
+	c.mu.Unlock()
+	if len(after) != n+1 || fmt.Sprint(after[n].ids) != "[G4]" {
+		t.Errorf("G4 must be marked read: %+v", after[n:])
+	}
+	if chat, _, _ := h.srv.store.GetChat(context.Background(), group); chat.UnreadCount != 0 || chat.ReadUpToTS != 1700000120 || chat.ReadUpToID != "G4" {
+		t.Errorf("chat after the second mark %+v", chat)
+	}
+}
+
+// Review W5: more than 100 unread messages sharing one timestamp were cut at 100.
+func TestReviewMarkReadManyMessagesSameSecond(t *testing.T) {
+	h, c := startPaired(t, true, fastTiming)
+	for i := 0; i < 250; i++ {
+		if !c.deliver(msgEvent(peerPN, peerPN, false, fmt.Sprintf("S%04d", i), 1700000100, text("burst"))) {
+			t.Fatal("refused")
+		}
+	}
+	h.consume("thread")
+	h.consume("message")
+	h.mustCall("mark_read", map[string]any{"thread_id": peerPN})
+	c.mu.Lock()
+	total := 0
+	seen := map[types.MessageID]bool{}
+	for _, m := range c.marks {
+		total += len(m.ids)
+		for _, id := range m.ids {
+			seen[id] = true
+		}
+		if len(m.ids) > 100 {
+			t.Errorf("a receipt carries %d ids, at most 100 are sent at a time", len(m.ids))
+		}
+	}
+	calls := len(c.marks)
+	c.mu.Unlock()
+	if total != 250 || len(seen) != 250 || calls != 3 {
+		t.Errorf("receipts for %d ids (%d distinct) in %d calls, want 250 in 3", total, len(seen), calls)
+	}
+	thr := h.threads()
+	if thr[0]["unread"] != false {
+		t.Errorf("unread flag after mark_read: %v", thr[0]["unread"])
+	}
+	chat, _, _ := h.srv.store.GetChat(context.Background(), peerPN)
+	if chat.ReadUpToTS != 1700000100 || chat.ReadUpToID != "S0249" {
+		t.Errorf("read mark %d %q", chat.ReadUpToTS, chat.ReadUpToID)
+	}
+	h.mustCall("mark_read", map[string]any{"thread_id": peerPN})
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.marks) != calls {
+		t.Errorf("a second mark_read re-sent receipts")
+	}
+}
+
+// Review: the send gate answers thread_not_found for unknown chats and sending_blocked on all five ops after a ban.
+func TestReviewSendGate(t *testing.T) {
+	h, c := startPaired(t, true, fastTiming)
+	h.wantErr(h.call("send_text", map[string]any{"thread_id": "15550009999@s.whatsapp.net", "text": "hi"}), "thread_not_found")
+	h.wantErr(h.call("send_text", map[string]any{"thread_id": group, "text": "hi"}), "thread_not_found")
+	h.incoming(c, peerPN, "P0", 1700000050, "hi")
+	h.mustCall("send_text", map[string]any{"thread_id": peerPN, "text": "ok"})
+	// the alias form resolves only once the mapping is known
+	h.wantErr(h.call("send_text", map[string]any{"thread_id": peerLID, "text": "ok"}), "thread_not_found")
+	if !c.deliver(&events.TemporaryBan{Code: 101, Expire: time.Hour}) {
+		t.Fatal("refused")
+	}
+	for _, op := range []string{"send_text", "send_media", "send_reaction", "mark_read", "set_typing"} {
+		rep := h.call(op, map[string]any{"thread_id": peerPN, "text": "x", "path": "/etc/hostname", "mime": "text/plain", "kind": "file", "message_id": "P0", "emoji": "x", "on": true})
+		h.wantErr(rep, "sending_blocked")
+	}
+}
+
+// Review: the phone normalisation the pair code flow depends on.
+func TestReviewNormalizePhone(t *testing.T) {
+	for in, want := range map[string]string{
+		"+1 (415) 555-0100":    "14155550100",
+		"14155550100":          "14155550100",
+		"+14155550100":         "14155550100",
+		"1234567":              "1234567",
+		"123456789012345":      "123456789012345",
+		"0141555501":           "",
+		"123456":               "",
+		"1234567890123456":     "",
+		"+٣٣١٢٣٤٥٦٧٨٩":         "",
+		"1 415 555 0100 ext 2": "",
+		"":                     "",
+		"+":                    "",
+	} {
+		got, ok := normalizePhone(in)
+		if got != want || ok != (want != "") {
+			t.Errorf("normalizePhone(%q) = %q, %v; want %q", in, got, ok, want)
+		}
 	}
 }

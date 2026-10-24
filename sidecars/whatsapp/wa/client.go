@@ -58,7 +58,8 @@ type Client interface {
 	BuildHistorySyncRequest(anchor *types.MessageInfo, count int) *waE2E.Message
 	MarkRead(ctx context.Context, ids []types.MessageID, ts time.Time, chat, sender types.JID) error
 	Upload(ctx context.Context, data []byte, mt whatsmeow.MediaType) (whatsmeow.UploadResponse, error)
-	Download(ctx context.Context, msg whatsmeow.DownloadableMessage) ([]byte, error)
+	// DownloadToFile streams the decrypted media into f; it never holds the whole file in memory.
+	DownloadToFile(ctx context.Context, msg whatsmeow.DownloadableMessage, f whatsmeow.File) error
 	SendMediaRetryReceipt(ctx context.Context, info *types.MessageInfo, mediaKey []byte) error
 	DecryptMediaRetry(evt *events.MediaRetry, mediaKey []byte) (*waMmsRetry.MediaRetryNotification, error)
 
@@ -78,5 +79,7 @@ type Factory interface {
 	NewClient(ctx context.Context, opts *LoginOptions) (Client, error)
 	// RefreshVersion asks WhatsApp for the current web version once per process; failures are ignored.
 	RefreshVersion(ctx context.Context)
+	// Scrub removes what a deleted device leaves in session.db: the LID map, privacy tokens and freed pages.
+	Scrub(ctx context.Context) error
 	Close() error
 }

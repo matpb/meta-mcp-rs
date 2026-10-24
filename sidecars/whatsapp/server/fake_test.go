@@ -70,6 +70,7 @@ type fakeClient struct {
 	logouts    int
 	logoutErr  error
 	deletes    int
+	deleteErr  error
 
 	qr          chan whatsmeow.QRChannelItem
 	qrErr       error
@@ -94,17 +95,20 @@ type fakeClient struct {
 	uploadErr  error
 	downloadFn func(msg whatsmeow.DownloadableMessage) ([]byte, error)
 	downloads  []string
+	written    int64 // bytes the download target accepted
+	writeErr   error // the write error that ended a download, if any
 	receipts   chan *types.MessageInfo
 	decryptRet func(evt *events.MediaRetry, key []byte) (*waMmsRetry.MediaRetryNotification, error)
 
 	decReaction func(evt *events.Message) (*waE2E.ReactionMessage, error)
 	decSecret   func(evt *events.Message) (*waE2E.Message, error)
 
-	lidToPN   map[string]types.JID
-	pnToLID   map[string]types.JID
-	groupInfo *types.GroupInfo
-	groupErr  error
-	groupCall chan types.JID
+	lidToPN    map[string]types.JID
+	pnToLID    map[string]types.JID
+	groupInfo  *types.GroupInfo
+	groupErr   error
+	groupPanic bool
+	groupCall  chan types.JID
 
 	idCounter int
 }
@@ -137,8 +141,12 @@ func (c *fakeClient) pair() {
 }
 
 // deliver passes an event to the registered handler and returns its verdict.
+// LoggedOut drops the device first, as whatsmeow deletes the record while it announces the event.
 func (c *fakeClient) deliver(evt any) bool {
 	c.mu.Lock()
+	if _, unlinked := evt.(*events.LoggedOut); unlinked {
+		c.hasDevice = false
+	}
 	h := c.handler
 	c.mu.Unlock()
 	if h == nil {
@@ -218,6 +226,9 @@ func (c *fakeClient) DeleteDevice(context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.deletes++
+	if c.deleteErr != nil {
+		return c.deleteErr
+	}
 	c.hasDevice = false
 	return nil
 }
@@ -339,15 +350,34 @@ func (c *fakeClient) Upload(_ context.Context, _ []byte, mt whatsmeow.MediaType)
 	return c.uploadResp, c.uploadErr
 }
 
-func (c *fakeClient) Download(_ context.Context, m whatsmeow.DownloadableMessage) ([]byte, error) {
+// DownloadToFile writes the scripted bytes in 1 MiB chunks, the way the library streams a body into the file.
+func (c *fakeClient) DownloadToFile(_ context.Context, m whatsmeow.DownloadableMessage, f whatsmeow.File) error {
 	c.mu.Lock()
 	c.downloads = append(c.downloads, m.GetDirectPath())
 	fn := c.downloadFn
 	c.mu.Unlock()
 	if fn == nil {
-		return nil, errors.New("no download scripted")
+		return errors.New("no download scripted")
 	}
-	return fn(m)
+	data, err := fn(m)
+	if err != nil {
+		return err
+	}
+	for len(data) > 0 {
+		n := min(len(data), 1<<20)
+		w, err := f.Write(data[:n])
+		c.mu.Lock()
+		c.written += int64(w)
+		if err != nil {
+			c.writeErr = err
+		}
+		c.mu.Unlock()
+		if err != nil {
+			return err
+		}
+		data = data[n:]
+	}
+	return nil
 }
 
 func (c *fakeClient) SendMediaRetryReceipt(_ context.Context, info *types.MessageInfo, _ []byte) error {
@@ -402,6 +432,9 @@ func (c *fakeClient) GetGroupInfo(_ context.Context, jid types.JID) (*types.Grou
 	case c.groupCall <- jid:
 	default:
 	}
+	if c.groupPanic {
+		panic("scripted panic in a background goroutine")
+	}
 	if c.groupErr != nil {
 		return nil, c.groupErr
 	}
@@ -441,6 +474,8 @@ type fakeFactory struct {
 	refreshes int
 	closed    bool
 	newErr    error
+	scrubs    int
+	scrubErr  error
 }
 
 func (f *fakeFactory) NewClient(_ context.Context, opts *wa.LoginOptions) (wa.Client, error) {
@@ -464,6 +499,13 @@ func (f *fakeFactory) RefreshVersion(context.Context) {
 	f.mu.Lock()
 	f.refreshes++
 	f.mu.Unlock()
+}
+
+func (f *fakeFactory) Scrub(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.scrubs++
+	return f.scrubErr
 }
 
 func (f *fakeFactory) Close() error {

@@ -1,12 +1,20 @@
 package server
 
 import (
+	"bufio"
 	"context"
+	"fmt"
+	"io"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/rs/zerolog"
+	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waCommon"
+	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
 
 	"github.com/matpb/meta-mcp-rs/sidecars/whatsapp/api"
 	"github.com/matpb/meta-mcp-rs/sidecars/whatsapp/wa"
@@ -22,8 +30,23 @@ func TestReadyEventFirst(t *testing.T) {
 
 func TestNotInitialisedBeforeHello(t *testing.T) {
 	h := startServer(t, &fakeFactory{})
-	for _, op := range []string{"connect", "ping", "list_threads", "send_text"} {
+	for _, op := range []string{"connect", "list_threads", "send_text", "logout", "fetch_messages", "frobnicate"} {
 		h.wantErr(h.call(op, nil), api.CodeNotInitialised)
+	}
+}
+
+func TestPingIsAnsweredBeforeHello(t *testing.T) {
+	h := startServer(t, &fakeFactory{})
+	if got := h.mustCall("ping", nil); got["pong"] != true {
+		t.Fatalf("ping %v", got)
+	}
+	if h.srv.isInit() {
+		t.Fatal("ping must not initialise the server")
+	}
+	h.wantErr(h.call("connect", nil), api.CodeNotInitialised)
+	h.mustHello()
+	if got := h.mustCall("ping", nil); got["pong"] != true {
+		t.Fatalf("ping after hello %v", got)
 	}
 }
 
@@ -74,7 +97,8 @@ func TestHelloSuccessUnpaired(t *testing.T) {
 }
 
 func TestHelloLoggedInAccount(t *testing.T) {
-	h, _ := startPaired(t, false)
+	f, _ := pairedFactory(false)
+	h := startServer(t, f)
 	res := h.mustHello()
 	if res["logged_in"] != true {
 		t.Fatalf("hello result %v", res)
@@ -95,15 +119,24 @@ func TestHelloStateWithoutDeviceEmitsNullState(t *testing.T) {
 	}
 }
 
-func TestHelloTwiceSameAndOtherDir(t *testing.T) {
+func TestSecondHelloIsRefused(t *testing.T) {
 	f := &fakeFactory{}
 	h := startServer(t, f)
 	h.mustHello()
-	h.mustHello()
-	if f.clientCount() != 1 {
-		t.Fatalf("second hello must not rebuild the client, clients=%d", f.clientCount())
+	for _, dir := range []string{h.dir, t.TempDir()} {
+		rep := h.call("hello", map[string]any{"protocol": 1, "platform": "whatsapp", "data_dir": dir, "state": nil})
+		h.wantErr(rep, api.CodeBadParams)
+		if rep.Error.Message != "already initialised" {
+			t.Fatalf("message %q", rep.Error.Message)
+		}
 	}
-	h.wantErr(h.call("hello", map[string]any{"protocol": 1, "platform": "whatsapp", "data_dir": t.TempDir(), "state": nil}), api.CodeBadParams)
+	h.wantErr(h.call("hello", nil), api.CodeBadParams)
+	if f.clientCount() != 1 {
+		t.Fatalf("a second hello must not rebuild the client, clients=%d", f.clientCount())
+	}
+	if got := h.mustCall("ping", nil); got["pong"] != true {
+		t.Fatalf("the server must keep working: %v", got)
+	}
 }
 
 func TestHelloLockedDataDir(t *testing.T) {
@@ -120,7 +153,11 @@ func TestHelloLockedDataDir(t *testing.T) {
 func TestUnknownOpUnsupported(t *testing.T) {
 	h := startServer(t, &fakeFactory{})
 	h.mustHello()
-	h.wantErr(h.call("frobnicate", nil), api.CodeUnsupported)
+	rep := h.call("frobnicate", nil)
+	h.wantErr(rep, api.CodeUnsupported)
+	if rep.Error.Message != "no such op" {
+		t.Fatalf("message %q", rep.Error.Message)
+	}
 }
 
 func TestPing(t *testing.T) {
@@ -181,4 +218,119 @@ func TestBadParamsAreRejected(t *testing.T) {
 	h.wantErr(h.call("list_threads", map[string]any{"limit": 201}), api.CodeBadParams)
 	h.wantErr(h.call("list_threads", map[string]any{"limit": 5, "cursor": "!!!"}), api.CodeBadParams)
 	h.wantErr(h.call("list_threads", []int{1}), api.CodeBadParams)
+}
+
+func TestPanicInAnOpIsAnInternalReply(t *testing.T) {
+	f, c := pairedFactory(true)
+	h, logs := startServerLogged(t, f)
+	h.mustHello()
+	h.incoming(c, peerPN, "A1", 1700000100, "hi")
+	h.consume("thread")
+	h.consume("message")
+	c.sendFn = func(types.JID, *waE2E.Message, whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
+		panic("boom carrying 14155550100 and a message body")
+	}
+	rep := h.call("send_text", map[string]any{"thread_id": peerPN, "text": "x"})
+	h.wantErr(rep, api.CodeInternal)
+	if rep.Error.Message != "internal error" {
+		t.Fatalf("the reply must not carry the panic value: %q", rep.Error.Message)
+	}
+	ev := h.event("error")
+	if ev["code"] != api.CodeInternal || strings.Contains(fmt.Sprint(ev), "boom") {
+		t.Fatalf("error event %v", ev)
+	}
+	out := logs.String()
+	if strings.Contains(out, "boom") || strings.Contains(out, "14155550100") || !strings.Contains(out, `"component":"op"`) || !strings.Contains(out, `"op":"send_text"`) || !strings.Contains(out, `"reason":"string"`) {
+		t.Fatalf("the log names the panic by type only: %s", out)
+	}
+	c.sendFn = nil
+	h.mustCall("send_text", map[string]any{"thread_id": peerPN, "text": "still alive"})
+}
+
+func TestPanicInAnEventHandlerIsNotAcknowledged(t *testing.T) {
+	f, c := pairedFactory(false)
+	h, logs := startServerLogged(t, f)
+	h.mustHello()
+	c.decReaction = func(*events.Message) (*waE2E.ReactionMessage, error) { panic("boom with secret text") }
+	enc := &waE2E.Message{EncReactionMessage: &waE2E.EncReactionMessage{TargetMessageKey: &waCommon.MessageKey{ID: ptr("A1")}}}
+	h.incoming(c, peerPN, "A1", 1700000100, "hi")
+	if c.deliver(msgEvent(peerPN, peerPN, false, "R1", 1700000160, enc)) {
+		t.Fatal("a panicking handler must not acknowledge the event")
+	}
+	ev := h.event("error")
+	if ev["code"] != api.CodeInternal || strings.Contains(fmt.Sprint(ev), "secret") {
+		t.Fatalf("error event %v", ev)
+	}
+	if out := logs.String(); strings.Contains(out, "secret") || !strings.Contains(out, `"component":"event"`) || !strings.Contains(out, `"event":"*events.Message"`) {
+		t.Fatalf("log %s", out)
+	}
+	c.decReaction = nil
+	h.incoming(c, peerPN, "A2", 1700000200, "the next event still works")
+}
+
+func TestPanicInABackgroundGoroutineIsRecovered(t *testing.T) {
+	f, c := pairedFactory(false)
+	h, logs := startServerLogged(t, f, withTiming(func(*timing) {}))
+	h.mustHello()
+	c.groupPanic = true
+	c.deliver(groupMsg(malloryPN, "G1", 1700000100, text("hello group")))
+	<-c.groupCall
+	ev := h.event("error")
+	if ev["code"] != api.CodeInternal {
+		t.Fatalf("error event %v", ev)
+	}
+	eventually(t, "recovered panic logged", func() bool { return strings.Contains(logs.String(), `"component":"background/group"`) })
+	if got := h.mustCall("ping", nil); got["pong"] != true {
+		t.Fatalf("the process must keep serving: %v", got)
+	}
+	eventually(t, "group fetch released", func() bool {
+		h.srv.groups.mu.Lock()
+		defer h.srv.groups.mu.Unlock()
+		return !h.srv.groups.inflight
+	})
+}
+
+func TestPanicInHelloIsAnInternalReply(t *testing.T) {
+	panicking := func(context.Context, string, zerolog.Logger) (wa.Factory, error) { panic("open exploded") }
+	h := startServerOpen(t, &fakeFactory{}, panicking)
+	rep := h.hello()
+	h.wantErr(rep, api.CodeInternal)
+	if h.srv.isInit() {
+		t.Fatal("a panicking hello must not initialise the server")
+	}
+	if got := h.mustCall("ping", nil); got["pong"] != true {
+		t.Fatalf("ping %v", got)
+	}
+}
+
+// Review: a message is acknowledged only after its store commit.
+func TestReviewNoAckWhenStoreFails(t *testing.T) {
+	h, c := startPaired(t, false)
+	h.incoming(c, peerPN, "A0", 1700000050, "hi")
+	_ = h.srv.store.Close()
+	if c.deliver(msgEvent(peerPN, peerPN, false, "A1", 1700000060, text("second"))) {
+		t.Errorf("handler acked a message although the store is closed")
+	}
+}
+
+// Review: a message is acknowledged only after its event reached stdout.
+func TestReviewNoAckWhenStdoutFails(t *testing.T) {
+	f, c := pairedFactory(false)
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	ready := make(chan struct{})
+	go func() {
+		_ = run(context.Background(), inR, outW, zerolog.Nop(), func(context.Context, string, zerolog.Logger) (wa.Factory, error) { return f, nil }, func(*server) { close(ready) })
+		_ = outW.Close()
+	}()
+	<-ready
+	br := bufio.NewReader(outR)
+	_, _ = br.ReadBytes('\n') // ready
+	_, _ = io.WriteString(inW, fmt.Sprintf(`{"id":1,"op":"hello","params":{"protocol":1,"platform":"whatsapp","data_dir":%q,"state":null}}`+"\n", t.TempDir()))
+	_, _ = br.ReadBytes('\n') // hello reply
+	_ = outR.Close()          // every later write fails
+	if c.deliver(msgEvent(peerPN, peerPN, false, "A2", 1700000060, text("third"))) {
+		t.Errorf("handler acked a message although stdout is broken")
+	}
+	_ = inW.Close()
 }

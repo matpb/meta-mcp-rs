@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -26,6 +28,8 @@ const (
 	endMoreRemain = "COMPLETE_BUT_MORE_MESSAGES_REMAIN_ON_PRIMARY"
 	endMoreOnDem  = "COMPLETE_ON_DEMAND_SYNC_BUT_MORE_MSG_REMAIN_ON_PRIMARY"
 	endNoMore     = "COMPLETE_AND_NO_MORE_MESSAGE_REMAIN_ON_PRIMARY"
+	// historyEnvelope leaves room in a batch for the event fields around the messages.
+	historyEnvelope = 1 << 10
 )
 
 // histWait is the one in-flight on-demand history request of a chat.
@@ -45,15 +49,19 @@ type histWaiters struct {
 	m  map[string]*histWait
 }
 
-// resolve wakes the request with this session id, else the in-flight request of any listed chat.
+// resolve wakes the request with this session id; an answer naming a session never matches by chat.
+// An answer without a session id wakes the in-flight request of any listed chat.
 func (h *histWaiters) resolve(sessionID string, chats []string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	for _, w := range h.m {
-		if sessionID != "" && w.id == sessionID {
-			w.finish()
-			return
+	if sessionID != "" {
+		for _, w := range h.m {
+			if w.id == sessionID {
+				w.finish()
+				return
+			}
 		}
+		return
 	}
 	for _, c := range chats {
 		if w, found := h.m[c]; found {
@@ -185,14 +193,43 @@ func (s *server) ingestConversation(ctx context.Context, cl wa.Client, conv *waH
 	for i, m := range msgs {
 		out[i] = m.API()
 	}
-	batches := normalize.Batches(out, normalize.HistoryBatchMax)
-	for i, b := range batches {
-		ev := api.HistoryEvent{ThreadID: chat.JID, Messages: b, Complete: i == len(batches)-1}
-		if err := s.emit(api.EvHistory, ev); err != nil {
-			return "", err
-		}
+	if err := s.emitHistory(chat.JID, out); err != nil {
+		return "", err
 	}
 	return chat.JID, nil
+}
+
+// jsonSize is the serialised size of m as it travels in a history event.
+func jsonSize(m api.Message) int {
+	b, err := json.Marshal(m)
+	if err != nil {
+		return normalize.HistoryBatchBytes
+	}
+	return len(b) + 1
+}
+
+// emitHistory reports messages in batches of at most 200 messages and about 4 MiB.
+// A batch that still cannot be written is skipped and the sync goes on; the messages stay in the store.
+func (s *server) emitHistory(thread string, msgs []api.Message) error {
+	batches := normalize.BatchesSized(msgs, normalize.HistoryBatchMax, normalize.HistoryBatchBytes-historyEnvelope, jsonSize)
+	closed := false
+	for i, b := range batches {
+		last := i == len(batches)-1
+		err := s.emit(api.EvHistory, api.HistoryEvent{ThreadID: thread, Messages: b, Complete: last})
+		switch {
+		case err == nil:
+			closed = closed || last
+		case errors.Is(err, ipc.ErrTooLong):
+			s.log.Info().Str("event", api.EvHistory).Str("thread", thread).Int("count", len(b)).Msg("skipped a history batch over the frame limit")
+			s.emitLog(api.EvError, api.ErrorEvent{Code: api.CodeIO, Message: "a history batch was too large and was skipped"})
+		default:
+			return err
+		}
+	}
+	if len(batches) > 0 && !closed {
+		return s.emit(api.EvHistory, api.HistoryEvent{ThreadID: thread, Messages: []api.Message{}, Complete: true})
+	}
+	return nil
 }
 
 // historyMessage parses and stores one history message; ok is false when it is skipped.
@@ -210,8 +247,13 @@ func (s *server) historyMessage(ctx context.Context, cl wa.Client, chatJID types
 	case normalize.ActMessage:
 		m := s.msgFrom(o, chat.JID, cls.Content)
 		m.Edited = wm.GetMessage().GetProtocolMessage().GetType() == waE2E.ProtocolMessage_MESSAGE_EDIT
-		if _, err := s.store.PutMessage(ctx, m, false); err != nil {
+		res, err := s.store.PutMessage(ctx, m, false)
+		if err != nil {
 			return m, false, err
+		}
+		if res == store.PutConflict {
+			s.log.Info().Str("thread", chat.JID).Str("id", m.ID).Msg("ignored a history message that reuses a stored id")
+			return store.Msg{}, false, nil
 		}
 		for _, r := range wm.GetReactions() {
 			sender, err := s.reactionSender(ctx, cl, o, r.GetKey().GetFromMe(), r.GetKey().GetParticipant())
@@ -235,9 +277,7 @@ func (s *server) historyMessage(ctx context.Context, cl wa.Client, chatJID types
 		}
 		return m, true, nil
 	case normalize.ActRevoke:
-		_, _, err := s.store.UpdateMessage(ctx, chat.JID, cls.TargetID, func(m *store.Msg) {
-			m.Unsent, m.Text, m.Attachments, m.Raw = true, nil, []api.Attachment{}, nil
-		})
+		_, _, err := s.revoke(ctx, chat, o, cls.TargetID)
 		return store.Msg{}, false, err
 	case normalize.ActReaction:
 		err := s.store.PutReaction(ctx, chat.JID, cls.TargetID, o.senderID, cls.Emoji, o.info.Timestamp.Unix())

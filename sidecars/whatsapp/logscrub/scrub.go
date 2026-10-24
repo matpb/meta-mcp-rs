@@ -1,4 +1,4 @@
-// Package logscrub removes sensitive keys and WhatsApp identifiers from zerolog JSON lines before they reach stderr.
+// Package logscrub keeps an allowlist of log fields and redacts WhatsApp identifiers in zerolog JSON lines before they reach stderr.
 package logscrub
 
 import (
@@ -13,14 +13,10 @@ import (
 // MaxPartial is the longest unterminated line held back before it is flushed as is.
 const MaxPartial = 1 << 20
 
-// DenyKeys are the log keys removed at any depth, matched case-insensitively after trimming.
-var DenyKeys = []string{
-	"data", "resp_body", "response_body", "response_proto_err",
-	"body", "payload", "cookies", "cookie", "token",
-	"tachyon_token", "auth", "message_data", "decrypted_data",
-	"header", "headers", "content", "text",
-	"evt_data", "devices", "response", "parsed_data", "raw", "url",
-	"qr", "code", "pair_code", "phone", "jid", "passkey", "public_key", "caption",
+// AllowKeys are the only top-level log fields that survive; every other field, nested ones included, is dropped.
+var AllowKeys = []string{
+	"level", "time", "message", "op", "code", "reason", "component",
+	"count", "event", "platform", "thread", "id", "state",
 }
 
 // valueRe matches, leftmost and in this order: QR payload, group JID (kept), user JID, pair code, phone number.
@@ -33,8 +29,21 @@ var valueRe = regexp.MustCompile(
 
 const qrPrefix = "https://wa.me/settings/linked_devices#"
 
-// scrubString redacts QR payloads, user JIDs, pair codes and phone numbers in s.
+// parseErrRes cut the input that strconv, net/url and time errors quote and keep the error kind.
+var parseErrRes = []struct {
+	re   *regexp.Regexp
+	repl string
+}{
+	{regexp.MustCompile(`(strconv\.\w+): parsing "(?:[^"\\]|\\.)*": `), "$1: "},
+	{regexp.MustCompile(`\bparse "(?:[^"\\]|\\.)*": `), "parse: "},
+	{regexp.MustCompile(`parsing time "(?:[^"\\]|\\.)*"(?: as "(?:[^"\\]|\\.)*")?: cannot parse "(?:[^"\\]|\\.)*" as "(?:[^"\\]|\\.)*"`), "parsing time: cannot parse"},
+}
+
+// scrubString redacts QR payloads, user JIDs, pair codes and phone numbers in s and reduces parse errors to their kind.
 func scrubString(s string) string {
+	for _, p := range parseErrRes {
+		s = p.re.ReplaceAllString(s, p.repl)
+	}
 	return valueRe.ReplaceAllStringFunc(s, func(m string) string {
 		switch {
 		case strings.HasPrefix(m, qrPrefix):
@@ -50,9 +59,9 @@ func scrubString(s string) string {
 	})
 }
 
-var blocked = func() map[string]struct{} {
-	m := make(map[string]struct{}, len(DenyKeys))
-	for _, k := range DenyKeys {
+var allowed = func() map[string]struct{} {
+	m := make(map[string]struct{}, len(AllowKeys))
+	for _, k := range AllowKeys {
 		m[k] = struct{}{}
 	}
 	return m
@@ -110,93 +119,82 @@ func (w *Writer) Flush() error {
 	return err
 }
 
-// scrubLine returns line without blocked keys and with values scrubbed; other lines get value scrubbing only.
+// scrubLine keeps allowlisted scalar fields of a JSON object line and scrubs their values; other lines get value scrubbing only.
 func scrubLine(line []byte) []byte {
 	trimmed := bytes.TrimSpace(line)
 	if len(trimmed) == 0 || trimmed[0] != '{' {
 		return []byte(scrubString(string(line)))
 	}
-	dec := json.NewDecoder(bytes.NewReader(trimmed))
-	dec.UseNumber()
-	var out bytes.Buffer
-	tok, err := dec.Token()
-	if err != nil || writeValue(dec, tok, &out) != nil {
+	out, ok := filterObject(trimmed)
+	if !ok {
 		return []byte(scrubString(string(line)))
 	}
-	if dec.InputOffset() != int64(len(trimmed)) {
-		return []byte(scrubString(string(line)))
-	}
-	return out.Bytes()
+	return out
 }
 
-func writeValue(dec *json.Decoder, tok json.Token, out *bytes.Buffer) error {
-	delim, isDelim := tok.(json.Delim)
-	if !isDelim {
-		if str, ok := tok.(string); ok {
-			tok = scrubString(str)
-		}
-		return writeScalar(tok, out)
+// filterObject keeps the allowlisted scalar fields of one JSON object; ok is false when raw is not exactly one object.
+func filterObject(raw []byte) ([]byte, bool) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return nil, false
 	}
-	closer := byte(']')
-	if delim == '{' {
-		closer = '}'
-	}
-	out.WriteByte(byte(delim))
+	var out bytes.Buffer
+	out.WriteByte('{')
 	first := true
 	for dec.More() {
-		var key string
-		if delim == '{' {
-			kt, err := dec.Token()
-			if err != nil {
-				return err
-			}
-			key, _ = kt.(string)
+		kt, err := dec.Token()
+		if err != nil {
+			return nil, false
 		}
+		key, _ := kt.(string)
 		vt, err := dec.Token()
 		if err != nil {
-			return err
+			return nil, false
 		}
-		if delim == '{' {
-			if _, drop := blocked[strings.ToLower(strings.TrimSpace(key))]; drop {
-				if err := skipValue(dec, vt); err != nil {
-					return err
-				}
-				continue
+		if _, nested := vt.(json.Delim); nested {
+			if err := skipNested(dec); err != nil {
+				return nil, false
 			}
+			continue
+		}
+		if _, keep := allowed[key]; !keep {
+			continue
+		}
+		if str, isStr := vt.(string); isStr {
+			vt = scrubString(str)
 		}
 		if !first {
 			out.WriteByte(',')
 		}
 		first = false
-		if delim == '{' {
-			if err := writeScalar(key, out); err != nil {
-				return err
-			}
-			out.WriteByte(':')
+		if err := writeScalar(key, &out); err != nil {
+			return nil, false
 		}
-		if err := writeValue(dec, vt, out); err != nil {
-			return err
+		out.WriteByte(':')
+		if err := writeScalar(vt, &out); err != nil {
+			return nil, false
 		}
 	}
-	if _, err := dec.Token(); err != nil {
-		return err
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('}') {
+		return nil, false
 	}
-	out.WriteByte(closer)
-	return nil
+	if dec.InputOffset() != int64(len(raw)) {
+		return nil, false
+	}
+	out.WriteByte('}')
+	return out.Bytes(), true
 }
 
-func skipValue(dec *json.Decoder, tok json.Token) error {
-	d, ok := tok.(json.Delim)
-	if !ok || (d != '{' && d != '[') {
-		return nil
-	}
+// skipNested consumes the rest of an object or array whose opening delimiter was just read.
+func skipNested(dec *json.Decoder) error {
 	for depth := 1; depth > 0; {
 		t, err := dec.Token()
 		if err != nil {
 			return err
 		}
-		if dd, isD := t.(json.Delim); isD {
-			if dd == '{' || dd == '[' {
+		if d, isDelim := t.(json.Delim); isDelim {
+			if d == '{' || d == '[' {
 				depth++
 			} else {
 				depth--

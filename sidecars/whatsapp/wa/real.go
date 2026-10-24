@@ -2,6 +2,7 @@ package wa
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -15,7 +16,8 @@ import (
 
 // Real implements Client as thin pass-throughs over a whatsmeow client.
 type Real struct {
-	cli *whatsmeow.Client
+	cli   *whatsmeow.Client
+	scrub func(context.Context) error // wipes session.db residue once the device row is gone
 
 	mu      sync.Mutex
 	handler func(evt any) bool
@@ -24,20 +26,26 @@ type Real struct {
 
 var _ Client = (*Real)(nil)
 
-func newReal(cli *whatsmeow.Client) *Real {
-	return &Real{cli: cli}
+func newReal(cli *whatsmeow.Client, scrub func(context.Context) error) *Real {
+	return &Real{cli: cli, scrub: scrub}
 }
 
 // Raw exposes the underlying client for diagnostics only.
 func (r *Real) Raw() *whatsmeow.Client { return r.cli }
 
 // SetEventHandler registers one trampoline on first use; later calls replace the target func.
+// The trampoline turns a panic into a failed handler: whatsmeow would otherwise report success and acknowledge the event.
 func (r *Real) SetEventHandler(h func(evt any) bool) {
 	r.mu.Lock()
 	r.handler = h
 	r.mu.Unlock()
 	r.once.Do(func() {
-		r.cli.AddEventHandlerWithSuccessStatus(func(evt any) bool {
+		r.cli.AddEventHandlerWithSuccessStatus(func(evt any) (handled bool) {
+			defer func() {
+				if recover() != nil {
+					handled = false
+				}
+			}()
 			r.mu.Lock()
 			cur := r.handler
 			r.mu.Unlock()
@@ -74,7 +82,14 @@ func (r *Real) Self() Self {
 
 func (r *Real) Logout(ctx context.Context) error { return r.cli.Logout(ctx) }
 
-func (r *Real) DeleteDevice(ctx context.Context) error { return r.cli.Store.Delete(ctx) }
+// DeleteDevice removes the device record, then the rows and freed pages that outlive it.
+func (r *Real) DeleteDevice(ctx context.Context) error {
+	err := r.cli.Store.Delete(ctx)
+	if r.scrub != nil {
+		err = errors.Join(err, r.scrub(ctx))
+	}
+	return err
+}
 
 func (r *Real) GetQRChannel(ctx context.Context) (<-chan whatsmeow.QRChannelItem, error) {
 	return r.cli.GetQRChannel(ctx)
@@ -126,8 +141,8 @@ func (r *Real) Upload(ctx context.Context, data []byte, mt whatsmeow.MediaType) 
 	return r.cli.Upload(ctx, data, mt)
 }
 
-func (r *Real) Download(ctx context.Context, msg whatsmeow.DownloadableMessage) ([]byte, error) {
-	return r.cli.Download(ctx, msg)
+func (r *Real) DownloadToFile(ctx context.Context, msg whatsmeow.DownloadableMessage, f whatsmeow.File) error {
+	return r.cli.DownloadToFile(ctx, msg, f)
 }
 
 func (r *Real) SendMediaRetryReceipt(ctx context.Context, info *types.MessageInfo, mediaKey []byte) error {

@@ -345,8 +345,9 @@ func TestLogoutConnected(t *testing.T) {
 	if h.f.clientCount() != 2 {
 		t.Fatalf("clients %d", h.f.clientCount())
 	}
-	if res := h.mustHello(); res["logged_in"] != false {
-		t.Fatalf("hello after logout %v", res)
+	h.wantErr(h.call("connect", nil), api.CodeNotLoggedIn)
+	if h.f.scrubs != 1 {
+		t.Fatalf("logout must wipe the session database leftovers, scrubs=%d", h.f.scrubs)
 	}
 }
 
@@ -443,5 +444,42 @@ func TestLoginCancelAfterPairingLetsSetupFinish(t *testing.T) {
 	c1.mu.Unlock()
 	if d != 0 || f.clientCount() != 2 {
 		t.Fatalf("cancel must not drop the paired client: disconnects %d clients %d", d, f.clientCount())
+	}
+}
+
+func TestLogoutReportsIOWhenTheSessionWipeFails(t *testing.T) {
+	h, c := startPaired(t, true)
+	h.incoming(c, "4155550001@s.whatsapp.net", "M1", 1700000000, "hi")
+	h.f.mu.Lock()
+	h.f.scrubErr = errors.New("disk full at /home/someone/data")
+	h.f.mu.Unlock()
+	rep := h.call("logout", nil)
+	h.wantErr(rep, api.CodeIO)
+	if rep.Error.Message != "could not wipe the session database" {
+		t.Fatalf("the error text is fixed: %q", rep.Error.Message)
+	}
+	if ev := h.event("state_updated"); ev["state"] != nil {
+		t.Fatalf("the unlink itself succeeded, the daemon must forget the session: %v", ev)
+	}
+	if res := h.mustCall("list_threads", map[string]any{"limit": 10}); len(res["threads"].([]any)) != 0 {
+		t.Fatalf("the message store is reset: %v", res)
+	}
+	h.f.mu.Lock()
+	h.f.scrubErr = nil
+	h.f.mu.Unlock()
+	h.mustCall("logout", nil)
+	if h.f.scrubs != 2 {
+		t.Fatalf("a retried logout wipes again, scrubs=%d", h.f.scrubs)
+	}
+}
+
+func TestLogoutDeleteFailureStopsBeforeTheWipe(t *testing.T) {
+	h, c := startPaired(t, false)
+	c.mu.Lock()
+	c.deleteErr = errors.New("db locked")
+	c.mu.Unlock()
+	h.wantErr(h.call("logout", nil), api.CodeIO)
+	if h.f.scrubs != 0 {
+		t.Fatalf("scrubs=%d", h.f.scrubs)
 	}
 }

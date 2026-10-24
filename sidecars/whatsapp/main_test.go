@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -13,7 +14,18 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/matpb/meta-mcp-rs/sidecars/whatsapp/logscrub"
 )
+
+// TestMain removes the sidecar binary that sidecarBinary built for the run.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if binPath != "" {
+		_ = os.RemoveAll(filepath.Dir(binPath))
+	}
+	os.Exit(code)
+}
 
 func TestLoggerIsScrubbedAndInfoOnly(t *testing.T) {
 	var dst bytes.Buffer
@@ -67,17 +79,38 @@ func sidecarBinary(t *testing.T) string {
 	return binPath
 }
 
+// syncBuf collects what the process writes to stderr.
+type syncBuf struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuf) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuf) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
 type proc struct {
-	cmd   *exec.Cmd
-	in    io.WriteCloser
-	out   *bufio.Reader
-	errCh chan error
+	cmd    *exec.Cmd
+	in     io.WriteCloser
+	out    *bufio.Reader
+	errCh  chan error
+	stderr *syncBuf
 }
 
 func spawn(t *testing.T) *proc {
 	t.Helper()
 	cmd := exec.Command(sidecarBinary(t))
 	cmd.Env = []string{}
+	stderr := &syncBuf{}
+	cmd.Stderr = stderr
 	in, err := cmd.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -89,7 +122,7 @@ func spawn(t *testing.T) *proc {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	p := &proc{cmd: cmd, in: in, out: bufio.NewReader(out), errCh: make(chan error, 1)}
+	p := &proc{cmd: cmd, in: in, out: bufio.NewReader(out), errCh: make(chan error, 1), stderr: stderr}
 	t.Cleanup(func() { _ = cmd.Process.Kill() })
 	return p
 }
@@ -190,6 +223,101 @@ func TestBinaryHelloPingShutdown(t *testing.T) {
 		}
 		if fi.Mode().Perm() != 0o600 {
 			t.Fatalf("%s mode %v", name, fi.Mode().Perm())
+		}
+	}
+}
+
+// ask sends one request line and returns the next frame.
+func (p *proc) ask(t *testing.T, line string) map[string]any {
+	t.Helper()
+	if _, err := io.WriteString(p.in, line+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	return p.frame(t)
+}
+
+func errorOf(f map[string]any) (code, message string) {
+	e, _ := f["error"].(map[string]any)
+	code, _ = e["code"].(string)
+	message, _ = e["message"].(string)
+	return code, message
+}
+
+func TestBinaryOpProtocolBeforeAndAfterHello(t *testing.T) {
+	p := spawn(t)
+	wantReady(t, p)
+	if f := p.ask(t, `{"id":1,"op":"ping","params":null}`); f["ok"] != true {
+		t.Fatalf("ping before hello: %v", f)
+	}
+	for i, op := range []string{"list_threads", "connect", "logout", "frobnicate"} {
+		f := p.ask(t, fmt.Sprintf(`{"id":%d,"op":%q,"params":null}`, i+2, op))
+		if code, _ := errorOf(f); f["ok"] == true || code != "not_initialised" {
+			t.Fatalf("%s before hello: %v", op, f)
+		}
+	}
+	dir := t.TempDir()
+	hello := `{"id":10,"op":"hello","params":{"protocol":1,"platform":"whatsapp","data_dir":` + quote(dir) + `,"state":null}}`
+	if f := p.ask(t, hello); f["ok"] != true {
+		t.Fatalf("hello: %v", f)
+	}
+	if code, msg := errorOf(p.ask(t, strings.Replace(hello, `"id":10`, `"id":11`, 1))); code != "bad_params" || msg != "already initialised" {
+		t.Fatalf("second hello: %q %q", code, msg)
+	}
+	if code, msg := errorOf(p.ask(t, `{"id":12,"op":"frobnicate","params":null}`)); code != "unsupported" || msg != "no such op" {
+		t.Fatalf("unknown op: %q %q", code, msg)
+	}
+	if f := p.ask(t, `{"id":13,"op":"shutdown","params":null}`); f["ok"] != true {
+		t.Fatalf("shutdown: %v", f)
+	}
+	if code := p.exitCode(t); code != 0 {
+		t.Fatalf("exit status %d", code)
+	}
+}
+
+func TestBinaryLogsOnlyAllowlistedFields(t *testing.T) {
+	p := spawn(t)
+	wantReady(t, p)
+	dir := t.TempDir()
+	for i, r := range []string{
+		`{"id":1,"op":"hello","params":{"protocol":1,"platform":"whatsapp","data_dir":` + quote(dir) + `,"state":null}}`,
+		`{"id":2,"op":"ping","params":null}`,
+		`{"id":3,"op":"send_text","params":{"thread_id":"14155550100@s.whatsapp.net","text":"SECRET BODY"}}`,
+		`{"id":4,"op":"frobnicate","params":null}`,
+		`{"id":5,"op":"shutdown","params":null}`,
+	} {
+		if f := p.ask(t, r); f["id"] != float64(i+1) {
+			t.Fatalf("request %d: %v", i+1, f)
+		}
+	}
+	if code := p.exitCode(t); code != 0 {
+		t.Fatalf("exit status %d", code)
+	}
+	allowed := map[string]bool{}
+	for _, k := range logscrub.AllowKeys {
+		allowed[k] = true
+	}
+	out := p.stderr.String()
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) < 5 {
+		t.Fatalf("expected log lines, got %q", out)
+	}
+	for _, l := range lines {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(l), &m); err != nil {
+			t.Fatalf("log line is not JSON: %q", l)
+		}
+		for k := range m {
+			if !allowed[k] {
+				t.Fatalf("log field %q is not on the allowlist: %s", k, l)
+			}
+		}
+	}
+	if strings.Contains(out, "SECRET") || strings.Contains(out, "14155550100") {
+		t.Fatalf("stderr leaks request content: %s", out)
+	}
+	for _, want := range []string{`"op":"ping"`, `"code":"not_logged_in"`, `"code":"unsupported"`} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("stderr lacks %s:\n%s", want, out)
 		}
 	}
 }

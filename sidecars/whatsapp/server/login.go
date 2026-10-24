@@ -214,6 +214,7 @@ func formatPairCode(c string) string {
 func (s *server) runLogin(ctx context.Context, l *login, ch <-chan whatsmeow.QRChannelItem) {
 	defer s.bg.Done()
 	defer close(l.done)
+	defer s.recoverPanic("login")
 	for {
 		select {
 		case <-ctx.Done():
@@ -255,12 +256,8 @@ func (s *server) onQRItem(ctx context.Context, l *login, item whatsmeow.QRChanne
 		if item.PasskeyConfirmation == nil {
 			return false
 		}
-		code := item.PasskeyConfirmation.Code
-		if item.PasskeyConfirmation.SkipHandoffUX {
-			code = ""
-		}
 		l.setAwaiting(awaitConfirm)
-		s.emitLog(api.EvPasskeyConf, api.PasskeyConfirmationEvent{Code: code})
+		s.emitLog(api.EvPasskeyConf, api.PasskeyConfirmationEvent{Code: item.PasskeyConfirmation.Code})
 	case whatsmeow.QRChannelSuccess.Event:
 		s.finishPairing(ctx, l)
 		return true
@@ -430,7 +427,7 @@ func (s *server) loginCancel(_ context.Context, req ipc.Request) ipc.Reply {
 	return ok(req.ID, struct{}{})
 }
 
-// logout unlinks the device, wipes the message store and installs a fresh unpaired client.
+// logout unlinks the device, wipes messages.db and the session.db leftovers, and installs a fresh unpaired client.
 func (s *server) logout(ctx context.Context, req ipc.Request) ipc.Reply {
 	s.loginMu.Lock()
 	defer s.loginMu.Unlock()
@@ -452,9 +449,13 @@ func (s *server) logout(ctx context.Context, req ipc.Request) ipc.Reply {
 	if err := s.store.Reset(ctx); err != nil {
 		return fail(req.ID, api.CodeIO, "could not reset the message database")
 	}
+	scrubErr := s.factory.Scrub(ctx)
 	s.emitLog(api.EvStateUpdated, api.StateUpdatedEvent{})
 	if err := s.freshClient(ctx); err != nil {
 		return fail(req.ID, api.CodeIO, "could not prepare a new WhatsApp client")
+	}
+	if scrubErr != nil {
+		return fail(req.ID, api.CodeIO, "could not wipe the session database")
 	}
 	return ok(req.ID, struct{}{})
 }

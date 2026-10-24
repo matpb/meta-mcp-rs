@@ -2,11 +2,7 @@ package server
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -98,6 +94,7 @@ type downloadParams struct {
 type downloadable struct {
 	msg    whatsmeow.DownloadableMessage
 	mime   string
+	length uint64 // the size the sender advertised, 0 when absent
 	setDir func(string)
 }
 
@@ -105,27 +102,35 @@ func pickDownloadable(m *waE2E.Message) *downloadable {
 	switch {
 	case m.GetImageMessage() != nil:
 		x := m.GetImageMessage()
-		return &downloadable{x, x.GetMimetype(), func(p string) { x.DirectPath = proto.String(p) }}
+		return &downloadable{x, x.GetMimetype(), x.GetFileLength(), func(p string) { x.DirectPath = proto.String(p) }}
 	case m.GetVideoMessage() != nil:
 		x := m.GetVideoMessage()
-		return &downloadable{x, x.GetMimetype(), func(p string) { x.DirectPath = proto.String(p) }}
+		return &downloadable{x, x.GetMimetype(), x.GetFileLength(), func(p string) { x.DirectPath = proto.String(p) }}
 	case m.GetPtvMessage() != nil:
 		x := m.GetPtvMessage()
-		return &downloadable{x, x.GetMimetype(), func(p string) { x.DirectPath = proto.String(p) }}
+		return &downloadable{x, x.GetMimetype(), x.GetFileLength(), func(p string) { x.DirectPath = proto.String(p) }}
 	case m.GetAudioMessage() != nil:
 		x := m.GetAudioMessage()
-		return &downloadable{x, x.GetMimetype(), func(p string) { x.DirectPath = proto.String(p) }}
+		return &downloadable{x, x.GetMimetype(), x.GetFileLength(), func(p string) { x.DirectPath = proto.String(p) }}
 	case m.GetDocumentMessage() != nil:
 		x := m.GetDocumentMessage()
-		return &downloadable{x, x.GetMimetype(), func(p string) { x.DirectPath = proto.String(p) }}
+		return &downloadable{x, x.GetMimetype(), x.GetFileLength(), func(p string) { x.DirectPath = proto.String(p) }}
 	case m.GetStickerMessage() != nil:
 		x := m.GetStickerMessage()
-		return &downloadable{x, x.GetMimetype(), func(p string) { x.DirectPath = proto.String(p) }}
+		return &downloadable{x, x.GetMimetype(), x.GetFileLength(), func(p string) { x.DirectPath = proto.String(p) }}
 	}
 	return nil
 }
 
-// downloadAttachment fetches and decrypts a message's media into dest_path, retrying through the phone when expired.
+// isExpiredMedia reports a CDN refusal that a fresh upload from the phone can fix.
+func isExpiredMedia(err error) bool {
+	return errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith404) ||
+		errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith410) ||
+		errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith403)
+}
+
+// downloadAttachment decrypts a message's media into a temp file next to dest_path, then renames it over dest_path.
+// An expired link is retried through the phone; the file is capped at 100 MiB and never follows a symlink.
 func (s *server) downloadAttachment(ctx context.Context, req ipc.Request) ipc.Reply {
 	var p downloadParams
 	if e := decode(req, &p); e != nil {
@@ -150,11 +155,13 @@ func (s *server) downloadAttachment(ctx context.Context, req ipc.Request) ipc.Re
 	if dl == nil || m.Unsent {
 		return fail(req.ID, api.CodeMessageNotFound, "the message has no downloadable media")
 	}
-	if !filepath.IsAbs(p.DestPath) {
-		return fail(req.ID, api.CodeBadParams, "dest_path must be an absolute file path")
+	dest, derr := openDestination(p.DestPath)
+	if derr != nil {
+		return failErr(req.ID, derr)
 	}
-	if fi, serr := os.Stat(filepath.Dir(p.DestPath)); serr != nil || !fi.IsDir() {
-		return fail(req.ID, api.CodeBadParams, "the directory of dest_path must exist")
+	defer dest.close()
+	if dl.length > maxDownloadBytes {
+		return fail(req.ID, api.CodeIO, "attachment exceeds 100 MiB")
 	}
 	cl := s.cur()
 	if !cl.HasDevice() {
@@ -163,61 +170,83 @@ func (s *server) downloadAttachment(ctx context.Context, req ipc.Request) ipc.Re
 	if !cl.IsConnected() {
 		return fail(req.ID, api.CodeNotConnected, "not connected to WhatsApp")
 	}
-	data, derr := cl.Download(ctx, dl.msg)
-	if errors.Is(derr, whatsmeow.ErrMediaDownloadFailedWith404) || errors.Is(derr, whatsmeow.ErrMediaDownloadFailedWith410) {
-		data, derr = s.retryDownload(ctx, cl, chat, m, &raw, dl)
-	}
-	if derr != nil {
-		var e *api.Error
-		if errors.As(derr, &e) {
-			return failErr(req.ID, e)
-		}
-		return fail(req.ID, api.CodeIO, "media download failed")
-	}
-	sum := sha256.Sum256(data)
-	if err := writeFile0600(p.DestPath, data); err != nil {
+	tmp, tmpName, terr := dest.newTemp()
+	if terr != nil {
 		return fail(req.ID, api.CodeIO, "could not write dest_path")
 	}
-	return ok(req.ID, map[string]any{"path": p.DestPath, "mime": dl.mime, "bytes": len(data), "sha256": hex.EncodeToString(sum[:])})
-}
-
-func writeFile0600(path string, data []byte) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tmp.Close()
+			dest.discard(tmpName)
+		}
+	}()
+	cf := &cappedFile{f: tmp, limit: maxDownloadBytes + downloadSlack}
+	err = s.fetchMedia(ctx, cl, dl, cf)
+	if isExpiredMedia(err) {
+		err = s.retryDownload(ctx, cl, chat, m, &raw, dl, cf)
+	}
 	if err != nil {
-		return err
+		return failErr(req.ID, downloadError(err, cf))
 	}
-	if err := f.Chmod(0o600); err != nil {
-		_ = f.Close()
-		return err
+	size, sum, herr := hashFile(tmp)
+	if herr != nil {
+		return fail(req.ID, api.CodeIO, "could not write dest_path")
 	}
-	if _, err := f.Write(data); err != nil {
-		_ = f.Close()
-		return err
+	if size > maxDownloadBytes {
+		return fail(req.ID, api.CodeIO, "attachment exceeds 100 MiB")
 	}
-	return f.Close()
+	if tmp.Chmod(0o600) != nil || tmp.Sync() != nil || tmp.Close() != nil {
+		return fail(req.ID, api.CodeIO, "could not write dest_path")
+	}
+	if dest.commit(tmpName) != nil {
+		return fail(req.ID, api.CodeIO, "could not write dest_path")
+	}
+	committed = true
+	return ok(req.ID, map[string]any{"path": p.DestPath, "mime": dl.mime, "bytes": size, "sha256": sum})
 }
 
-// retryDownload asks the phone to re-upload expired media, then downloads it once more.
-func (s *server) retryDownload(ctx context.Context, cl wa.Client, chat store.Chat, m store.Msg, raw *waE2E.Message, dl *downloadable) ([]byte, error) {
+// fetchMedia empties cf and downloads the media into it.
+func (s *server) fetchMedia(ctx context.Context, cl wa.Client, dl *downloadable, cf *cappedFile) error {
+	if err := cf.rewind(); err != nil {
+		return err
+	}
+	return cl.DownloadToFile(ctx, dl.msg, cf)
+}
+
+// downloadError maps a failed download to its protocol error; only *api.Error text and the size cap are told apart.
+func downloadError(err error, cf *cappedFile) *api.Error {
+	if cf.over.Load() || errors.Is(err, errTooLarge) {
+		return api.Errorf(api.CodeIO, "attachment exceeds 100 MiB")
+	}
+	var e *api.Error
+	if errors.As(err, &e) {
+		return e
+	}
+	return api.Errorf(api.CodeIO, "media download failed")
+}
+
+// retryDownload asks the phone to re-upload expired media, then downloads it once more into cf.
+func (s *server) retryDownload(ctx context.Context, cl wa.Client, chat store.Chat, m store.Msg, raw *waE2E.Message, dl *downloadable, cf *cappedFile) error {
 	expired := api.Errorf(api.CodeAttachmentExpired, "the media has expired and the phone could not provide it again")
 	chatWire, err1 := types.ParseJID(m.ChatWire)
 	sender, err2 := types.ParseJID(m.SenderWire)
 	if err1 != nil || err2 != nil {
-		return nil, expired
+		return expired
 	}
 	info := &types.MessageInfo{
 		MessageSource: types.MessageSource{Chat: chatWire, Sender: sender, IsFromMe: m.FromMe, IsGroup: chat.Kind == api.KindGroup},
 		ID:            m.ID,
 	}
 	if r := s.blockedReason(); r != "" {
-		return nil, api.Errorf(api.CodeAttachmentExpired, "the media has expired and cannot be requested from the phone while sending is blocked (%s)", r)
+		return api.Errorf(api.CodeAttachmentExpired, "the media has expired and cannot be requested from the phone while sending is blocked (%s)", r)
 	}
 	key := dl.msg.GetMediaKey()
 	mkey := mediaKey(m.ChatWire, m.ID)
 	ch := s.media.register(mkey)
 	defer s.media.unregister(mkey, ch)
 	if err := cl.SendMediaRetryReceipt(ctx, info, key); err != nil {
-		return nil, expired
+		return expired
 	}
 	timer := time.NewTimer(s.tm.mediaRetry)
 	defer timer.Stop()
@@ -225,21 +254,23 @@ func (s *server) retryDownload(ctx context.Context, cl wa.Client, chat store.Cha
 	select {
 	case res = <-ch:
 	case <-timer.C:
-		return nil, expired
+		return expired
 	case <-ctx.Done():
-		return nil, expired
+		return expired
 	}
 	notif, err := cl.DecryptMediaRetry(res.evt, key)
 	if err != nil || notif.GetResult() != waMmsRetry.MediaRetryNotification_SUCCESS || notif.GetDirectPath() == "" {
-		return nil, expired
+		return expired
 	}
 	dl.setDir(notif.GetDirectPath())
 	if nraw, merr := proto.Marshal(raw); merr == nil {
 		_, _, _ = s.store.UpdateMessage(ctx, chat.JID, m.ID, func(x *store.Msg) { x.Raw = nraw })
 	}
-	data, err := cl.Download(ctx, dl.msg)
-	if err != nil {
-		return nil, expired
+	if err := s.fetchMedia(ctx, cl, dl, cf); err != nil {
+		if cf.over.Load() {
+			return err
+		}
+		return expired
 	}
-	return data, nil
+	return nil
 }

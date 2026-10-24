@@ -2,6 +2,7 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -54,12 +55,43 @@ func startServer(t *testing.T, f *fakeFactory, opts ...opt) *harness {
 // startServerOpen is startServer with a custom OpenFunc.
 func startServerOpen(t *testing.T, f *fakeFactory, open OpenFunc, opts ...opt) *harness {
 	t.Helper()
+	return startServerLog(t, f, zerolog.Nop(), open, opts...)
+}
+
+// lockedBuffer collects log lines written from several goroutines.
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+// startServerLogged is startServer with the log lines collected in the returned buffer.
+func startServerLogged(t *testing.T, f *fakeFactory, opts ...opt) (*harness, *lockedBuffer) {
+	t.Helper()
+	buf := &lockedBuffer{}
+	open := func(context.Context, string, zerolog.Logger) (wa.Factory, error) { return f, nil }
+	return startServerLog(t, f, zerolog.New(buf), open, opts...), buf
+}
+
+func startServerLog(t *testing.T, f *fakeFactory, log zerolog.Logger, open OpenFunc, opts ...opt) *harness {
+	t.Helper()
 	inR, inW := io.Pipe()
 	outR, outW := io.Pipe()
 	h := &harness{t: t, in: inW, done: make(chan error, 1), f: f, dir: t.TempDir()}
 	ready := make(chan struct{})
 	go func() {
-		err := run(context.Background(), inR, outW, zerolog.Nop(), open, func(s *server) {
+		err := run(context.Background(), inR, outW, log, open, func(s *server) {
 			h.srv = s
 			for _, o := range opts {
 				o(s)
@@ -152,6 +184,21 @@ func (h *harness) pending(name string) []map[string]any {
 			var m map[string]any
 			_ = json.Unmarshal(fr.data, &m)
 			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// rawEvents marks every unused event of this name as used and returns their data exactly as sent.
+func (h *harness) rawEvents(name string) []json.RawMessage {
+	h.sync()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []json.RawMessage
+	for _, fr := range h.frames {
+		if !fr.used && fr.event == name {
+			fr.used = true
+			out = append(out, fr.data)
 		}
 	}
 	return out

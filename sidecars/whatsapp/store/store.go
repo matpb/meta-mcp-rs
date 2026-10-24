@@ -19,8 +19,9 @@ import (
 // ErrBadCursor means a list_threads cursor could not be decoded.
 var ErrBadCursor = errors.New("store: bad cursor")
 
-const schemaVersion = 1
+const schemaVersion = 2
 
+// schemaV1 stays verbatim: a new database starts here and migrates, so one code path serves both.
 const schemaV1 = `
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE chats (
@@ -85,6 +86,38 @@ CREATE TABLE contacts (
 CREATE TABLE lid_map (lid TEXT PRIMARY KEY, pn TEXT NOT NULL UNIQUE);
 `
 
+// schemaV2 keys messages by (chat, sender, id) with (chat, id) unique, and adds the read mark id and the group admins.
+const schemaV2 = `
+CREATE TABLE messages_v2 (
+	chat TEXT NOT NULL,
+	sender TEXT NOT NULL DEFAULT '',
+	id TEXT NOT NULL,
+	chat_wire TEXT NOT NULL DEFAULT '',
+	sender_wire TEXT NOT NULL DEFAULT '',
+	sender_alt TEXT NOT NULL DEFAULT '',
+	sender_name TEXT NOT NULL DEFAULT '',
+	ts INTEGER NOT NULL,
+	from_me INTEGER NOT NULL DEFAULT 0,
+	kind TEXT NOT NULL,
+	text TEXT,
+	reply_to TEXT,
+	attachments TEXT NOT NULL DEFAULT '[]',
+	raw BLOB,
+	edited INTEGER NOT NULL DEFAULT 0,
+	unsent INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (chat, sender, id)
+);
+INSERT INTO messages_v2 (chat, sender, id, chat_wire, sender_wire, sender_alt, sender_name, ts, from_me, kind, text, reply_to, attachments, raw, edited, unsent)
+	SELECT chat, sender, id, chat_wire, sender_wire, sender_alt, sender_name, ts, from_me, kind, text, reply_to, attachments, raw, edited, unsent FROM messages;
+DROP TABLE messages;
+ALTER TABLE messages_v2 RENAME TO messages;
+CREATE UNIQUE INDEX messages_chat_id ON messages(chat, id);
+CREATE INDEX messages_chat_ts ON messages(chat, ts DESC, id DESC);
+ALTER TABLE chats ADD COLUMN read_up_to_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE chats ADD COLUMN admins TEXT;
+UPDATE chats SET read_up_to_id = COALESCE((SELECT MAX(m.id) FROM messages m WHERE m.chat = chats.jid AND m.from_me = 0 AND m.ts = chats.read_up_to_ts), '') WHERE read_up_to_ts > 0;
+`
+
 // Chat is one conversation row.
 type Chat struct {
 	JID, AltJID  string
@@ -97,9 +130,11 @@ type Chat struct {
 	Pinned       bool
 	MutedUntil   int64
 	ReadUpToTS   int64
+	ReadUpToID   string // with ReadUpToTS, the newest message marked read in (ts, id) order
 	EndOfHistory string
 	Participants []api.Participant
 	GroupInfoAt  int64
+	Admins       []string // ids of the known group admins, both id forms
 }
 
 // Msg is one stored message; Reactions is filled on read.
@@ -117,6 +152,32 @@ type Msg struct {
 	Edited, Unsent       bool
 	Reactions            []api.Reaction
 }
+
+// WrittenBy reports whether the sender of m is the owner (fromMe) or goes by any of ids.
+// m names its sender in up to three forms (sender, sender_alt, sender_wire); one shared form is enough.
+func (m Msg) WrittenBy(fromMe bool, ids ...string) bool {
+	if m.FromMe != fromMe {
+		return false
+	}
+	if fromMe {
+		return true
+	}
+	for _, id := range ids {
+		if id != "" && (id == m.Sender || id == m.SenderAlt || id == m.SenderWire) {
+			return true
+		}
+	}
+	return false
+}
+
+// Mark is a position in a chat's (ts, id) message order.
+type Mark struct {
+	TS int64
+	ID string
+}
+
+// After reports whether a sorts after b.
+func (a Mark) After(b Mark) bool { return a.TS > b.TS || (a.TS == b.TS && a.ID > b.ID) }
 
 // Store is the messages.db handle.
 type Store struct {
@@ -139,7 +200,7 @@ func Open(path string) (*Store, error) {
 	}
 	f.Close()
 	esc := strings.NewReplacer("%", "%25", "?", "%3f", "#", "%23").Replace(path)
-	dsn := "file:" + esc + "?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+	dsn := "file:" + esc + "?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=secure_delete(1)&_pragma=temp_store(2)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("store: open: %w", err)
@@ -172,11 +233,17 @@ func (s *Store) migrate(ctx context.Context) error {
 	if v > schemaVersion {
 		return fmt.Errorf("store: database version %d is newer than supported %d", v, schemaVersion)
 	}
-	if v < 1 {
-		if _, err := tx.ExecContext(ctx, schemaV1); err != nil {
-			return fmt.Errorf("store: create schema: %w", err)
+	for _, step := range []struct {
+		to  int
+		ddl string
+	}{{1, schemaV1}, {2, schemaV2}} {
+		if v >= step.to {
+			continue
 		}
-		if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
+		if _, err := tx.ExecContext(ctx, step.ddl); err != nil {
+			return fmt.Errorf("store: migrate to version %d: %w", step.to, err)
+		}
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", step.to)); err != nil {
 			return fmt.Errorf("store: set version: %w", err)
 		}
 	}
@@ -198,9 +265,9 @@ func (s *Store) inTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
 	return tx.Commit()
 }
 
-// Reset deletes every row of every table.
+// Reset deletes every row of every table, then rewrites the file so the deleted rows leave no residue.
 func (s *Store) Reset(ctx context.Context) error {
-	return s.inTx(ctx, func(tx *sql.Tx) error {
+	err := s.inTx(ctx, func(tx *sql.Tx) error {
 		for _, t := range []string{"meta", "chats", "messages", "reactions", "receipts", "contacts", "lid_map"} {
 			if _, err := tx.ExecContext(ctx, "DELETE FROM "+t); err != nil {
 				return err
@@ -208,6 +275,15 @@ func (s *Store) Reset(ctx context.Context) error {
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	for _, q := range []string{"PRAGMA wal_checkpoint(TRUNCATE)", "VACUUM", "PRAGMA wal_checkpoint(TRUNCATE)"} {
+		if _, err := s.db.ExecContext(ctx, q); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // GetMeta reads a meta value.
@@ -228,13 +304,13 @@ func (s *Store) SetMeta(ctx context.Context, key, value string) error {
 
 // ---- chats ----
 
-const chatCols = "jid, alt_jid, kind, name, last_ts, last_preview, unread_count, archived, pinned, muted_until, read_up_to_ts, end_of_history, participants, group_info_at"
+const chatCols = "jid, alt_jid, kind, name, last_ts, last_preview, unread_count, archived, pinned, muted_until, read_up_to_ts, read_up_to_id, end_of_history, participants, group_info_at, admins"
 
 func scanChat(r scanner) (Chat, error) {
 	var c Chat
-	var parts sql.NullString
+	var parts, admins sql.NullString
 	if err := r.Scan(&c.JID, &c.AltJID, &c.Kind, &c.Name, &c.LastTS, &c.LastPreview, &c.UnreadCount,
-		&c.Archived, &c.Pinned, &c.MutedUntil, &c.ReadUpToTS, &c.EndOfHistory, &parts, &c.GroupInfoAt); err != nil {
+		&c.Archived, &c.Pinned, &c.MutedUntil, &c.ReadUpToTS, &c.ReadUpToID, &c.EndOfHistory, &parts, &c.GroupInfoAt, &admins); err != nil {
 		return Chat{}, err
 	}
 	if parts.Valid {
@@ -242,7 +318,35 @@ func scanChat(r scanner) (Chat, error) {
 			return Chat{}, fmt.Errorf("store: participants: %w", err)
 		}
 	}
+	if admins.Valid {
+		if err := json.Unmarshal([]byte(admins.String), &c.Admins); err != nil {
+			return Chat{}, fmt.Errorf("store: admins: %w", err)
+		}
+	}
 	return c, nil
+}
+
+// HasAdmin reports whether any of ids is a known admin of the group.
+func (c Chat) HasAdmin(ids ...string) bool {
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		for _, a := range c.Admins {
+			if a == id {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func adminsArg(a []string) (any, error) {
+	if len(a) == 0 {
+		return nil, nil
+	}
+	b, err := json.Marshal(a)
+	return string(b), err
 }
 
 func getChat(ctx context.Context, q querier, id string) (Chat, bool, error) {
@@ -267,10 +371,14 @@ func writeChat(ctx context.Context, q querier, origJID string, c Chat) error {
 	if err != nil {
 		return err
 	}
+	admins, err := adminsArg(c.Admins)
+	if err != nil {
+		return err
+	}
 	_, err = q.ExecContext(ctx, `UPDATE chats SET alt_jid=?, kind=?, name=?, last_ts=?, last_preview=?, unread_count=?,
-		archived=?, pinned=?, muted_until=?, read_up_to_ts=?, end_of_history=?, participants=?, group_info_at=? WHERE jid=?`,
+		archived=?, pinned=?, muted_until=?, read_up_to_ts=?, read_up_to_id=?, end_of_history=?, participants=?, group_info_at=?, admins=? WHERE jid=?`,
 		c.AltJID, c.Kind, c.Name, c.LastTS, c.LastPreview, c.UnreadCount, c.Archived, c.Pinned, c.MutedUntil,
-		c.ReadUpToTS, c.EndOfHistory, parts, c.GroupInfoAt, origJID)
+		c.ReadUpToTS, c.ReadUpToID, c.EndOfHistory, parts, c.GroupInfoAt, admins, origJID)
 	return err
 }
 
@@ -279,9 +387,13 @@ func insertChat(ctx context.Context, q querier, c Chat) error {
 	if err != nil {
 		return err
 	}
-	_, err = q.ExecContext(ctx, "INSERT INTO chats("+chatCols+") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+	admins, err := adminsArg(c.Admins)
+	if err != nil {
+		return err
+	}
+	_, err = q.ExecContext(ctx, "INSERT INTO chats("+chatCols+") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
 		c.JID, c.AltJID, c.Kind, c.Name, c.LastTS, c.LastPreview, c.UnreadCount, c.Archived, c.Pinned,
-		c.MutedUntil, c.ReadUpToTS, c.EndOfHistory, parts, c.GroupInfoAt)
+		c.MutedUntil, c.ReadUpToTS, c.ReadUpToID, c.EndOfHistory, parts, c.GroupInfoAt, admins)
 	return err
 }
 
@@ -429,8 +541,11 @@ func mergeMeta(src, dst Chat, dstOK bool, to string) Chat {
 	if older.MutedUntil > m.MutedUntil {
 		m.MutedUntil = older.MutedUntil
 	}
-	if older.ReadUpToTS > m.ReadUpToTS {
-		m.ReadUpToTS = older.ReadUpToTS
+	if (Mark{older.ReadUpToTS, older.ReadUpToID}).After(Mark{m.ReadUpToTS, m.ReadUpToID}) {
+		m.ReadUpToTS, m.ReadUpToID = older.ReadUpToTS, older.ReadUpToID
+	}
+	if m.Admins == nil {
+		m.Admins = older.Admins
 	}
 	m.AltJID = dst.AltJID
 	if m.AltJID == "" && src.JID != to {
@@ -669,21 +784,39 @@ func Preview(m Msg) string {
 	return "[unsupported]"
 }
 
-// PutMessage upserts a message by (chat, id); a redelivery never double counts unread or reverts an edit or revoke.
-func (s *Store) PutMessage(ctx context.Context, m Msg, countUnread bool) (bool, error) {
-	var inserted bool
+// PutResult says what PutMessage did.
+type PutResult int
+
+const (
+	// PutInserted means a new row was written.
+	PutInserted PutResult = iota
+	// PutExisting means the same sender already owns this id; the row is left alone unless m arrived as an edit or revoke.
+	PutExisting
+	// PutConflict means another sender owns this id in the chat; nothing was written.
+	PutConflict
+)
+
+// PutMessage stores a message keyed by (chat, sender, id); the first sender to hold an id in a chat keeps it.
+// A redelivery never double counts unread or changes content, unless it arrives as an edit or revoke from the same sender.
+func (s *Store) PutMessage(ctx context.Context, m Msg, countUnread bool) (PutResult, error) {
+	res := PutInserted
 	err := s.inTx(ctx, func(tx *sql.Tx) error {
-		var oldEdited, oldUnsent bool
-		err := tx.QueryRowContext(ctx, "SELECT edited, unsent FROM messages WHERE chat = ? AND id = ?", m.Chat, m.ID).Scan(&oldEdited, &oldUnsent)
-		switch {
-		case err == nil:
-			if (oldEdited || oldUnsent) && !m.Edited && !m.Unsent {
+		old, found, err := getMessage(ctx, tx, m.Chat, m.ID)
+		if err != nil {
+			return err
+		}
+		if found {
+			if !old.WrittenBy(m.FromMe, m.Sender, m.SenderAlt, m.SenderWire) {
+				res = PutConflict
 				return nil
 			}
-			m.Unsent = m.Unsent || oldUnsent
-			return writeMsg(ctx, tx, m)
-		case !errors.Is(err, sql.ErrNoRows):
-			return err
+			res = PutExisting
+			if !m.Edited && !m.Unsent {
+				return nil
+			}
+			old.Kind, old.Text, old.ReplyTo, old.Attachments, old.Raw = m.Kind, m.Text, m.ReplyTo, m.Attachments, m.Raw
+			old.Edited, old.Unsent = old.Edited || m.Edited, old.Unsent || m.Unsent
+			return writeMsg(ctx, tx, old)
 		}
 		atts, err := attsArg(m.Attachments)
 		if err != nil {
@@ -692,16 +825,15 @@ func (s *Store) PutMessage(ctx context.Context, m Msg, countUnread bool) (bool, 
 		if _, err := tx.ExecContext(ctx, "INSERT INTO messages("+msgCols+") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", msgArgs(m, atts)...); err != nil {
 			return err
 		}
-		inserted = true
 		count := countUnread && !m.FromMe
 		_, err = tx.ExecContext(ctx, `UPDATE chats SET
 			last_preview = CASE WHEN ?2 >= last_ts THEN ?3 ELSE last_preview END,
 			last_ts = CASE WHEN ?2 >= last_ts THEN ?2 ELSE last_ts END,
-			unread_count = unread_count + CASE WHEN ?4 AND ?2 > read_up_to_ts THEN 1 ELSE 0 END
-			WHERE jid = ?1`, m.Chat, m.TS, Preview(m), count)
+			unread_count = unread_count + CASE WHEN ?4 AND (?2 > read_up_to_ts OR (?2 = read_up_to_ts AND ?5 > read_up_to_id)) THEN 1 ELSE 0 END
+			WHERE jid = ?1`, m.Chat, m.TS, Preview(m), count, m.ID)
 		return err
 	})
-	return inserted, err
+	return res, err
 }
 
 // GetMessage reads one message with its reactions.
@@ -709,30 +841,51 @@ func (s *Store) GetMessage(ctx context.Context, chat, id string) (Msg, bool, err
 	return getMessage(ctx, s.db, chat, id)
 }
 
+// UpdateResult says what UpdateMessageIf did.
+type UpdateResult int
+
+const (
+	// UpdateMissing means no such message is stored.
+	UpdateMissing UpdateResult = iota
+	// UpdateDenied means the message exists and allow refused it; nothing was written.
+	UpdateDenied
+	// UpdateDone means fn ran and the row was written.
+	UpdateDone
+)
+
 // UpdateMessage applies fn to a stored message in one transaction and refreshes the chat preview when it is the newest.
 func (s *Store) UpdateMessage(ctx context.Context, chat, id string, fn func(*Msg)) (Msg, bool, error) {
+	m, res, err := s.UpdateMessageIf(ctx, chat, id, nil, fn)
+	return m, res == UpdateDone, err
+}
+
+// UpdateMessageIf is UpdateMessage that first asks allow (when not nil) about the stored row, in the same transaction.
+func (s *Store) UpdateMessageIf(ctx context.Context, chat, id string, allow func(Msg) bool, fn func(*Msg)) (Msg, UpdateResult, error) {
 	var out Msg
-	var found bool
+	res := UpdateMissing
 	err := s.inTx(ctx, func(tx *sql.Tx) error {
 		m, ok, err := getMessage(ctx, tx, chat, id)
 		if err != nil || !ok {
 			return err
 		}
-		found = true
+		if allow != nil && !allow(m) {
+			res = UpdateDenied
+			return nil
+		}
 		fn(&m)
 		m.Chat, m.ID = chat, id
 		if err := writeMsg(ctx, tx, m); err != nil {
 			return err
 		}
-		out = m
+		out, res = m, UpdateDone
 		_, err = tx.ExecContext(ctx, `UPDATE chats SET last_preview = ?3 WHERE jid = ?1 AND ?2 = (
 			SELECT id FROM messages WHERE chat = ?1 ORDER BY ts DESC, id DESC LIMIT 1)`, chat, id, Preview(m))
 		return err
 	})
 	if err != nil {
-		return Msg{}, false, err
+		return Msg{}, UpdateMissing, err
 	}
-	return out, found, nil
+	return out, res, nil
 }
 
 // FetchMessages returns up to limit messages newest first, older than the (beforeMS, beforeID) anchor when beforeMS is set.
@@ -767,13 +920,33 @@ func (s *Store) OldestMessage(ctx context.Context, chat string) (Msg, bool, erro
 	return ms[0], true, nil
 }
 
-// UnreadIncoming returns up to max incoming messages with afterTS < ts <= upToTS, newest first.
-func (s *Store) UnreadIncoming(ctx context.Context, chat string, afterTS, upToTS int64, max int) ([]Msg, error) {
+// UnreadIncoming returns up to max incoming messages after the after mark, at or below upToTS and older than before, newest first.
+// Only Chat, ID, TS, ChatWire and SenderWire are filled.
+func (s *Store) UnreadIncoming(ctx context.Context, chat string, after Mark, upToTS int64, before *Mark, max int) ([]Msg, error) {
 	if max < 1 {
 		max = 100
 	}
-	return queryMsgs(ctx, s.db, "SELECT "+msgCols+` FROM messages WHERE chat = ? AND from_me = 0 AND ts > ? AND ts <= ?
-		ORDER BY ts DESC, id DESC LIMIT `+fmt.Sprint(max), chat, afterTS, upToTS)
+	q := `SELECT chat, id, ts, chat_wire, sender_wire FROM messages WHERE chat = ?1 AND from_me = 0
+		AND (ts > ?2 OR (ts = ?2 AND id > ?3)) AND ts <= ?4`
+	args := []any{chat, after.TS, after.ID, upToTS}
+	if before != nil {
+		q += " AND (ts < ?5 OR (ts = ?5 AND id < ?6))"
+		args = append(args, before.TS, before.ID)
+	}
+	rows, err := s.db.QueryContext(ctx, q+" ORDER BY ts DESC, id DESC LIMIT "+fmt.Sprint(max), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Msg
+	for rows.Next() {
+		var m Msg
+		if err := rows.Scan(&m.Chat, &m.ID, &m.TS, &m.ChatWire, &m.SenderWire); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
 }
 
 // ---- reactions and receipts ----

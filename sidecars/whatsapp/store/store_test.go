@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -43,13 +44,19 @@ func ensure(t *testing.T, s *Store, jid, alt, kind string) Chat {
 	return c
 }
 
-func put(t *testing.T, s *Store, m Msg, unread bool) bool {
+func putRes(t *testing.T, s *Store, m Msg, unread bool) PutResult {
 	t.Helper()
-	ins, err := s.PutMessage(ctx, m, unread)
+	res, err := s.PutMessage(ctx, m, unread)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return ins
+	return res
+}
+
+// put stores m and reports whether it was inserted as a new row.
+func put(t *testing.T, s *Store, m Msg, unread bool) bool {
+	t.Helper()
+	return putRes(t, s, m, unread) == PutInserted
 }
 
 func msg(chat, id string, ts int64) Msg {
@@ -87,7 +94,7 @@ func TestFileModeAndReopen(t *testing.T) {
 		t.Fatalf("meta lost on reopen: %q %v", v, ok)
 	}
 	var ver int
-	if err := s.db.QueryRow("PRAGMA user_version").Scan(&ver); err != nil || ver != 1 {
+	if err := s.db.QueryRow("PRAGMA user_version").Scan(&ver); err != nil || ver != 2 {
 		t.Fatalf("user_version %d %v", ver, err)
 	}
 }
@@ -664,7 +671,7 @@ func TestUnreadIncoming(t *testing.T) {
 		m.FromMe = i == 4
 		put(t, s, m, false)
 	}
-	ms, err := s.UnreadIncoming(ctx, "c", 10, 50, 100)
+	ms, err := s.UnreadIncoming(ctx, "c", Mark{TS: 10, ID: "m1"}, 50, nil, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -675,9 +682,12 @@ func TestUnreadIncoming(t *testing.T) {
 	if !reflect.DeepEqual(ids, []string{"m5", "m3", "m2"}) {
 		t.Fatalf("%v", ids)
 	}
-	ms, _ = s.UnreadIncoming(ctx, "c", 0, 1<<62, 2)
+	ms, _ = s.UnreadIncoming(ctx, "c", Mark{}, 1<<62, nil, 2)
 	if len(ms) != 2 || ms[0].ID != "m6" {
 		t.Fatalf("max/newest first: %+v", ms)
+	}
+	if ms[0].ChatWire != "" || ms[0].Text != nil || ms[0].Chat != "c" || ms[0].TS != 60 {
+		t.Fatalf("only the receipt fields are filled: %+v", ms[0])
 	}
 }
 
@@ -696,5 +706,361 @@ func TestAPIConversions(t *testing.T) {
 	if m.ThreadID != "c" || m.Sender != (api.Sender{ID: "s", Name: "S", IsMe: true}) || m.Attachments == nil || m.Reactions == nil ||
 		!m.Encrypted || !m.Edited || *m.Text != "hi" || *m.ReplyTo != "r" {
 		t.Fatalf("%+v", m)
+	}
+}
+
+// v1DDL is the schema of messages.db before sender keying, copied from the first release.
+const v1DDL = `
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE chats (
+	jid TEXT PRIMARY KEY, alt_jid TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL, name TEXT NOT NULL DEFAULT '',
+	last_ts INTEGER NOT NULL DEFAULT 0, last_preview TEXT NOT NULL DEFAULT '', unread_count INTEGER NOT NULL DEFAULT 0,
+	archived INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0, muted_until INTEGER NOT NULL DEFAULT 0,
+	read_up_to_ts INTEGER NOT NULL DEFAULT 0, end_of_history TEXT NOT NULL DEFAULT '', participants TEXT,
+	group_info_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX chats_alt_jid ON chats(alt_jid);
+CREATE INDEX chats_last ON chats(last_ts DESC, jid DESC);
+CREATE TABLE messages (
+	chat TEXT NOT NULL, id TEXT NOT NULL, chat_wire TEXT NOT NULL DEFAULT '', sender_wire TEXT NOT NULL DEFAULT '',
+	sender TEXT NOT NULL DEFAULT '', sender_alt TEXT NOT NULL DEFAULT '', sender_name TEXT NOT NULL DEFAULT '',
+	ts INTEGER NOT NULL, from_me INTEGER NOT NULL DEFAULT 0, kind TEXT NOT NULL, text TEXT, reply_to TEXT,
+	attachments TEXT NOT NULL DEFAULT '[]', raw BLOB, edited INTEGER NOT NULL DEFAULT 0, unsent INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (chat, id)
+);
+CREATE INDEX messages_chat_ts ON messages(chat, ts DESC, id DESC);
+CREATE TABLE reactions (chat TEXT NOT NULL, message_id TEXT NOT NULL, sender TEXT NOT NULL, emoji TEXT NOT NULL, ts INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (chat, message_id, sender));
+CREATE TABLE receipts (chat TEXT NOT NULL, sender TEXT NOT NULL, kind TEXT NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY (chat, sender, kind));
+CREATE TABLE contacts (jid TEXT PRIMARY KEY, full_name TEXT NOT NULL DEFAULT '', first_name TEXT NOT NULL DEFAULT '', push_name TEXT NOT NULL DEFAULT '');
+CREATE TABLE lid_map (lid TEXT PRIMARY KEY, pn TEXT NOT NULL UNIQUE);
+PRAGMA user_version = 1;
+`
+
+func TestMigrationFromV1KeepsEveryRowReadable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "messages.db")
+	old, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		v1DDL,
+		`INSERT INTO meta VALUES ('owner_jid', 'me@s.whatsapp.net')`,
+		`INSERT INTO chats (jid, alt_jid, kind, name, last_ts, last_preview, unread_count, read_up_to_ts, participants) VALUES ('a@s.whatsapp.net', 'a@lid', 'dm', 'Ann', 300, 'three', 1, 200, '[{"id":"a@s.whatsapp.net","name":"Ann","is_me":false}]')`,
+		`INSERT INTO chats (jid, kind, name, read_up_to_ts) VALUES ('g@g.us', 'group', 'Crew', 0)`,
+		`INSERT INTO messages (chat, id, chat_wire, sender_wire, sender, sender_alt, sender_name, ts, from_me, kind, text, attachments, raw, edited) VALUES ('a@s.whatsapp.net', 'one', 'a@lid', 'a@lid', 'a@s.whatsapp.net', 'a@lid', 'Ann', 100, 0, 'text', 'hello', '[]', x'0aff', 1)`,
+		`INSERT INTO messages (chat, id, sender, ts, from_me, kind, text) VALUES ('a@s.whatsapp.net', 'two', 'me@s.whatsapp.net', 200, 1, 'text', 'reply')`,
+		`INSERT INTO messages (chat, id, sender, ts, kind, text) VALUES ('a@s.whatsapp.net', 'zed', 'a@s.whatsapp.net', 200, 'text', 'same second as the mark')`,
+		`INSERT INTO messages (chat, id, sender, ts, kind, text) VALUES ('a@s.whatsapp.net', 'three', 'a@s.whatsapp.net', 300, 'text', 'three')`,
+		`INSERT INTO reactions VALUES ('a@s.whatsapp.net', 'one', 'me@s.whatsapp.net', '👍', 150)`,
+		`INSERT INTO receipts VALUES ('a@s.whatsapp.net', 'a@s.whatsapp.net', 'read', 120)`,
+		`INSERT INTO contacts (jid, full_name) VALUES ('a@s.whatsapp.net', 'Ann Liddell')`,
+		`INSERT INTO lid_map VALUES ('a@lid', 'a@s.whatsapp.net')`,
+	} {
+		if _, err := old.Exec(q); err != nil {
+			t.Fatalf("seed v1: %v\n%s", err, q)
+		}
+	}
+	if err := old.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("open v1 database: %v", err)
+	}
+	defer s.Close()
+	var ver int
+	if err := s.db.QueryRow("PRAGMA user_version").Scan(&ver); err != nil || ver != 2 {
+		t.Fatalf("user_version %d %v", ver, err)
+	}
+	ms, more, err := s.FetchMessages(ctx, "a@s.whatsapp.net", 10, 0, "")
+	if err != nil || more || len(ms) != 4 || ms[0].ID != "three" || ms[1].ID != "zed" || ms[3].ID != "one" {
+		t.Fatalf("migrated messages %v more=%v err=%v", ids(ms), more, err)
+	}
+	one := ms[3]
+	if one.Text == nil || *one.Text != "hello" || one.Sender != "a@s.whatsapp.net" || one.SenderAlt != "a@lid" || one.SenderWire != "a@lid" || !one.Edited ||
+		!reflect.DeepEqual(one.Raw, []byte{0x0a, 0xff}) || len(one.Reactions) != 1 || one.Reactions[0].Emoji != "👍" {
+		t.Fatalf("migrated row changed: %+v", one)
+	}
+	c, ok, err := s.GetChat(ctx, "a@lid")
+	if err != nil || !ok || c.JID != "a@s.whatsapp.net" || c.Name != "Ann" || c.UnreadCount != 1 || len(c.Participants) != 1 || c.Admins != nil {
+		t.Fatalf("migrated chat %+v %v %v", c, ok, err)
+	}
+	if c.ReadUpToTS != 200 || c.ReadUpToID != "zed" {
+		t.Fatalf("watermark id must be the newest id at the mark second, got %d %q", c.ReadUpToTS, c.ReadUpToID)
+	}
+	if g, _, _ := s.GetChat(ctx, "g@g.us"); g.ReadUpToID != "" {
+		t.Fatalf("a chat never marked read keeps an empty watermark id: %+v", g)
+	}
+	if v, ok, _ := s.GetMeta(ctx, "owner_jid"); !ok || v != "me@s.whatsapp.net" {
+		t.Fatalf("meta %q %v", v, ok)
+	}
+	if name, ok, _ := s.ContactName(ctx, "a@s.whatsapp.net"); !ok || name != "Ann Liddell" {
+		t.Fatalf("contact %q %v", name, ok)
+	}
+	if lid, ok, _ := s.LIDForPN(ctx, "a@s.whatsapp.net"); !ok || lid != "a@lid" {
+		t.Fatalf("lid cache %q %v", lid, ok)
+	}
+	if got := putRes(t, s, Msg{Chat: "a@s.whatsapp.net", ID: "one", TS: 5, Kind: api.MsgText, Sender: "mallory"}, true); got != PutConflict {
+		t.Fatalf("a migrated row must be protected like a new one: %v", got)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("second open after migration: %v", err)
+	}
+	s2.Close()
+}
+
+func ids(ms []Msg) []string {
+	out := make([]string, len(ms))
+	for i, m := range ms {
+		out[i] = m.ID
+	}
+	return out
+}
+
+func TestMessagesAreKeyedBySenderAndChatIDIsUnique(t *testing.T) {
+	s := open(t)
+	var pk []string
+	rows, err := s.db.Query("SELECT name FROM pragma_table_info('messages') WHERE pk > 0 ORDER BY pk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var n string
+		rows.Scan(&n)
+		pk = append(pk, n)
+	}
+	rows.Close()
+	if !reflect.DeepEqual(pk, []string{"chat", "sender", "id"}) {
+		t.Fatalf("primary key %v", pk)
+	}
+	var unique int
+	s.db.QueryRow("SELECT COUNT(*) FROM pragma_index_list('messages') WHERE \"unique\" = 1 AND origin = 'c'").Scan(&unique)
+	if unique != 1 {
+		t.Fatalf("want the unique (chat, id) index, found %d", unique)
+	}
+}
+
+func TestPutMessageFirstSenderOfAnIDKeepsIt(t *testing.T) {
+	s := open(t)
+	ensure(t, s, "g@g.us", "", api.KindGroup)
+	alice := Msg{Chat: "g@g.us", ID: "X", TS: 100, Kind: api.MsgText, Text: sp("Alice: 5pm"), Sender: "alice@s.whatsapp.net", SenderAlt: "1@lid", SenderWire: "1@lid"}
+	if putRes(t, s, alice, true) != PutInserted {
+		t.Fatal("first put must insert")
+	}
+	mallory := alice
+	mallory.Sender, mallory.SenderAlt, mallory.SenderWire, mallory.Text, mallory.TS = "mallory@s.whatsapp.net", "2@lid", "2@lid", sp("Mallory: wire money"), 200
+	if got := putRes(t, s, mallory, true); got != PutConflict {
+		t.Fatalf("another sender reusing the id: %v", got)
+	}
+	mine := alice
+	mine.FromMe, mine.Sender, mine.SenderAlt, mine.SenderWire = true, "me@s.whatsapp.net", "9@lid", "me@s.whatsapp.net"
+	mine.Text = sp("forged as me")
+	if got := putRes(t, s, mine, true); got != PutConflict {
+		t.Fatalf("the owner flag is part of the sender: %v", got)
+	}
+	got, _, _ := s.GetMessage(ctx, "g@g.us", "X")
+	if got.Text == nil || *got.Text != "Alice: 5pm" || got.Sender != alice.Sender || got.TS != 100 {
+		t.Fatalf("stored message changed: %+v", got)
+	}
+	if c, _, _ := s.GetChat(ctx, "g@g.us"); c.UnreadCount != 1 || c.LastTS != 100 || c.LastPreview != "Alice: 5pm" {
+		t.Fatalf("a rejected message must not touch the chat: %+v", c)
+	}
+	// the same message in the other id form of the same sender is a redelivery, not a conflict
+	again := alice
+	again.Sender, again.SenderAlt, again.SenderWire = "1@lid", "", "1@lid"
+	again.Text = sp("rewritten by the same sender")
+	if got := putRes(t, s, again, true); got != PutExisting {
+		t.Fatalf("same sender in another form: %v", got)
+	}
+	if stored, _, _ := s.GetMessage(ctx, "g@g.us", "X"); *stored.Text != "Alice: 5pm" {
+		t.Fatalf("a same-sender redelivery with other content must be ignored: %q", *stored.Text)
+	}
+	// only an edit event may change it
+	edit := again
+	edit.Edited = true
+	edit.TS = 999
+	if got := putRes(t, s, edit, true); got != PutExisting {
+		t.Fatalf("edit: %v", got)
+	}
+	stored, _, _ := s.GetMessage(ctx, "g@g.us", "X")
+	if *stored.Text != "rewritten by the same sender" || !stored.Edited || stored.TS != 100 || stored.Sender != alice.Sender {
+		t.Fatalf("edit must change the content only: %+v", stored)
+	}
+}
+
+func TestUpdateMessageIfDeniedLeavesTheRowAlone(t *testing.T) {
+	s := open(t)
+	ensure(t, s, "c", "", api.KindDM)
+	put(t, s, msg("c", "a", 100), false)
+	ran := false
+	_, res, err := s.UpdateMessageIf(ctx, "c", "a", func(m Msg) bool { return m.Sender == "someone else" }, func(*Msg) { ran = true })
+	if err != nil || res != UpdateDenied || ran {
+		t.Fatalf("denied update: %v %v ran=%v", res, err, ran)
+	}
+	if _, res, _ = s.UpdateMessageIf(ctx, "c", "nope", func(Msg) bool { return true }, func(*Msg) { ran = true }); res != UpdateMissing || ran {
+		t.Fatalf("missing: %v ran=%v", res, ran)
+	}
+	got, res, err := s.UpdateMessageIf(ctx, "c", "a", func(m Msg) bool { return m.Sender == "peer" }, func(m *Msg) { m.Text = sp("new") })
+	if err != nil || res != UpdateDone || *got.Text != "new" {
+		t.Fatalf("allowed update: %v %v %+v", res, err, got)
+	}
+}
+
+func TestMessageWrittenBy(t *testing.T) {
+	m := Msg{Sender: "pn@s.whatsapp.net", SenderAlt: "1@lid", SenderWire: "1:4@lid"}
+	for _, c := range []struct {
+		name   string
+		fromMe bool
+		ids    []string
+		want   bool
+	}{
+		{"canonical", false, []string{"pn@s.whatsapp.net"}, true},
+		{"alt", false, []string{"x", "1@lid"}, true},
+		{"wire", false, []string{"1:4@lid"}, true},
+		{"other", false, []string{"2@lid"}, false},
+		{"empty ids never match an empty field", false, []string{"", ""}, false},
+		{"owner flag differs", true, []string{"pn@s.whatsapp.net"}, false},
+	} {
+		if got := m.WrittenBy(c.fromMe, c.ids...); got != c.want {
+			t.Errorf("%s: %v want %v", c.name, got, c.want)
+		}
+	}
+	own := Msg{FromMe: true, Sender: "me@s.whatsapp.net"}
+	if !own.WrittenBy(true) || own.WrittenBy(false, "me@s.whatsapp.net") {
+		t.Error("an owner message belongs to the owner only")
+	}
+	if (Msg{}).WrittenBy(false, "") {
+		t.Error("two empty identities are not the same sender")
+	}
+}
+
+func TestUnreadWatermarkComparesTimestampAndID(t *testing.T) {
+	s := open(t)
+	ensure(t, s, "c", "", api.KindDM)
+	count := func() int { c, _, _ := s.GetChat(ctx, "c"); return c.UnreadCount }
+	s.UpdateChat(ctx, "c", func(c *Chat) { c.ReadUpToTS, c.ReadUpToID = 150, "m"; c.UnreadCount = 0 })
+	put(t, s, msg("c", "a", 150), true)
+	if count() != 0 {
+		t.Fatalf("same second, smaller id counts as read: %d", count())
+	}
+	put(t, s, msg("c", "z", 150), true)
+	if count() != 1 {
+		t.Fatalf("same second, larger id is unread: %d", count())
+	}
+	put(t, s, msg("c", "old", 149), true)
+	put(t, s, msg("c", "new", 151), true)
+	if count() != 2 {
+		t.Fatalf("older read, newer unread: %d", count())
+	}
+}
+
+func TestUnreadIncomingCursorWalksSameSecondMessages(t *testing.T) {
+	s := open(t)
+	ensure(t, s, "c", "", api.KindDM)
+	for i := 0; i < 250; i++ {
+		put(t, s, msg("c", fmt.Sprintf("u%03d", i), 500), false)
+	}
+	put(t, s, msg("c", "other", 400), false)
+	var all []Msg
+	var cur *Mark
+	pages := 0
+	for {
+		page, err := s.UnreadIncoming(ctx, "c", Mark{}, 1<<62, cur, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pages++
+		all = append(all, page...)
+		if len(page) < 100 {
+			break
+		}
+		last := page[len(page)-1]
+		cur = &Mark{TS: last.TS, ID: last.ID}
+	}
+	seen := map[string]bool{}
+	for _, m := range all {
+		seen[m.ID] = true
+	}
+	if len(all) != 251 || len(seen) != 251 || pages != 3 || all[0].ID != "u249" || all[250].ID != "other" {
+		t.Fatalf("walked %d rows (%d distinct) in %d pages, first %q last %q", len(all), len(seen), pages, all[0].ID, all[len(all)-1].ID)
+	}
+	// rows at or below the watermark and above the upper bound are excluded
+	page, _ := s.UnreadIncoming(ctx, "c", Mark{TS: 500, ID: "u100"}, 500, nil, 1000)
+	if len(page) != 149 || page[len(page)-1].ID != "u101" {
+		t.Fatalf("after the (500, u100) mark: %d rows, last %q", len(page), page[len(page)-1].ID)
+	}
+	if page, _ = s.UnreadIncoming(ctx, "c", Mark{}, 450, nil, 10); len(page) != 1 || page[0].ID != "other" {
+		t.Fatalf("upper bound: %+v", page)
+	}
+}
+
+func TestAdminsRoundTripAndLookup(t *testing.T) {
+	s := open(t)
+	ensure(t, s, "g@g.us", "", api.KindGroup)
+	if c, _, _ := s.GetChat(ctx, "g@g.us"); c.Admins != nil || c.HasAdmin("a@s.whatsapp.net") {
+		t.Fatalf("new chat has no admins: %+v", c)
+	}
+	s.UpdateChat(ctx, "g@g.us", func(c *Chat) { c.Admins = []string{"a@s.whatsapp.net", "1@lid"} })
+	c, _, _ := s.GetChat(ctx, "g@g.us")
+	if !reflect.DeepEqual(c.Admins, []string{"a@s.whatsapp.net", "1@lid"}) || !c.HasAdmin("x", "1@lid") || c.HasAdmin("b@s.whatsapp.net") || c.HasAdmin("") {
+		t.Fatalf("admins %+v", c.Admins)
+	}
+	s.UpdateChat(ctx, "g@g.us", func(c *Chat) { c.Admins = nil })
+	if c, _, _ = s.GetChat(ctx, "g@g.us"); c.Admins != nil {
+		t.Fatalf("cleared admins %+v", c.Admins)
+	}
+}
+
+func TestMergeChatKeepsTheNewerReadMark(t *testing.T) {
+	s := open(t)
+	ensure(t, s, "lid1@lid", "", api.KindDM)
+	ensure(t, s, "pn1@s.whatsapp.net", "", api.KindDM)
+	s.UpdateChat(ctx, "lid1@lid", func(c *Chat) { c.ReadUpToTS, c.ReadUpToID = 40, "b"; c.Admins = []string{"x"} })
+	s.UpdateChat(ctx, "pn1@s.whatsapp.net", func(c *Chat) { c.ReadUpToTS, c.ReadUpToID = 40, "a" })
+	if err := s.MergeChat(ctx, "lid1@lid", "pn1@s.whatsapp.net"); err != nil {
+		t.Fatal(err)
+	}
+	c, _, _ := s.GetChat(ctx, "pn1@s.whatsapp.net")
+	if c.ReadUpToTS != 40 || c.ReadUpToID != "b" || !c.HasAdmin("x") {
+		t.Fatalf("merged mark %d %q admins %v", c.ReadUpToTS, c.ReadUpToID, c.Admins)
+	}
+}
+
+func TestResetLeavesNoResidueInTheFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "messages.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ensure(t, s, "c", "", api.KindDM)
+	marker := "RESIDUE-" + strings.Repeat("secretmessagetext", 40)
+	for i := 0; i < 50; i++ {
+		m := msg("c", fmt.Sprintf("m%d", i), int64(i))
+		m.Text = sp(marker)
+		put(t, s, m, false)
+	}
+	s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	if raw, _ := os.ReadFile(path); !strings.Contains(string(raw), marker) {
+		t.Fatal("setup: the marker must be in the file before the reset")
+	}
+	if err := s.Reset(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, suffix := range []string{"", "-wal"} {
+		raw, err := os.ReadFile(path + suffix)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(raw), "secretmessagetext") {
+			t.Fatalf("deleted message text is still in %s%s", filepath.Base(path), suffix)
+		}
 	}
 }

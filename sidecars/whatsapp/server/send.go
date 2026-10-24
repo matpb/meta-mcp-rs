@@ -31,7 +31,8 @@ const (
 	maxMediaBytes = 100 << 20
 	thumbMaxSide  = 100
 	thumbQuality  = 60
-	unreadBatch   = 100
+	unreadBatch   = 100 // stored messages per page while mark_read walks the unread ones
+	receiptBatch  = 100 // message ids per read receipt
 )
 
 type sendTextParams struct {
@@ -117,9 +118,12 @@ func (s *server) deliver(ctx context.Context, reqID uint64, cl wa.Client, chat s
 	m := s.msgFrom(o, chat.JID, msg)
 	s.ingestMu.Lock()
 	defer s.ingestMu.Unlock()
-	if _, err := s.store.PutMessage(ctx, m, false); err != nil {
+	switch res, err := s.store.PutMessage(ctx, m, false); {
+	case err != nil:
 		s.log.Error().Msg("could not store a sent message")
-	} else {
+	case res == store.PutConflict:
+		s.log.Info().Str("thread", chat.JID).Str("id", m.ID).Msg("ignored a sent message whose id another sender holds")
+	default:
 		s.emitLog(api.EvMessage, api.MessageEvent{Message: m.API(), Direction: "out"})
 	}
 	return ok(reqID, map[string]any{"message_id": id, "ts": ts})
@@ -337,7 +341,7 @@ type markReadParams struct {
 	UpToMS   *int64 `json:"up_to_ts_ms"`
 }
 
-// markRead sends read receipts for stored unread incoming messages, grouped by sender.
+// markRead sends read receipts for stored unread incoming messages, grouped by sender and sent 100 ids at a time.
 func (s *server) markRead(ctx context.Context, req ipc.Request) ipc.Reply {
 	var p markReadParams
 	if e := decode(req, &p); e != nil {
@@ -378,19 +382,22 @@ func (s *server) markRead(ctx context.Context, req ipc.Request) ipc.Reply {
 				return fail(req.ID, api.CodeInternal, "stored sender is not a JID")
 			}
 		}
-		ids := make([]types.MessageID, len(g))
-		for i, m := range g {
-			ids[i] = types.MessageID(m.ID)
-		}
-		if err := cl.MarkRead(ctx, ids, time.Now(), chatWire, sender); err != nil {
-			return failErr(req.ID, s.sendError(err, ""))
+		for start := 0; start < len(g); start += receiptBatch {
+			part := g[start:min(start+receiptBatch, len(g))]
+			ids := make([]types.MessageID, len(part))
+			for i, m := range part {
+				ids[i] = types.MessageID(m.ID)
+			}
+			if err := cl.MarkRead(ctx, ids, time.Now(), chatWire, sender); err != nil {
+				return failErr(req.ID, s.sendError(err, ""))
+			}
 		}
 	}
 	s.ingestMu.Lock()
 	defer s.ingestMu.Unlock()
 	upd, _, uerr := s.store.UpdateChat(ctx, chat.JID, func(c *store.Chat) {
-		if msgs[0].TS > c.ReadUpToTS {
-			c.ReadUpToTS = msgs[0].TS
+		if newest := (store.Mark{TS: msgs[0].TS, ID: msgs[0].ID}); newest.After(store.Mark{TS: c.ReadUpToTS, ID: c.ReadUpToID}) {
+			c.ReadUpToTS, c.ReadUpToID = newest.TS, newest.ID
 		}
 		if p.UpToMS == nil {
 			c.UnreadCount = 0
@@ -434,30 +441,22 @@ func (s *server) setTyping(ctx context.Context, req ipc.Request) ipc.Reply {
 	return ok(req.ID, struct{}{})
 }
 
-// allUnread collects every unread incoming message up to upTo, newest first, 100 rows per query.
+// allUnread collects every incoming message after the chat's read mark up to upTo seconds, newest first.
+// It pages with a (ts, id) cursor, so messages that share one second are all reached.
 func (s *server) allUnread(ctx context.Context, chat store.Chat, upTo int64) ([]store.Msg, error) {
 	var all []store.Msg
-	seen := map[string]bool{}
-	upper := upTo
+	after := store.Mark{TS: chat.ReadUpToTS, ID: chat.ReadUpToID}
+	var before *store.Mark
 	for {
-		batch, err := s.store.UnreadIncoming(ctx, chat.JID, chat.ReadUpToTS, upper, unreadBatch)
+		batch, err := s.store.UnreadIncoming(ctx, chat.JID, after, upTo, before, unreadBatch)
 		if err != nil {
 			return nil, err
 		}
-		fresh := 0
-		for _, m := range batch {
-			if !seen[m.ID] {
-				seen[m.ID] = true
-				all = append(all, m)
-				fresh++
-			}
-		}
+		all = append(all, batch...)
 		if len(batch) < unreadBatch {
 			return all, nil
 		}
-		upper = batch[len(batch)-1].TS
-		if fresh == 0 {
-			upper--
-		}
+		last := batch[len(batch)-1]
+		before = &store.Mark{TS: last.TS, ID: last.ID}
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -53,6 +54,7 @@ type timing struct {
 	groupGap   time.Duration // minimum gap between group info fetches
 	groupTTL   time.Duration // group info older than this is refreshed
 	groupRetry time.Duration // wait before retrying a failed group info fetch
+	unlink     time.Duration // longest wait for whatsmeow to delete the device after LoggedOut
 }
 
 func defaultTiming() timing {
@@ -64,6 +66,7 @@ func defaultTiming() timing {
 		groupGap:   time.Second,
 		groupTTL:   24 * time.Hour,
 		groupRetry: 10 * time.Minute,
+		unlink:     5 * time.Second,
 	}
 }
 
@@ -206,13 +209,14 @@ func (s *server) isInit() bool {
 }
 
 // handle routes one request. hello and shutdown run inline, everything else asynchronously.
+// Before hello only ping, hello and shutdown are served; any other op is not_initialised.
 func (s *server) handle(req ipc.Request) (stop bool, err error) {
-	if req.Op != "hello" && req.Op != "shutdown" && !s.isInit() {
+	if req.Op != "hello" && req.Op != "shutdown" && req.Op != "ping" && !s.isInit() {
 		return false, s.reply(req.Op, fail(req.ID, api.CodeNotInitialised, "hello must be the first request"))
 	}
 	switch req.Op {
 	case "hello":
-		rep, post := s.hello(req)
+		rep, post := s.safeHello(req)
 		err := s.reply(req.Op, rep)
 		if err == nil && post != nil {
 			post()
@@ -236,8 +240,53 @@ func (s *server) dispatchAsync(req ipc.Request, h handler) {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		_ = s.reply(req.Op, h(s.ctx, req))
+		_ = s.reply(req.Op, s.safely(req, h))
 	}()
+}
+
+// safely runs h and turns a panic into an internal error reply.
+func (s *server) safely(req ipc.Request, h handler) (rep ipc.Reply) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.recovered("op", req.Op, r)
+			rep = fail(req.ID, api.CodeInternal, "internal error")
+		}
+	}()
+	return h(s.ctx, req)
+}
+
+// safeHello is hello with the same panic guard as the async ops.
+func (s *server) safeHello(req ipc.Request) (rep ipc.Reply, post func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.recovered("op", req.Op, r)
+			rep, post = fail(req.ID, api.CodeInternal, "internal error"), nil
+		}
+	}()
+	return s.hello(req)
+}
+
+// recovered reports a recovered panic by its type only, since the panic value could carry message text.
+// kind is "op", "event" or "background"; name is the op, the event type or the goroutine.
+func (s *server) recovered(kind, name string, r any) {
+	ev := s.log.Error().Str("reason", fmt.Sprintf("%T", r))
+	switch kind {
+	case "op":
+		ev = ev.Str("component", kind).Str("op", name)
+	case "event":
+		ev = ev.Str("component", kind).Str("event", name)
+	default:
+		ev = ev.Str("component", kind+"/"+name)
+	}
+	ev.Msg("recovered a panic")
+	s.emitLog(api.EvError, api.ErrorEvent{Code: api.CodeInternal, Message: "an internal error was recovered in " + kind + " code"})
+}
+
+// recoverPanic is deferred at the top of a goroutine that nothing else guards.
+func (s *server) recoverPanic(name string) {
+	if r := recover(); r != nil {
+		s.recovered("background", name, r)
+	}
 }
 
 // drain waits a bounded time for in-flight handlers to write their replies.
@@ -282,9 +331,9 @@ func (s *server) cleanup() {
 
 func (s *server) reply(op string, rep ipc.Reply) error {
 	if rep.OK {
-		s.log.Info().Str("op", op).Bool("ok", true).Msg("request done")
+		s.log.Info().Str("op", op).Msg("request ok")
 	} else if rep.Error != nil {
-		s.log.Info().Str("op", op).Bool("ok", false).Str("code", rep.Error.Code).Msg("request done")
+		s.log.Info().Str("op", op).Str("code", rep.Error.Code).Msg("request failed")
 	}
 	err := s.w.Write(rep)
 	if errors.Is(err, ipc.ErrTooLong) {
@@ -301,7 +350,11 @@ func (s *server) emit(name string, data any) error {
 		return err
 	}
 	if err := s.w.Write(ipc.Event{Event: name, Data: b}); err != nil {
-		s.log.Error().Str("event", name).Msg("event write failed")
+		if errors.Is(err, ipc.ErrTooLong) {
+			s.log.Info().Str("event", name).Msg("event over the frame limit")
+		} else {
+			s.log.Error().Str("event", name).Msg("event write failed")
+		}
 		return err
 	}
 	return nil
@@ -319,6 +372,9 @@ type helloParams struct {
 
 // hello validates the handshake and, on the first call, opens the session and message stores.
 func (s *server) hello(req ipc.Request) (ipc.Reply, func()) {
+	if s.isInit() {
+		return fail(req.ID, api.CodeBadParams, "already initialised"), nil
+	}
 	var p helloParams
 	if !isObject(req.Params) || json.Unmarshal(req.Params, &p) != nil {
 		return fail(req.ID, api.CodeBadParams, "hello params must be an object with protocol, platform, data_dir and state"), nil
@@ -338,14 +394,7 @@ func (s *server) hello(req ipc.Request) (ipc.Reply, func()) {
 	}
 	hasState := len(p.State) > 0 && string(p.State) != "null"
 
-	s.mu.Lock()
-	init, dir := s.initialised, s.dataDir
-	s.mu.Unlock()
-	if init {
-		if dir != filepath.Clean(p.DataDir) {
-			return fail(req.ID, api.CodeBadParams, "hello was already sent with another data_dir"), nil
-		}
-	} else if rep, failed := s.firstHello(req.ID, filepath.Clean(p.DataDir)); failed {
+	if rep, failed := s.firstHello(req.ID, filepath.Clean(p.DataDir)); failed {
 		return rep, nil
 	}
 

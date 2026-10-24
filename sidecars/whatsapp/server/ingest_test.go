@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -553,5 +554,442 @@ func TestUnreadCountsAndKinds(t *testing.T) {
 	h.incoming(c, peerPN, "A2", 1700000200, "two")
 	if chat, _, _ = h.srv.store.GetChat(context.Background(), peerPN); chat.UnreadCount != 2 {
 		t.Fatalf("a redelivery must not double count: %+v", chat)
+	}
+}
+
+const (
+	aliceGrpPN = "14155550111@s.whatsapp.net"
+	aliceGrpLD = "100000000000111@lid"
+	malloryPN  = "14155550666@s.whatsapp.net"
+)
+
+func groupMsg(sender string, id string, ts int64, m *waE2E.Message) *events.Message {
+	e := msgEvent(group, sender, false, id, ts, m)
+	e.Info.PushName = "someone"
+	return e
+}
+
+// storedMsg finds a message by id in the newest 100 of a thread.
+func (h *harness) storedMsg(chat, id string) (map[string]any, bool) {
+	h.t.Helper()
+	rows, _ := h.fetch(chat, 100)
+	for _, r := range rows {
+		if r["id"] == id {
+			return r, true
+		}
+	}
+	return nil, false
+}
+
+func revokeMsg(chatID, targetID string, fromMe bool, participant string) *waE2E.Message {
+	key := &waCommon.MessageKey{ID: ptr(targetID), FromMe: ptr(fromMe), RemoteJID: ptr(chatID)}
+	if participant != "" {
+		key.Participant = ptr(participant)
+	}
+	return &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{Type: waE2E.ProtocolMessage_REVOKE.Enum(), Key: key}}
+}
+
+func editMsg(chatID, targetID string, participant, newText string) *waE2E.Message {
+	key := &waCommon.MessageKey{ID: ptr(targetID), FromMe: ptr(false), RemoteJID: ptr(chatID)}
+	if participant != "" {
+		key.Participant = ptr(participant)
+	}
+	return &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
+		Type:          waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(),
+		Key:           key,
+		EditedMessage: &waE2E.Message{Conversation: ptr(newText)},
+	}}
+}
+
+// Review W2: a second sender reusing a stored message id must not replace the first message.
+func TestReviewMessageIDCollisionOverwritesOtherSendersMessage(t *testing.T) {
+	h, c := startPaired(t, false)
+	if !c.deliver(groupMsg(aliceGrpPN, "COLLIDE1", 1700000100, text("Alice: the meeting is at 5"))) {
+		t.Fatal("refused")
+	}
+	before, ok := h.storedMsg(group, "COLLIDE1")
+	if !ok {
+		t.Fatal("alice message missing")
+	}
+	h.consume("thread")
+	h.consume("message")
+	if !c.deliver(groupMsg(malloryPN, "COLLIDE1", 1700000200, text("Mallory: wire the money to account X"))) {
+		t.Fatal("refused")
+	}
+	after, ok := h.storedMsg(group, "COLLIDE1")
+	if !ok {
+		t.Fatal("message vanished")
+	}
+	if strings.Contains(after["text"].(string), "Mallory") || after["sender"].(map[string]any)["id"] != before["sender"].(map[string]any)["id"] {
+		t.Errorf("Alice's stored message was replaced by Mallory's (same chat, same id): %v", after)
+	}
+	if rows, _ := h.fetch(group, 100); len(rows) != 1 {
+		t.Errorf("the forged duplicate must not be stored as a second row: %d rows", len(rows))
+	}
+	if got := h.pending("message"); len(got) != 0 {
+		t.Errorf("an ignored message must not be reported: %v", got)
+	}
+	if chat, _, _ := h.srv.store.GetChat(context.Background(), group); chat.UnreadCount != 1 || chat.LastPreview != "Alice: the meeting is at 5" {
+		t.Errorf("an ignored message must not touch the chat: %+v", chat)
+	}
+}
+
+// Review W2: in a DM the peer reusing the id of the owner's own message must not rewrite it.
+func TestReviewPeerReusingOwnMessageIDRewritesOwnerMessage(t *testing.T) {
+	h, c := startPaired(t, true, fastTiming)
+	h.incoming(c, peerPN, "P0", 1700000050, "hi") // creates the chat
+	res := h.mustCall("send_text", map[string]any{"thread_id": peerPN, "text": "I will pay you 10 dollars"})
+	own := res["message_id"].(string)
+	before, _ := h.storedMsg(peerPN, own)
+	if !c.deliver(msgEvent(peerPN, peerPN, false, own, 1700000600, text("I will pay you 10000 dollars"))) {
+		t.Fatal("refused")
+	}
+	after, _ := h.storedMsg(peerPN, own)
+	if after["text"] != before["text"] || after["sender"].(map[string]any)["is_me"] != true {
+		t.Errorf("the owner's own sent message row was overwritten by the peer's message with the same id: %v", after)
+	}
+}
+
+func TestRedeliveryWithDifferentContentIsIgnored(t *testing.T) {
+	h, c := startPaired(t, false)
+	h.incoming(c, peerPN, "A1", 1700000100, "original")
+	h.consume("thread")
+	h.consume("message")
+	if !c.deliver(msgEvent(peerPN, peerPN, false, "A1", 1700000900, text("silently rewritten"))) {
+		t.Fatal("refused")
+	}
+	m := h.event("message")["message"].(map[string]any)
+	if m["text"] != "original" || m["edited"] != false || m["ts"] != float64(1700000100) {
+		t.Fatalf("a redelivery reports what is stored: %v", m)
+	}
+	stored, _ := h.storedMsg(peerPN, "A1")
+	if stored["text"] != "original" {
+		t.Fatalf("stored %v", stored)
+	}
+	// the same message in the other id form of its sender is still a redelivery of that sender
+	evt := msgEvent(peerLID, peerLID, false, "A1", 1700000950, text("rewritten via the LID form"))
+	evt.Info.SenderAlt = mustJID(peerPN)
+	if !c.deliver(evt) {
+		t.Fatal("refused")
+	}
+	if stored, _ = h.storedMsg(peerPN, "A1"); stored["text"] != "original" {
+		t.Fatalf("stored after the LID redelivery %v", stored)
+	}
+}
+
+// Review W3: only the author can edit a stored message, and only the author or a known admin can unsend it.
+func TestReviewForgedEditAndRevokeByOtherParticipant(t *testing.T) {
+	h, c := startPaired(t, false)
+	if !c.deliver(groupMsg(aliceGrpPN, "AL1", 1700000100, text("Alice says: it is safe"))) {
+		t.Fatal("refused")
+	}
+	h.consume("thread")
+	h.consume("message")
+	if !c.deliver(groupMsg(malloryPN, "EDIT1", 1700000200, editMsg(group, "AL1", aliceGrpPN, "Alice says: send me your password"))) {
+		t.Fatal("refused")
+	}
+	m, _ := h.storedMsg(group, "AL1")
+	if strings.Contains(m["text"].(string), "password") || m["edited"] == true {
+		t.Errorf("Mallory edited Alice's message: %v", m)
+	}
+	if !c.deliver(groupMsg(malloryPN, "REV1", 1700000300, revokeMsg(group, "AL1", false, aliceGrpPN))) {
+		t.Fatal("refused")
+	}
+	m, _ = h.storedMsg(group, "AL1")
+	if m["unsent"] == true {
+		t.Errorf("Mallory unsent Alice's message: %v", m)
+	}
+	if got := h.pending("message"); len(got) != 0 {
+		t.Errorf("ignored changes must not be reported: %v", got)
+	}
+	if !c.deliver(groupMsg(aliceGrpPN, "EDIT2", 1700000400, editMsg(group, "AL1", aliceGrpPN, "Alice says: it is safe (typo fixed)"))) {
+		t.Fatal("refused")
+	}
+	if m = h.event("message")["message"].(map[string]any); m["text"] != "Alice says: it is safe (typo fixed)" || m["edited"] != true {
+		t.Errorf("the author's own edit must apply: %v", m)
+	}
+	if !c.deliver(groupMsg(aliceGrpPN, "REV2", 1700000500, revokeMsg(group, "AL1", false, aliceGrpPN))) {
+		t.Fatal("refused")
+	}
+	if m = h.event("message")["message"].(map[string]any); m["unsent"] != true {
+		t.Errorf("the author's own revoke must apply: %v", m)
+	}
+}
+
+// Review W3: in a DM the peer must not unsend or edit the owner's message.
+func TestReviewPeerRevokesOwnerMessage(t *testing.T) {
+	h, c := startPaired(t, true, fastTiming)
+	h.incoming(c, peerPN, "P0", 1700000050, "hi")
+	res := h.mustCall("send_text", map[string]any{"thread_id": peerPN, "text": "my promise"})
+	own := res["message_id"].(string)
+	if !c.deliver(msgEvent(peerPN, peerPN, false, "R2", 1700000700, revokeMsg(peerPN, own, false, ""))) {
+		t.Fatal("refused")
+	}
+	if !c.deliver(msgEvent(peerPN, peerPN, false, "E2", 1700000710, editMsg(peerPN, own, "", "my promise is void"))) {
+		t.Fatal("refused")
+	}
+	m, _ := h.storedMsg(peerPN, own)
+	if m["unsent"] == true || m["text"] != "my promise" || m["edited"] == true {
+		t.Errorf("peer changed the owner's sent message in the local store: %v", m)
+	}
+}
+
+func TestOwnEditAndRevokeFromAnotherDeviceStillApply(t *testing.T) {
+	h, c := startPaired(t, true, fastTiming)
+	h.incoming(c, peerPN, "P0", 1700000050, "hi")
+	own := h.mustCall("send_text", map[string]any{"thread_id": peerPN, "text": "first draft"})["message_id"].(string)
+	h.consume("thread")
+	h.consume("message")
+	if !c.deliver(msgEvent(peerPN, selfLID, true, "OE1", 1700000600, editMsg(peerPN, own, "", "second draft"))) {
+		t.Fatal("refused")
+	}
+	if m := h.event("message")["message"].(map[string]any); m["text"] != "second draft" || m["edited"] != true {
+		t.Fatalf("owner edit %v", m)
+	}
+	if !c.deliver(msgEvent(peerPN, selfLID, true, "OR1", 1700000700, revokeMsg(peerPN, own, true, ""))) {
+		t.Fatal("refused")
+	}
+	if m := h.event("message")["message"].(map[string]any); m["unsent"] != true {
+		t.Fatalf("owner revoke %v", m)
+	}
+}
+
+func TestEditFromTheSamePersonInAnotherIDFormApplies(t *testing.T) {
+	h, c := startPaired(t, false)
+	if !c.deliver(groupMsg(aliceGrpLD, "L1", 1700000100, text("from a LID"))) {
+		t.Fatal("refused")
+	}
+	h.consume("thread")
+	h.consume("message")
+	evt := groupMsg(aliceGrpLD, "E1", 1700000200, editMsg(group, "L1", "", "from a LID, edited"))
+	evt.Info.SenderAlt = mustJID(aliceGrpPN)
+	if !c.deliver(evt) {
+		t.Fatal("refused")
+	}
+	if m := h.event("message")["message"].(map[string]any); m["text"] != "from a LID, edited" {
+		t.Fatalf("edit %v", m)
+	}
+}
+
+func joinGroup(t *testing.T, h *harness, c *fakeClient, admins ...string) {
+	t.Helper()
+	parts := []types.GroupParticipant{{JID: mustJID(selfPN)}}
+	for _, p := range []string{aliceGrpPN, malloryPN} {
+		gp := types.GroupParticipant{JID: mustJID(p)}
+		for _, a := range admins {
+			gp.IsAdmin = gp.IsAdmin || a == p
+		}
+		parts = append(parts, gp)
+	}
+	if !c.deliver(&events.JoinedGroup{GroupInfo: types.GroupInfo{JID: mustJID(group), GroupName: types.GroupName{Name: "Crew"}, Participants: parts}}) {
+		t.Fatal("refused")
+	}
+	h.consume("thread")
+}
+
+func TestGroupAdminMayRevokeButNotEdit(t *testing.T) {
+	h, c := startPaired(t, false)
+	joinGroup(t, h, c, aliceGrpPN)
+	if chat, _, _ := h.srv.store.GetChat(context.Background(), group); !chat.HasAdmin(aliceGrpPN) || chat.HasAdmin(malloryPN) {
+		t.Fatalf("admins %v", chat.Admins)
+	}
+	c.deliver(groupMsg(malloryPN, "M1", 1700000100, text("spam")))
+	c.deliver(groupMsg(aliceGrpPN, "A1", 1700000110, text("announcement")))
+	h.consume("message")
+
+	c.deliver(groupMsg(aliceGrpPN, "AE", 1700000200, editMsg(group, "M1", malloryPN, "an admin may not edit")))
+	if m, _ := h.storedMsg(group, "M1"); m["text"] != "spam" || m["edited"] == true {
+		t.Fatalf("an admin edited another member's message: %v", m)
+	}
+	c.deliver(groupMsg(malloryPN, "MR", 1700000210, revokeMsg(group, "A1", false, aliceGrpPN)))
+	if m, _ := h.storedMsg(group, "A1"); m["unsent"] == true {
+		t.Fatalf("a plain member unsent an admin's message: %v", m)
+	}
+	if got := h.pending("message"); len(got) != 0 {
+		t.Fatalf("ignored changes were reported: %v", got)
+	}
+
+	c.deliver(groupMsg(aliceGrpPN, "AR", 1700000300, revokeMsg(group, "M1", false, malloryPN)))
+	if m := h.event("message")["message"].(map[string]any); m["id"] != "M1" || m["unsent"] != true {
+		t.Fatalf("admin revoke %v", m)
+	}
+
+	// promotion and demotion events change who may unsend, without a group info fetch
+	c.deliver(&events.GroupInfo{JID: mustJID(group), Promote: []types.JID{mustJID(malloryPN)}})
+	c.deliver(groupMsg(malloryPN, "MR2", 1700000400, revokeMsg(group, "A1", false, aliceGrpPN)))
+	if m := h.event("message")["message"].(map[string]any); m["id"] != "A1" || m["unsent"] != true {
+		t.Fatalf("revoke by a promoted member %v", m)
+	}
+	c.deliver(&events.GroupInfo{JID: mustJID(group), Demote: []types.JID{mustJID(malloryPN)}})
+	c.deliver(groupMsg(aliceGrpPN, "A2", 1700000500, text("second announcement")))
+	h.consume("message")
+	c.deliver(groupMsg(malloryPN, "MR3", 1700000600, revokeMsg(group, "A2", false, aliceGrpPN)))
+	if m, _ := h.storedMsg(group, "A2"); m["unsent"] == true {
+		t.Fatalf("revoke by a demoted member %v", m)
+	}
+}
+
+func TestUnknownGroupAdminsMeanNoAdminRevoke(t *testing.T) {
+	h, c := startPaired(t, false)
+	c.deliver(groupMsg(malloryPN, "M1", 1700000100, text("hello")))
+	h.consume("thread")
+	h.consume("message")
+	c.deliver(groupMsg(aliceGrpPN, "AR", 1700000200, revokeMsg(group, "M1", false, malloryPN)))
+	if m, _ := h.storedMsg(group, "M1"); m["unsent"] == true {
+		t.Fatalf("a revoke from a sender not known to be an admin was applied: %v", m)
+	}
+}
+
+func TestGroupInfoFetchRecordsAdmins(t *testing.T) {
+	h, c := startPaired(t, false, withTiming(func(*timing) {}))
+	c.groupInfo = &types.GroupInfo{
+		JID: mustJID(group), GroupName: types.GroupName{Name: "Team"},
+		Participants: []types.GroupParticipant{
+			{JID: mustJID(aliceGrpLD), PhoneNumber: mustJID(aliceGrpPN), IsSuperAdmin: true},
+			{JID: mustJID(malloryPN)},
+		},
+	}
+	c.deliver(groupMsg(malloryPN, "M1", 1700000100, text("hello")))
+	<-c.groupCall
+	eventually(t, "admins stored", func() bool {
+		chat, _, _ := h.srv.store.GetChat(context.Background(), group)
+		return chat.HasAdmin(aliceGrpPN) && chat.HasAdmin(aliceGrpLD) && !chat.HasAdmin(malloryPN)
+	})
+}
+
+func TestHistoryRevokeFromAnotherSenderIsIgnored(t *testing.T) {
+	h, c := startPaired(t, false)
+	revoke := func(id, by string) *waHistorySync.HistorySyncMsg {
+		return &waHistorySync.HistorySyncMsg{Message: &waWeb.WebMessageInfo{
+			Key:              &waCommon.MessageKey{RemoteJID: ptr(group), FromMe: ptr(false), ID: ptr(id), Participant: ptr(by)},
+			Message:          revokeMsg(group, "H1", false, aliceGrpPN),
+			MessageTimestamp: ptr(uint64(1700000300)),
+		}}
+	}
+	orig := webMsg(group, "H1", 1700000100, false, "kept")
+	orig.Message.Key.Participant = ptr(aliceGrpPN)
+	conv := &waHistorySync.Conversation{ID: ptr(group), Messages: []*waHistorySync.HistorySyncMsg{orig, revoke("R1", malloryPN)}}
+	if !c.deliver(historyEvent(waHistorySync.HistorySync_RECENT, "", conv)) {
+		t.Fatal("refused")
+	}
+	if m, _ := h.storedMsg(group, "H1"); m["unsent"] == true || m["text"] != "kept" {
+		t.Fatalf("a history revoke from another sender was applied: %v", m)
+	}
+	conv = &waHistorySync.Conversation{ID: ptr(group), Messages: []*waHistorySync.HistorySyncMsg{revoke("R2", aliceGrpPN)}}
+	if !c.deliver(historyEvent(waHistorySync.HistorySync_RECENT, "", conv)) {
+		t.Fatal("refused")
+	}
+	if m, _ := h.storedMsg(group, "H1"); m["unsent"] != true {
+		t.Fatalf("the author's history revoke must apply: %v", m)
+	}
+}
+
+func TestHistoryCopyFromAnotherSenderIsIgnored(t *testing.T) {
+	h, c := startPaired(t, false)
+	c.deliver(groupMsg(aliceGrpPN, "G1", 1700000100, text("Alice: real")))
+	h.consume("thread")
+	h.consume("message")
+	forged := webMsg(group, "G1", 1700000150, false, "Mallory: forged")
+	forged.Message.Key.Participant = ptr(malloryPN)
+	forged.Message.Reactions = []*waWeb.Reaction{{Key: &waCommon.MessageKey{FromMe: ptr(false), Participant: ptr(malloryPN)}, Text: ptr("💣")}}
+	conv := &waHistorySync.Conversation{ID: ptr(group), Messages: []*waHistorySync.HistorySyncMsg{forged}}
+	if !c.deliver(historyEvent(waHistorySync.HistorySync_RECENT, "", conv)) {
+		t.Fatal("refused")
+	}
+	m, _, _ := h.srv.store.GetMessage(context.Background(), group, "G1")
+	if m.Text == nil || *m.Text != "Alice: real" || m.Sender != aliceGrpPN || len(m.Reactions) != 0 {
+		t.Fatalf("the forged history copy changed the stored message: %+v", m)
+	}
+	for _, ev := range h.pending("history") {
+		if len(ev["messages"].([]any)) != 0 {
+			t.Fatalf("the forged copy was reported: %v", ev)
+		}
+	}
+}
+
+func TestEncryptedEditFromAnotherSenderIsIgnored(t *testing.T) {
+	h, c := startPaired(t, false)
+	c.deliver(groupMsg(aliceGrpPN, "A1", 1700000100, text("original")))
+	h.consume("thread")
+	h.consume("message")
+	c.decSecret = func(*events.Message) (*waE2E.Message, error) { return text("rewritten"), nil }
+	secret := &waE2E.Message{SecretEncryptedMessage: &waE2E.SecretEncryptedMessage{TargetMessageKey: &waCommon.MessageKey{ID: ptr("A1")}}}
+	c.deliver(groupMsg(malloryPN, "S1", 1700000200, secret))
+	if m, _ := h.storedMsg(group, "A1"); m["text"] != "original" {
+		t.Fatalf("an encrypted edit from another sender was applied: %v", m)
+	}
+	c.deliver(groupMsg(aliceGrpPN, "S2", 1700000300, secret))
+	if m := h.event("message")["message"].(map[string]any); m["text"] != "rewritten" || m["edited"] != true {
+		t.Fatalf("the author's encrypted edit must apply: %v", m)
+	}
+}
+
+// Review L5: after a LID chat merges into the phone-number chat the daemon needs a thread event for the new id.
+func TestReviewLIDMergeEmitsNoThreadEvent(t *testing.T) {
+	h, c := startPaired(t, false)
+	if !c.deliver(msgEvent(peerLID, peerLID, false, "L1", 1700000100, text("first as LID"))) {
+		t.Fatal("refused")
+	}
+	h.consume("thread")
+	h.consume("message")
+	evt := msgEvent(peerLID, peerLID, false, "L2", 1700000200, text("second, now with PN known"))
+	evt.Info.SenderAlt = mustJID(peerPN)
+	if !c.deliver(evt) {
+		t.Fatal("refused")
+	}
+	ths, msgs := h.pending("thread"), h.pending("message")
+	if len(ths) != 1 || len(msgs) != 1 {
+		t.Fatalf("want one thread and one message event, got %d and %d", len(ths), len(msgs))
+	}
+	th := ths[0]["thread"].(map[string]any)
+	if th["id"] != peerPN || th["alt_id"] != peerLID || msgs[0]["message"].(map[string]any)["thread_id"] != peerPN {
+		t.Errorf("thread id moved from the LID form to the PN form but the event says %v", th)
+	}
+}
+
+func TestReadSelfReceiptMovesTheReadMark(t *testing.T) {
+	h, c := startPaired(t, false)
+	h.incoming(c, peerPN, "A1", 1700000100, "one")
+	h.incoming(c, peerPN, "A2", 1700000100, "two")
+	h.incoming(c, peerPN, "A3", 1700000200, "three")
+	src := types.MessageSource{Chat: mustJID(peerPN), Sender: mustJID(selfPN), IsFromMe: true}
+	c.deliver(&events.Receipt{MessageSource: src, MessageIDs: []string{"A1", "A2"}, Timestamp: time.Unix(1700000900, 0), Type: types.ReceiptTypeReadSelf})
+	chat, _, _ := h.srv.store.GetChat(context.Background(), peerPN)
+	if chat.ReadUpToTS != 1700000100 || chat.ReadUpToID != "A2" || chat.UnreadCount != 0 {
+		t.Fatalf("read mark after a read on another device: %+v", chat)
+	}
+	h.incoming(c, peerPN, "A9", 1700000100, "arrives later in the same second")
+	if chat, _, _ = h.srv.store.GetChat(context.Background(), peerPN); chat.UnreadCount != 1 {
+		t.Fatalf("a later message in the same second with a larger id is unread: %+v", chat)
+	}
+	h.incoming(c, peerPN, "A4", 1700000300, "newer")
+	if chat, _, _ = h.srv.store.GetChat(context.Background(), peerPN); chat.UnreadCount != 2 {
+		t.Fatalf("unread %d", chat.UnreadCount)
+	}
+}
+
+func TestIgnoredChangeIsLoggedWithIDsOnly(t *testing.T) {
+	f, c := pairedFactory(false)
+	h, logs := startServerLogged(t, f)
+	h.mustHello()
+	c.deliver(groupMsg(aliceGrpPN, "AL1", 1700000100, text("Alice says: it is safe")))
+	c.deliver(groupMsg(malloryPN, "E1", 1700000200, editMsg(group, "AL1", aliceGrpPN, "forged SECRETTEXT")))
+	c.deliver(groupMsg(malloryPN, "R1", 1700000300, revokeMsg(group, "AL1", false, aliceGrpPN)))
+	c.deliver(groupMsg(malloryPN, "AL1", 1700000400, text("duplicate id SECRETTEXT")))
+	h.sync()
+	out := logs.String()
+	for _, want := range []string{
+		`"level":"info","op":"edit","thread":"` + group + `","id":"AL1"`,
+		`"level":"info","op":"revoke","thread":"` + group + `","id":"AL1"`,
+		`"level":"info","thread":"` + group + `","id":"AL1"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("log lacks %s:\n%s", want, out)
+		}
+	}
+	for _, leak := range []string{"SECRETTEXT", "forged", "14155550111", "14155550666", "Alice says"} {
+		if strings.Contains(out, leak) {
+			t.Fatalf("the log leaks %q:\n%s", leak, out)
+		}
 	}
 }

@@ -72,12 +72,12 @@ func Open(ctx context.Context, dataDir string, log zerolog.Logger) (*Session, er
 }
 
 func (s *Session) openDB(ctx context.Context) error {
-	u := url.URL{Scheme: "file", Path: s.dbPath, RawQuery: "_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"}
+	u := url.URL{Scheme: "file", Path: s.dbPath, RawQuery: "_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=secure_delete(1)"}
 	db, err := sql.Open("sqlite", u.String())
 	if err != nil {
 		return fmt.Errorf("wa: open session db: %w", err)
 	}
-	wmLog := waLog.Zerolog(s.log.With().Str("mod", "whatsmeow").Logger())
+	wmLog := waLog.Zerolog(s.log.With().Str("component", "whatsmeow").Logger())
 	container := sqlstore.NewWithDB(db, "sqlite3", wmLog)
 	if err := container.Upgrade(ctx); err != nil {
 		_ = db.Close()
@@ -112,14 +112,14 @@ func (s *Session) NewClient(ctx context.Context, opts *LoginOptions) (Client, er
 	if opts != nil && dev.ID == nil {
 		applyLoginOptions(opts)
 	}
-	cli := whatsmeow.NewClient(dev, waLog.Zerolog(s.log.With().Str("mod", "client").Logger()))
+	cli := whatsmeow.NewClient(dev, waLog.Zerolog(s.log.With().Str("component", "client").Logger()))
 	cli.SynchronousAck = true
 	cli.EnableDecryptedEventBuffer = true
 	cli.AutomaticMessageRerequestFromPhone = true
 	cli.EnableAutoReconnect = true
 	cli.InitialAutoReconnect = true
 	s.chmodDB()
-	return newReal(cli), nil
+	return newReal(cli, s.Scrub), nil
 }
 
 func applyLoginOptions(opts *LoginOptions) {
@@ -151,6 +151,31 @@ func (s *Session) RefreshVersion(ctx context.Context) {
 		}
 		store.SetWAVersion(*ver)
 	})
+}
+
+// Scrub clears whatsmeow_lid_map and whatsmeow_privacy_tokens, which no device row owns, then
+// checkpoints the WAL and rewrites session.db so a deleted device leaves no key bytes in free pages.
+func (s *Session) Scrub(ctx context.Context) error {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("wa: scrub: %w", err)
+	}
+	defer conn.Close()
+	for _, q := range []string{
+		"PRAGMA secure_delete = ON",
+		"PRAGMA temp_store = MEMORY",
+		"DELETE FROM whatsmeow_lid_map",
+		"DELETE FROM whatsmeow_privacy_tokens",
+		"PRAGMA wal_checkpoint(TRUNCATE)",
+		"VACUUM",
+		"PRAGMA wal_checkpoint(TRUNCATE)",
+	} {
+		if _, err := conn.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("wa: scrub: %w", err)
+		}
+	}
+	s.chmodDB()
+	return nil
 }
 
 // Close closes session.db and releases the lock; it disconnects nothing.

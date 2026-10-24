@@ -11,6 +11,7 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 
 	"github.com/matpb/meta-mcp-rs/sidecars/whatsapp/api"
+	"github.com/matpb/meta-mcp-rs/sidecars/whatsapp/wa"
 )
 
 func TestConnectedSendsUnavailablePresenceAndEmitsConnected(t *testing.T) {
@@ -168,9 +169,12 @@ func TestFatalEventsBlockSending(t *testing.T) {
 					t.Fatalf("state_updated %v", st)
 				}
 				eventually(t, "fresh client", func() bool { return h.f.clientCount() == 2 })
-				if res := h.mustHello(); res["logged_in"] != false {
-					t.Fatalf("hello after logout %v", res)
-				}
+				h.wantErr(h.call("connect", nil), api.CodeNotLoggedIn)
+				eventually(t, "session database wipe", func() bool {
+					h.f.mu.Lock()
+					defer h.f.mu.Unlock()
+					return h.f.scrubs == 1
+				})
 			}
 		})
 	}
@@ -219,5 +223,131 @@ func TestStaleClientEventsAreIgnored(t *testing.T) {
 	}
 	if h.srv.blockedReason() != "" {
 		t.Fatal("stale fatal event blocked sending")
+	}
+}
+
+func TestConnectIsRefusedWhileBlocked(t *testing.T) {
+	h, c := startPaired(t, false)
+	if !c.deliver(&events.TemporaryBan{Code: events.TempBanSentToTooManyPeople}) {
+		t.Fatal("refused")
+	}
+	h.consume("connection")
+	rep := h.call("connect", nil)
+	h.wantErr(rep, api.CodeNotConnected)
+	for _, want := range []string{"temporary_ban", "restart the sidecar"} {
+		if !strings.Contains(rep.Error.Message, want) {
+			t.Fatalf("the refusal must say %q: %q", want, rep.Error.Message)
+		}
+	}
+	c.mu.Lock()
+	connects := c.connects
+	c.mu.Unlock()
+	if connects != 0 || h.f.refreshes != 0 {
+		t.Fatalf("a blocked account must not dial: connects %d refreshes %d", connects, h.f.refreshes)
+	}
+	if got := h.pending("connection"); len(got) != 0 {
+		t.Fatalf("a refused connect reports nothing: %v", got)
+	}
+}
+
+func TestConnectIsRefusedWhileBlockedEvenOnALiveConnection(t *testing.T) {
+	h, c := startPaired(t, true)
+	c.deliver(&events.NotifyAccountReachoutTimelock{IsActive: true})
+	h.wantErr(h.call("connect", nil), api.CodeNotConnected)
+}
+
+func TestConnectFailure409IsFatalStreamReplaced(t *testing.T) {
+	h, c := startPaired(t, true)
+	h.incoming(c, peerPN, "A1", 1700000100, "hi")
+	h.consume("thread")
+	h.consume("message")
+	if !c.deliver(&events.ConnectFailure{Reason: events.ConnectFailureBadUserAgent}) {
+		t.Fatal("refused")
+	}
+	if ev := h.event("connection"); ev["state"] != "fatal" || ev["reason"] != "stream_replaced" || ev["action"] != "none" {
+		t.Fatalf("connection %v", ev)
+	}
+	h.wantErr(h.call("send_text", map[string]any{"thread_id": peerPN, "text": "x"}), api.CodeSendingBlocked)
+	h.wantErr(h.call("connect", nil), api.CodeNotConnected)
+
+	h2, c2 := startPaired(t, true)
+	c2.deliver(&events.ConnectFailure{Reason: events.ConnectFailureClientUnknown})
+	if ev := h2.event("connection"); ev["state"] != "disconnected" || ev["reason"] != "connect_failure_418" || ev["action"] != "retry" {
+		t.Fatalf("other connect failures stay retryable: %v", ev)
+	}
+	if h2.srv.blockedReason() != "" {
+		t.Fatal("a retryable failure must not block")
+	}
+}
+
+func TestFatalSignalEndsTheWishToBeConnected(t *testing.T) {
+	h, c := startPaired(t, false)
+	h.mustCall("connect", nil)
+	h.consume("connection")
+	c.deliver(&events.StreamReplaced{})
+	if ev := h.event("connection"); ev["state"] != "fatal" {
+		t.Fatalf("connection %v", ev)
+	}
+	c.deliver(&events.Disconnected{})
+	if got := h.pending("connection"); len(got) != 0 {
+		t.Fatalf("the socket closing after a fatal signal must not read as a retryable drop: %v", got)
+	}
+	if h.srv.wantsConn() {
+		t.Fatal("a fatal signal ends the wish to be connected")
+	}
+}
+
+func TestReachoutTimelockKeepsTheConnectionWanted(t *testing.T) {
+	h, c := startPaired(t, false)
+	h.mustCall("connect", nil)
+	h.consume("connection")
+	c.deliver(&events.NotifyAccountReachoutTimelock{IsActive: true})
+	if ev := h.event("connection"); ev["reason"] != "reachout_timelock" {
+		t.Fatalf("connection %v", ev)
+	}
+	c.deliver(&events.Disconnected{})
+	if ev := h.event("connection"); ev["state"] != "disconnected" || ev["reason"] != "network" {
+		t.Fatalf("a real drop after the time-lock is still reported: %v", ev)
+	}
+}
+
+func TestUnlinkWipeWaitsForTheDeviceRecordToGo(t *testing.T) {
+	h, c := startPaired(t, true)
+	// whatsmeow announces LoggedOut before it has deleted the device record, so the event is not routed through deliver
+	if !h.srv.handleEvent(c, &events.LoggedOut{OnConnect: true, Reason: events.ConnectFailureLoggedOut}) {
+		t.Fatal("refused")
+	}
+	time.Sleep(100 * time.Millisecond)
+	h.f.mu.Lock()
+	early := h.f.scrubs
+	h.f.mu.Unlock()
+	if early != 0 || h.f.clientCount() != 1 {
+		t.Fatalf("nothing is wiped while the device record exists: scrubs %d clients %d", early, h.f.clientCount())
+	}
+	c.mu.Lock()
+	c.hasDevice = false
+	c.mu.Unlock()
+	eventually(t, "wipe and fresh client", func() bool {
+		h.f.mu.Lock()
+		defer h.f.mu.Unlock()
+		return h.f.scrubs == 1 && len(h.f.clients) == 2
+	})
+}
+
+func TestUnlinkWipeLeavesAClientThatTookOverAlone(t *testing.T) {
+	h, c := startPaired(t, true)
+	if !h.srv.handleEvent(c, &events.LoggedOut{OnConnect: true, Reason: events.ConnectFailureLoggedOut}) {
+		t.Fatal("refused")
+	}
+	other := newFakeClient() // a login_start replaced the client while the library was still deleting the device
+	h.srv.setClient(other)
+	c.mu.Lock()
+	c.hasDevice = false
+	c.mu.Unlock()
+	waitTimeout(&h.srv.bg, 3*time.Second)
+	h.f.mu.Lock()
+	defer h.f.mu.Unlock()
+	if h.f.scrubs != 0 || len(h.f.clients) != 1 || h.srv.cur() != wa.Client(other) {
+		t.Fatalf("a client that took over must be left alone: scrubs %d clients %d", h.f.scrubs, len(h.f.clients))
 	}
 }

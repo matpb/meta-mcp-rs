@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -72,6 +73,16 @@ func (s *server) canon(ctx context.Context, cl wa.Client, jid, alt types.JID) (s
 		if err := s.store.MergeChat(ctx, altID, id); err != nil {
 			return "", "", err
 		}
+		// the daemon still knows the chat by its LID id; tell it the thread moved to the phone-number id
+		merged, ok, err := s.store.GetChat(ctx, id)
+		if err != nil {
+			return "", "", err
+		}
+		if ok {
+			if err := s.emit(api.EvThread, api.ThreadEvent{Thread: merged.API()}); err != nil {
+				return "", "", err
+			}
+		}
 	}
 	return id, altID, nil
 }
@@ -100,6 +111,11 @@ func (o origin) direction() string {
 		return "out"
 	}
 	return "in"
+}
+
+// senderForms lists the ids the sender of an event goes by.
+func (o origin) senderForms() []string {
+	return []string{o.senderID, o.senderAlt, o.info.Sender.ToNonAD().String()}
 }
 
 // originOf canonicalises the chat and sender of info; chatID and chatAlt are used when already known.
@@ -291,8 +307,13 @@ func (s *server) liveMessage(ctx context.Context, cl wa.Client, o origin, conten
 		return err
 	}
 	m := s.msgFrom(o, chat.JID, content)
-	if _, err := s.store.PutMessage(ctx, m, true); err != nil {
+	res, err := s.store.PutMessage(ctx, m, true)
+	if err != nil {
 		return err
+	}
+	if res == store.PutConflict {
+		s.log.Info().Str("thread", chat.JID).Str("id", m.ID).Msg("ignored a message that reuses a stored id")
+		return nil
 	}
 	if created {
 		if chat, _, err = s.store.GetChat(ctx, chat.JID); err != nil {
@@ -316,6 +337,20 @@ func (s *server) liveMessage(ctx context.Context, cl wa.Client, o origin, conten
 	return nil
 }
 
+// mayChange reports whether the sender of o may edit or revoke the stored message m of chat.
+// Only the author may edit; a revoke also comes from a known admin of the group.
+func mayChange(chat store.Chat, m store.Msg, o origin, revoke bool) bool {
+	if m.WrittenBy(o.info.IsFromMe, o.senderForms()...) {
+		return true
+	}
+	return revoke && chat.Kind == api.KindGroup && chat.HasAdmin(o.senderForms()...)
+}
+
+// ignoredChange logs, with ids only, an edit or revoke that its sender had no right to make.
+func (s *server) ignoredChange(op string, chat store.Chat, target string) {
+	s.log.Info().Str("op", op).Str("thread", chat.JID).Str("id", target).Msg("ignored a change from a sender that does not own the message")
+}
+
 func (s *server) applyEdit(ctx context.Context, cl wa.Client, o origin, target string, content *waE2E.Message) error {
 	chat, found, err := s.store.GetChat(ctx, o.chatID)
 	if err != nil || !found || content == nil {
@@ -323,16 +358,36 @@ func (s *server) applyEdit(ctx context.Context, cl wa.Client, o origin, target s
 	}
 	c := normalize.Extract(content)
 	raw, _ := proto.Marshal(content)
-	m, found, err := s.store.UpdateMessage(ctx, chat.JID, target, func(m *store.Msg) {
+	m, res, err := s.store.UpdateMessageIf(ctx, chat.JID, target, func(m store.Msg) bool { return mayChange(chat, m, o, false) }, func(m *store.Msg) {
 		m.Kind, m.Text, m.Attachments, m.Raw, m.Edited = c.Kind, c.Text, c.Attachments, raw, true
 		if c.ReplyTo != nil {
 			m.ReplyTo = c.ReplyTo
 		}
 	})
-	if err != nil || !found {
+	if err != nil {
 		return err
 	}
+	if res == store.UpdateDenied {
+		s.ignoredChange("edit", chat, target)
+	}
+	if res != store.UpdateDone {
+		return nil
+	}
 	return s.emit(api.EvMessage, api.MessageEvent{Message: m.API(), Direction: o.direction()})
+}
+
+// revoke unsends the target message when the sender of o may; it reports whether the row changed.
+func (s *server) revoke(ctx context.Context, chat store.Chat, o origin, target string) (store.Msg, bool, error) {
+	m, res, err := s.store.UpdateMessageIf(ctx, chat.JID, target, func(m store.Msg) bool { return mayChange(chat, m, o, true) }, func(m *store.Msg) {
+		m.Unsent, m.Text, m.Attachments, m.Raw = true, nil, []api.Attachment{}, nil
+	})
+	if err != nil {
+		return store.Msg{}, false, err
+	}
+	if res == store.UpdateDenied {
+		s.ignoredChange("revoke", chat, target)
+	}
+	return m, res == store.UpdateDone, nil
 }
 
 func (s *server) applyRevoke(ctx context.Context, cl wa.Client, o origin, target string) error {
@@ -340,10 +395,8 @@ func (s *server) applyRevoke(ctx context.Context, cl wa.Client, o origin, target
 	if err != nil || !found {
 		return err
 	}
-	m, found, err := s.store.UpdateMessage(ctx, chat.JID, target, func(m *store.Msg) {
-		m.Unsent, m.Text, m.Attachments, m.Raw = true, nil, []api.Attachment{}, nil
-	})
-	if err != nil || !found {
+	m, changed, err := s.revoke(ctx, chat, o, target)
+	if err != nil || !changed {
 		return err
 	}
 	return s.emit(api.EvMessage, api.MessageEvent{Message: m.API(), Direction: o.direction()})
@@ -395,21 +448,21 @@ func (s *server) onReceipt(ctx context.Context, cl wa.Client, e *events.Receipt)
 	if err != nil || !found {
 		return err
 	}
-	var upTo int64
+	var newest store.Mark
 	for _, id := range e.MessageIDs {
 		m, ok, err := s.store.GetMessage(ctx, chat.JID, id)
 		if err != nil {
 			return err
 		}
-		if ok && m.TS > upTo {
-			upTo = m.TS
+		if mark := (store.Mark{TS: m.TS, ID: m.ID}); ok && mark.After(newest) {
+			newest = mark
 		}
 	}
 	if kind == "read-self" {
 		upd, _, err := s.store.UpdateChat(ctx, chat.JID, func(c *store.Chat) {
 			c.UnreadCount = 0
-			if upTo > c.ReadUpToTS {
-				c.ReadUpToTS = upTo
+			if newest.After(store.Mark{TS: c.ReadUpToTS, ID: c.ReadUpToID}) {
+				c.ReadUpToTS, c.ReadUpToID = newest.TS, newest.ID
 			}
 		})
 		if err != nil {
@@ -417,6 +470,7 @@ func (s *server) onReceipt(ctx context.Context, cl wa.Client, e *events.Receipt)
 		}
 		return s.emit(api.EvThread, api.ThreadEvent{Thread: upd.API()})
 	}
+	upTo := newest.TS
 	if upTo == 0 {
 		upTo = e.Timestamp.Unix()
 	}
@@ -557,7 +611,7 @@ func (s *server) onJoinedGroup(ctx context.Context, cl wa.Client, e *events.Join
 	if err != nil {
 		return err
 	}
-	parts, err := s.participantsOf(ctx, cl, &e.GroupInfo)
+	parts, admins, err := s.participantsOf(ctx, cl, &e.GroupInfo)
 	if err != nil {
 		return err
 	}
@@ -565,7 +619,7 @@ func (s *server) onJoinedGroup(ctx context.Context, cl wa.Client, e *events.Join
 		if e.Name != "" {
 			c.Name = e.Name
 		}
-		c.Participants, c.GroupInfoAt = parts, time.Now().Unix()
+		c.Participants, c.GroupInfoAt, c.Admins = parts, time.Now().Unix(), admins
 	})
 	if err != nil {
 		return err
@@ -574,9 +628,18 @@ func (s *server) onJoinedGroup(ctx context.Context, cl wa.Client, e *events.Join
 }
 
 func (s *server) onGroupInfo(ctx context.Context, cl wa.Client, e *events.GroupInfo) error {
-	refresh := len(e.Join) > 0 || len(e.Leave) > 0
+	roles := len(e.Promote) > 0 || len(e.Demote) > 0
+	refresh := len(e.Join) > 0 || len(e.Leave) > 0 || roles
 	if e.Name == nil && !refresh {
 		return nil
+	}
+	promote, err := s.formsOf(ctx, cl, e.Promote)
+	if err != nil {
+		return err
+	}
+	demote, err := s.formsOf(ctx, cl, e.Demote)
+	if err != nil {
+		return err
 	}
 	return s.updateChat(ctx, cl, e.JID, func(c *store.Chat) {
 		if e.Name != nil && e.Name.Name != "" {
@@ -585,13 +648,51 @@ func (s *server) onGroupInfo(ctx context.Context, cl wa.Client, e *events.GroupI
 		if refresh {
 			c.GroupInfoAt = 0
 		}
+		if roles {
+			c.Admins = changeAdmins(c.Admins, promote, demote)
+		}
 	})
 }
 
-// participantsOf converts group info members to protocol participants.
-func (s *server) participantsOf(ctx context.Context, cl wa.Client, gi *types.GroupInfo) ([]api.Participant, error) {
+// formsOf lists every id form of the given users.
+func (s *server) formsOf(ctx context.Context, cl wa.Client, jids []types.JID) ([]string, error) {
+	var out []string
+	for _, j := range jids {
+		id, alt, err := s.canon(ctx, cl, j, types.EmptyJID)
+		if err != nil {
+			return nil, err
+		}
+		out = addIDs(out, id, alt, j.ToNonAD().String())
+	}
+	return out, nil
+}
+
+// addIDs appends the ids that are not empty and not already in list.
+func addIDs(list []string, ids ...string) []string {
+	for _, id := range ids {
+		if id != "" && !slices.Contains(list, id) {
+			list = append(list, id)
+		}
+	}
+	return list
+}
+
+// changeAdmins adds the promoted ids to admins and removes the demoted ones.
+func changeAdmins(admins, promote, demote []string) []string {
+	out := make([]string, 0, len(admins)+len(promote))
+	for _, a := range admins {
+		if !slices.Contains(demote, a) {
+			out = append(out, a)
+		}
+	}
+	return addIDs(out, promote...)
+}
+
+// participantsOf converts group info members to protocol participants and lists the ids of the admins.
+func (s *server) participantsOf(ctx context.Context, cl wa.Client, gi *types.GroupInfo) ([]api.Participant, []string, error) {
 	self := cl.Self()
 	out := make([]api.Participant, 0, len(gi.Participants))
+	var admins []string
 	for _, p := range gi.Participants {
 		alt := p.PhoneNumber
 		if p.JID.Server == types.DefaultUserServer {
@@ -599,19 +700,22 @@ func (s *server) participantsOf(ctx context.Context, cl wa.Client, gi *types.Gro
 		}
 		id, altID, err := s.canon(ctx, cl, p.JID, alt)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		name, err := s.nameOf(ctx, id, altID)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if name == "" {
 			name = p.DisplayName
 		}
 		isMe := (!self.JID.IsEmpty() && id == self.JID.String()) || (!self.LID.IsEmpty() && (p.JID.User == self.LID.User || p.LID.User == self.LID.User))
 		out = append(out, api.Participant{ID: id, Name: name, IsMe: isMe})
+		if p.IsAdmin || p.IsSuperAdmin {
+			admins = addIDs(admins, id, altID)
+		}
 	}
-	return out, nil
+	return out, admins, nil
 }
 
 // groupFetcher paces background GetGroupInfo calls: one at a time with a minimum gap.
@@ -652,6 +756,7 @@ func (s *server) fetchGroup(cl wa.Client, chatJID string) {
 		g.inflight = false
 		g.mu.Unlock()
 	}()
+	defer s.recoverPanic("group")
 	g.mu.Lock()
 	wait := s.tm.groupGap - time.Since(g.last)
 	g.mu.Unlock()
@@ -678,7 +783,7 @@ func (s *server) fetchGroup(cl wa.Client, chatJID string) {
 	}
 	s.ingestMu.Lock()
 	defer s.ingestMu.Unlock()
-	parts, err := s.participantsOf(ctx, cl, info)
+	parts, admins, err := s.participantsOf(ctx, cl, info)
 	if err != nil {
 		return
 	}
@@ -686,7 +791,7 @@ func (s *server) fetchGroup(cl wa.Client, chatJID string) {
 		if info.Name != "" {
 			c.Name = info.Name
 		}
-		c.Participants, c.GroupInfoAt = parts, time.Now().Unix()
+		c.Participants, c.GroupInfoAt, c.Admins = parts, time.Now().Unix(), admins
 	})
 	if err != nil || !found {
 		return
