@@ -33,11 +33,14 @@ pub fn hint(code: i64, subcode: Option<i64>) -> Option<&'static str> {
         (190, _) => {
             "the access token is invalid or expired: run `meta-mcp setup` again or `meta-mcp token refresh`"
         }
+        (_, Some(2018278 | 2534022)) => {
+            "outside the 24-hour messaging window: the person must message the Page first, or use tag HUMAN_AGENT if your app has that approval"
+        }
+        (200, Some(2018028)) => {
+            "the app is not approved yet: until pages_messaging has Advanced Access and the app is live, the Page can only message people with a role on the app (admin, developer, tester)"
+        }
         (10 | 200 | 230, _) => {
             "permission denied: the Page token needs pages_messaging, pages_read_engagement and pages_manage_metadata, and the app must be allowed to message this person (Development mode only reaches app roles)"
-        }
-        (100, Some(2018278)) => {
-            "outside the 24-hour messaging window: the person must message the Page first, or use tag HUMAN_AGENT if your app has that approval"
         }
         (100, Some(2018001)) => {
             "no matching user: the recipient must be a Page-scoped ID (PSID) from this Page's conversations"
@@ -54,7 +57,7 @@ pub fn hint(code: i64, subcode: Option<i64>) -> Option<&'static str> {
             "WhatsApp: message undeliverable (number not on WhatsApp or has not accepted the terms)"
         }
         (131030, _) => {
-            "WhatsApp: recipient not in the allowed list (test numbers can only message up to 5 verified recipients)"
+            "WhatsApp: recipient not in the allowed list (a test number can only message the verified recipients added in the App Dashboard)"
         }
         (368, _) => "action blocked by Meta as abusive or policy violating",
         _ => return None,
@@ -193,13 +196,15 @@ mod tests {
 
     #[test]
     fn hint_table() {
-        let cases: [(i64, Option<i64>, &str); 18] = [
+        let cases: [(i64, Option<i64>, &str); 20] = [
             (190, None, "meta-mcp setup"),
             (190, Some(463), "meta-mcp token refresh"),
             (10, None, "pages_messaging"),
             (200, None, "pages_manage_metadata"),
             (230, None, "Development mode"),
-            (100, Some(2018278), "24-hour"),
+            (10, Some(2018278), "24-hour"),
+            (10, Some(2534022), "24-hour"),
+            (200, Some(2018028), "Advanced Access"),
             (100, Some(2018001), "Page-scoped ID"),
             (100, Some(1), "2026-04-27"),
             (100, None, "CONFIRMED_EVENT_UPDATE"),

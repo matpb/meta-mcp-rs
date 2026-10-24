@@ -89,7 +89,7 @@ pub fn whatsapp_hint(code: i64) -> Option<&'static str> {
             "WhatsApp: the message could not be delivered: the number is not on WhatsApp, the person has not accepted the latest terms, or their app is too old"
         }
         131030 => {
-            "WhatsApp: the recipient is not in the allowed list: a number in test mode can only message up to 5 verified recipients"
+            "WhatsApp: the recipient is not in the allowed list: a test number can only message the verified recipients added in the App Dashboard"
         }
         131049 => {
             "WhatsApp: Meta blocked this message to keep conversations healthy: wait about 24 hours before retrying"
