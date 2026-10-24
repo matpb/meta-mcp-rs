@@ -1,11 +1,13 @@
 //! Command line: argument parsing and dispatch. Exit codes: 0 ok, 1 runtime or config error, 2 usage.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 
 use crate::config::Config;
-use crate::{mcp, server};
+use crate::setup::oauth::RedirectMode;
+use crate::{mcp, server, setup};
 
 /// MCP server for the Meta Graph API (Facebook Messenger and WhatsApp Cloud API).
 #[derive(Debug, Parser)]
@@ -15,11 +17,174 @@ pub struct Cli {
     pub command: Option<Command>,
 }
 
-/// Arguments of commands that arrive in a later phase; accepted so scripts fail clearly.
-#[derive(Debug, Args)]
-pub struct Pending {
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
-    pub args: Vec<String>,
+/// Options of `meta-mcp setup`.
+#[derive(Debug, Clone, Args)]
+#[command(
+    after_help = "Every value comes from its flag, then the environment (META_APP_ID, META_APP_SECRET, META_WEBHOOK_PUBLIC_URL, META_WEBHOOK_VERIFY_TOKEN), then credentials.json, then a prompt. With --non-interactive, or when stdin is not a terminal, a missing value is a usage error (exit 2) that names the flag. The login URL is printed in full; secrets never are."
+)]
+pub struct SetupArgs {
+    /// Facebook App ID (or META_APP_ID)
+    #[arg(long, value_name = "ID")]
+    pub app_id: Option<String>,
+    /// App Secret (it stays in shell history: prefer --app-secret-env or META_APP_SECRET)
+    #[arg(long, value_name = "SECRET", conflicts_with_all = ["app_secret_env", "app_secret_file"])]
+    pub app_secret: Option<String>,
+    /// Read the App Secret from this environment variable
+    #[arg(long, value_name = "NAME", conflicts_with = "app_secret_file")]
+    pub app_secret_env: Option<String>,
+    /// Read the App Secret from the first line of this file
+    #[arg(long, value_name = "PATH")]
+    pub app_secret_file: Option<PathBuf>,
+
+    /// Sign in with Facebook Login in the browser (the default)
+    #[arg(long, conflicts_with_all = ["user_token", "page_token", "stored"])]
+    pub login: bool,
+    /// Use this user access token instead of signing in
+    #[arg(long, value_name = "TOKEN", conflicts_with_all = ["login", "page_token", "stored"])]
+    pub user_token: Option<String>,
+    /// Use this Page access token (no user token is stored)
+    #[arg(long, value_name = "TOKEN", conflicts_with_all = ["login", "user_token", "stored", "no_messenger"])]
+    pub page_token: Option<String>,
+    /// Reuse the tokens already in credentials.json instead of signing in
+    #[arg(long, conflicts_with_all = ["login", "user_token", "page_token"])]
+    pub stored: bool,
+
+    /// How the login code returns: a loopback listener or a pasted URL
+    #[arg(long, value_enum, default_value_t = RedirectMode::Loopback)]
+    pub redirect_mode: RedirectMode,
+    /// Redirect URI to send to Facebook (must match Valid OAuth Redirect URIs exactly)
+    #[arg(long, value_name = "URI")]
+    pub redirect_uri: Option<String>,
+    /// Loopback listener port (default 8766)
+    #[arg(long, value_name = "PORT")]
+    pub port: Option<u16>,
+    /// Facebook Login for Business configuration id (replaces the scope list)
+    #[arg(long, value_name = "ID")]
+    pub config_id: Option<String>,
+    /// Ask again for permissions that were declined before
+    #[arg(long)]
+    pub rerequest: bool,
+    /// Print the login URL but do not open a browser
+    #[arg(long)]
+    pub no_browser: bool,
+
+    /// Page to store (repeatable)
+    #[arg(long = "page-id", value_name = "ID", conflicts_with_all = ["all_pages", "no_messenger"])]
+    pub page_ids: Vec<String>,
+    /// Store every Page the login can manage
+    #[arg(long, conflicts_with = "no_messenger")]
+    pub all_pages: bool,
+    /// Skip Messenger and Pages (WhatsApp only)
+    #[arg(long)]
+    pub no_messenger: bool,
+    /// Drop stored Pages this run did not select; also allows switching to another app
+    #[arg(long)]
+    pub replace: bool,
+
+    /// Also set up the WhatsApp Cloud API
+    #[arg(long)]
+    pub whatsapp: bool,
+    /// System User token for WhatsApp (otherwise the user token is used)
+    #[arg(long, value_name = "TOKEN")]
+    pub whatsapp_token: Option<String>,
+    /// WhatsApp Business Account id
+    #[arg(long, value_name = "ID")]
+    pub waba_id: Option<String>,
+    /// WhatsApp phone number id to store (repeatable)
+    #[arg(long = "phone-number-id", value_name = "ID")]
+    pub phone_number_ids: Vec<String>,
+    /// Also request the Instagram messaging permissions
+    #[arg(long)]
+    pub instagram: bool,
+
+    /// Public https URL of the webhook receiver (or META_WEBHOOK_PUBLIC_URL)
+    #[arg(long, value_name = "URL")]
+    pub webhook_url: Option<String>,
+    /// Point only the WhatsApp account at the webhook and leave the app-level callback alone
+    #[arg(long)]
+    pub webhook_override: bool,
+    /// Webhook verify token (or META_WEBHOOK_VERIFY_TOKEN); generated when absent
+    #[arg(long, value_name = "TOKEN")]
+    pub verify_token: Option<String>,
+
+    /// Never prompt: a missing value is a usage error (exit 2)
+    #[arg(long)]
+    pub non_interactive: bool,
+    /// Seconds to wait for the login callback or the pasted URL
+    #[arg(long, value_name = "SECONDS", default_value_t = 300)]
+    pub timeout_seconds: u64,
+    /// Answer yes to confirmations: replacing a different webhook callback, switching apps
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+}
+
+/// Options of `meta-mcp doctor`.
+#[derive(Debug, Clone, Args)]
+pub struct DoctorArgs {
+    /// Print one JSON document instead of the text report
+    #[arg(long)]
+    pub json: bool,
+    /// Also test that the public webhook URL answers Meta's verification handshake
+    #[arg(long)]
+    pub webhook: bool,
+}
+
+/// The token to store with `meta-mcp token import`; exactly one kind per run.
+#[derive(Debug, Clone, Args)]
+#[command(group(ArgGroup::new("kind").required(true).multiple(false).args(["page_token", "user_token", "whatsapp_token"])))]
+pub struct ImportArgs {
+    /// A Page access token
+    #[arg(long, value_name = "TOKEN")]
+    pub page_token: Option<String>,
+    /// A user access token
+    #[arg(long, value_name = "TOKEN")]
+    pub user_token: Option<String>,
+    /// A WhatsApp (System User) access token
+    #[arg(long, value_name = "TOKEN")]
+    pub whatsapp_token: Option<String>,
+    /// Phone number id to store with the WhatsApp token
+    #[arg(long, value_name = "ID")]
+    pub phone_number_id: Option<String>,
+    /// WhatsApp Business Account id to store with the WhatsApp token
+    #[arg(long, value_name = "ID")]
+    pub waba_id: Option<String>,
+}
+
+impl ImportArgs {
+    /// The WhatsApp ids only make sense with a WhatsApp token (clap cannot express this next to the group).
+    pub fn check(&self) -> Result<(), String> {
+        if self.whatsapp_token.is_none()
+            && (self.phone_number_id.is_some() || self.waba_id.is_some())
+        {
+            return Err("--phone-number-id and --waba-id go with --whatsapp-token".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum TokenCommand {
+    /// Exchange the stored user token for a fresh one and re-derive the Page tokens
+    Refresh {
+        /// Refresh the WhatsApp token instead of leaving it alone
+        #[arg(long)]
+        whatsapp: bool,
+    },
+    /// Validate a token with Meta and store it
+    Import(ImportArgs),
+    /// Show what is stored: kinds, expiry, scopes, Pages and numbers, never a token
+    Show {
+        /// Print JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Options of `meta-mcp token`.
+#[derive(Debug, Clone, Args)]
+pub struct TokenArgs {
+    #[command(subcommand)]
+    pub command: TokenCommand,
 }
 
 #[derive(Debug, Subcommand)]
@@ -34,12 +199,12 @@ pub enum Command {
     },
     /// Run only the webhook receiver that feeds the local inbox
     Webhook,
-    /// Guided setup (arrives in the next phase)
-    Setup(Pending),
-    /// Check the whole configuration against Meta (arrives in the next phase)
-    Doctor(Pending),
-    /// Refresh, show or import tokens (arrives in the next phase)
-    Token(Pending),
+    /// Guided setup: sign in, pick Pages and numbers, subscribe webhooks, write credentials
+    Setup(Box<SetupArgs>),
+    /// Check the whole configuration against Meta and say what to fix
+    Doctor(DoctorArgs),
+    /// Refresh, import or show tokens
+    Token(TokenArgs),
     /// Print every tool name, one per line, honouring read-only mode
     Tools,
 }
@@ -47,11 +212,6 @@ pub enum Command {
 fn fail(msg: impl std::fmt::Display) -> ExitCode {
     eprintln!("error: {msg}");
     ExitCode::from(1)
-}
-
-fn pending(name: &str) -> ExitCode {
-    eprintln!("{name} arrives in the next phase");
-    ExitCode::from(2)
 }
 
 /// Parses the command line, runs the chosen command and returns the process exit code.
@@ -68,12 +228,12 @@ pub async fn run() -> ExitCode {
 }
 
 async fn execute(command: Command) -> ExitCode {
-    match command {
-        Command::Setup(_) => return pending("setup"),
-        Command::Doctor(_) => return pending("doctor"),
-        Command::Token(_) => return pending("token"),
-        _ => {}
-    }
+    let command = match command {
+        Command::Setup(args) => return setup::run_setup(*args).await,
+        Command::Doctor(args) => return setup::run_doctor(args).await,
+        Command::Token(args) => return setup::run_token(args).await,
+        other => other,
+    };
     server::init_tracing();
     let cfg = match Config::from_env() {
         Ok(cfg) => cfg,
@@ -133,15 +293,132 @@ mod tests {
     }
 
     #[test]
-    fn pending_commands_accept_future_flags() {
+    fn setup_doctor_and_token_arguments_parse() {
         for args in [
             &["setup", "--webhook-url", "https://x.example/webhook"][..],
             &["setup"],
-            &["doctor", "--json"],
+            &[
+                "setup",
+                "--app-id",
+                "1",
+                "--app-secret-env",
+                "MY_SECRET",
+                "--login",
+                "--no-browser",
+            ],
+            &[
+                "setup",
+                "--page-token",
+                "EAAx",
+                "--non-interactive",
+                "--yes",
+            ],
+            &[
+                "setup",
+                "--redirect-mode",
+                "paste",
+                "--page-id",
+                "1",
+                "--page-id",
+                "2",
+            ],
+            &[
+                "setup",
+                "--user-token",
+                "EAAx",
+                "--whatsapp",
+                "--no-messenger",
+                "--phone-number-id",
+                "P1",
+                "--phone-number-id",
+                "P2",
+            ],
+            &["doctor"],
+            &["doctor", "--json", "--webhook"],
             &["token", "refresh"],
+            &["token", "refresh", "--whatsapp"],
+            &["token", "show", "--json"],
+            &["token", "import", "--page-token", "EAAx"],
+            &[
+                "token",
+                "import",
+                "--whatsapp-token",
+                "EAAx",
+                "--phone-number-id",
+                "P1",
+                "--waba-id",
+                "W1",
+            ],
         ] {
             assert!(parse(args).is_ok(), "{args:?}");
         }
+        let Some(Command::Setup(a)) = parse(&["setup", "--port", "9000", "--timeout-seconds", "5"])
+            .expect("setup")
+            .command
+        else {
+            panic!("not setup");
+        };
+        assert_eq!((a.port, a.timeout_seconds), (Some(9000), 5));
+        assert_eq!(a.redirect_mode, RedirectMode::Loopback);
+    }
+
+    #[test]
+    fn conflicting_setup_flags_are_rejected() {
+        for args in [
+            &["setup", "--login", "--page-token", "EAAx"][..],
+            &["setup", "--user-token", "a", "--page-token", "b"],
+            &["setup", "--app-secret", "a", "--app-secret-env", "B"],
+            &["setup", "--all-pages", "--page-id", "1"],
+            &["setup", "--no-messenger", "--all-pages"],
+            &["token", "import"],
+            &["token", "import", "--page-token", "a", "--user-token", "b"],
+            &["token"],
+        ] {
+            assert!(parse(args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn whatsapp_ids_need_the_whatsapp_token() {
+        let import = |args: &[&str]| match parse(args).expect("parse").command {
+            Some(Command::Token(TokenArgs {
+                command: TokenCommand::Import(i),
+            })) => i,
+            other => panic!("not an import: {other:?}"),
+        };
+        assert!(
+            import(&[
+                "token",
+                "import",
+                "--page-token",
+                "a",
+                "--phone-number-id",
+                "P"
+            ])
+            .check()
+            .is_err()
+        );
+        assert!(
+            import(&["token", "import", "--user-token", "a", "--waba-id", "W"])
+                .check()
+                .is_err()
+        );
+        let ok = import(&[
+            "token",
+            "import",
+            "--whatsapp-token",
+            "a",
+            "--phone-number-id",
+            "P",
+            "--waba-id",
+            "W",
+        ]);
+        assert!(ok.check().is_ok());
+        assert!(
+            import(&["token", "import", "--page-token", "a"])
+                .check()
+                .is_ok()
+        );
     }
 
     #[test]

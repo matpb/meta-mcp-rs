@@ -561,17 +561,24 @@ fn cli_exit_codes() {
     ] {
         assert!(out.contains(sub), "--help lacks {sub}: {out}");
     }
-    for stub in ["setup", "doctor", "token"] {
-        let (c, _, err) = code(&[stub], &[]);
-        assert_eq!(c, Some(2), "{stub}");
-        assert!(err.contains("arrives in the next phase"), "{err}");
-    }
+    let (c, _, err) = code(&["setup"], &[]);
+    assert_eq!(
+        c,
+        Some(2),
+        "setup without a terminal needs its values as flags"
+    );
+    assert!(err.contains("--app-id"), "{err}");
     let (c, _, err) = code(
         &["setup", "--webhook-url", "https://x.example/webhook"],
         &[],
     );
     assert_eq!(c, Some(2));
-    assert!(err.contains("setup arrives in the next phase"), "{err}");
+    assert!(err.contains("--app-id"), "{err}");
+    let (c, _, _) = code(&["token"], &[]);
+    assert_eq!(c, Some(2), "token needs a subcommand");
+    let (c, out, _) = code(&["doctor"], &[]);
+    assert_eq!(c, Some(1), "nothing configured is a failure");
+    assert!(out.contains("meta-mcp setup"), "{out}");
     let (c, _, _) = code(&["bogus"], &[]);
     assert_eq!(c, Some(2));
     let (c, _, err) = code(&["tools"], &[("META_MCP_READ_ONLY", "maybe")]);
