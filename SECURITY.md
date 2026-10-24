@@ -59,8 +59,13 @@ meta-mcp cannot stop a model from obeying text it reads. What it does:
   MCP client can ask you before running them.
 - **Read-only mode** (`META_MCP_READ_ONLY=true`) removes every tool that sends a message or
   changes local state, so an injected instruction has nothing to send with.
-- Attachment bytes are saved as files and shown to the model only as an inline image when
-  the type is an image and the file is small. They are never executed or parsed otherwise.
+- Attachment bytes are saved as files. They are shown to the model only as an inline image, and
+  only when the bytes themselves pass a structural check as a PNG (signature and `IHDR` chunk),
+  a JPEG (a baseline or progressive frame header), a GIF (header and screen descriptor) or a
+  WEBP (a RIFF container whose size matches) with a sane width and height, and fit in 2 MiB. The
+  type a sender or a server reports is never trusted. Anything else is saved and the result says why
+  it was not shown (`note` for Messenger, `inline_skipped` for WhatsApp). The bytes are never
+  executed or parsed otherwise.
 
 These are advisory and structural measures, not a guarantee. If the assistant can send, an
 injected message can ask it to send. Use read-only mode, a narrow files directory, a Page
@@ -142,20 +147,27 @@ server. The rules, enforced in the Graph client:
 - https only (plain http is accepted for loopback hosts, which exists for tests), no user
   name or password in the URL.
 - The host must match the allowlist on **every hop**: `*.fbcdn.net`, `*.fbsbx.com`,
-  `*.facebook.com`, `*.messenger.com`, `*.whatsapp.net` and `lookaside.fbsbx.com`, plus any
-  exact host listed in `META_MCP_DOWNLOAD_HOSTS`. A wildcard needs at least one label before
-  the suffix.
-- Redirects are followed by hand, at most 5, each re-checked against the allowlist.
+  `*.whatsapp.net` and `lookaside.fbsbx.com`, plus any exact host listed in
+  `META_MCP_DOWNLOAD_HOSTS` (bare host names: no wildcard and no port). A wildcard needs at least
+  one label before the suffix. `*.facebook.com` and `*.messenger.com` are not on the list.
+- **The Graph API host is never fetched.** A URL on the host of `META_GRAPH_BASE_URL`
+  (`graph.facebook.com` by default) is refused on every hop, whether or not a token would be
+  attached, whatever its port or path, and even when `META_MCP_DOWNLOAD_HOSTS` names it. A fetch
+  there is an API call made with your credentials, not a media download. Because redirects are
+  followed by hand, a redirect that lands on it is refused too.
+- Redirects are followed by hand, at most 5, each re-checked against the allowlist and the
+  Graph host rule.
 - The body is streamed and aborted past `META_MCP_MAX_FILE_BYTES`.
 - **Token rules.** The first Messenger attempt carries no token. After an HTTP 401 or 403 the
-  download is retried once with the Page token, and only when the host ends in `.fbcdn.net`,
-  `.fbsbx.com`, `.facebook.com` or `.messenger.com` (or is listed in
-  `META_MCP_DOWNLOAD_HOSTS`). The WhatsApp media URL requires the token and is fetched with
-  it only after the same host check. The token is attached on an exact host match per hop,
-  so a redirect to another host drops it.
+  download is retried once with the Page token, and only when the host ends in `.fbcdn.net` or
+  `.fbsbx.com` (or is listed in `META_MCP_DOWNLOAD_HOSTS`). The WhatsApp media URL requires the
+  token and is fetched with it only when its host is `lookaside.fbsbx.com`, ends in `.whatsapp.net`
+  or is listed in `META_MCP_DOWNLOAD_HOSTS`. The token is tied to the exact host and port of that
+  request, so a redirect to another host, or to the same host on another port, drops it.
 - Limits: the allowlist is by host name. DNS answers are not pinned or checked against
-  private ranges, and `*.facebook.com` is broad. `META_MCP_DOWNLOAD_HOSTS` widens both the
-  allowlist and the set of hosts that may receive a token: leave it unset in production.
+  private ranges, and the three wildcards cover every subdomain under them.
+  `META_MCP_DOWNLOAD_HOSTS` widens both the allowlist and the set of hosts that may receive a
+  token: leave it unset in production.
 - URLs given to the send tools are fetched by Meta's servers, not by meta-mcp.
 
 ## File jail
@@ -173,6 +185,26 @@ it unset, path arguments fail with an error naming the variable. What the jail g
   and are then hard-linked or renamed into place, so a failed write leaves no partial file
   and an existing file is never replaced unless `overwrite` is true.
 - Reads and writes are capped by `META_MCP_MAX_FILE_BYTES` (default 100 MiB).
+- **Received files are kept apart.** Downloads are saved under `inbound/messenger/` and
+  `inbound/whatsapp/` inside the directory. The upload paths (`path` of `messenger_send_attachment`
+  and `whatsapp_send_media`, and `whatsapp_upload_media`) refuse any file under `inbound/`, unless
+  the call says `allow_inbound=true`, so passing what one person sent to someone else is a step the
+  assistant has to take on purpose. The flag is an argument of the tool call: an injected
+  instruction can set it too. It makes the step visible to a client that shows tool arguments
+  before a send tool runs, and it is not a permission boundary.
+- **Download names are safe and short.** Messenger reduces any name that comes from the sender or
+  from a URL (and `dest_name` too) to one path component: control, bidirectional and zero-width
+  characters and `: * ? " < > |` are replaced, Windows device names such as `CON` are prefixed with
+  `_`, and the name is cut to 200 bytes on a character boundary. A `Content-Disposition` header is
+  never read. A derived Messenger name that already holds different content gets a short hash of
+  the URL instead of replacing it, and an explicit `dest_name` or an identical file fails with
+  "already exists" unless `overwrite` is true. WhatsApp names the file
+  `whatsapp_<media id>.<extension>`; a `dest_name` may add sub-folders but cannot leave
+  `inbound/whatsapp/`, and a component over 200 bytes is refused before any request is made.
+- **The directory cannot contain the configuration.** meta-mcp refuses to start when
+  `META_MCP_FILES_DIR` contains `META_MCP_HOME`, `credentials.json` or the inbox database
+  (`META_MCP_INBOX_DB`), after resolving symlinks. The error names the overlap, because the file
+  tools could read or replace those files.
 
 What it does not guarantee:
 
@@ -187,7 +219,8 @@ What it does not guarantee:
   dot files inside it work; the dot rule applies to write destinations only.
 - Saved files are created with the process default permissions (the umask), not 0600.
 - The jail covers tool path arguments only. `META_MCP_HOME` and `META_MCP_INBOX_DB` are
-  operator choices and are not jailed. Do not put the files directory around them.
+  operator choices and are not jailed. The startup check above refuses a files directory that
+  contains them; it runs once, at startup.
 
 ## HTTP mode
 
@@ -223,9 +256,10 @@ be called): `inbox_mark_processed`, `messenger_send_text`, `messenger_send_attac
 `whatsapp_send_template`, `whatsapp_send_reaction`, `whatsapp_send_location`,
 `whatsapp_mark_read` and `whatsapp_upload_media`. It does not hide data: the read tools still
 return conversations and inbox events, and the two download tools remain because they only
-write inside the files directory. The webhook receiver keeps storing events, and the
-`setup`, `token` and `doctor` commands still write the credentials file; they are commands,
-not tools.
+write inside the files directory, and in read-only mode both refuse `overwrite=true`, so they
+can only create new files. The webhook receiver keeps storing
+events, and the `setup`, `token` and `doctor` commands still write the credentials file; they
+are commands, not tools.
 
 ## Data you keep
 

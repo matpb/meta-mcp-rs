@@ -37,6 +37,20 @@ call fails and lists the valid IDs.
 **Types.** Integers are 64-bit. IDs are strings. A Graph timestamp or ID that Meta sends as a
 number is accepted either way.
 
+**IDs.** Every ID you pass is checked before any request is made, so that it cannot reshape the
+request path.
+
+- Graph IDs (conversation, PSID, user and Messaging account IDs) are 1 to 256 bytes of letters, digits
+  and `_ - . : = +`. The first character must be a letter, a digit or `_`, so `.`, `..` and any ID
+  that starts with another character are refused, and so is an ID that begins like a Graph version
+  (`v26.0`: a `v`, digits, then a dot).
+- Messenger message IDs (`message_id`, `reply_to_mid`) follow the same rule, may also hold `$` (the
+  legacy `mid.$...` form) and may run to 512 bytes.
+- WhatsApp message IDs (`message_id`, `reply_to_message_id`) must start with `wamid.`, run to 200 bytes
+  of printable ASCII without spaces, and may carry the `whatsapp:` prefix of an inbox event ID, which
+  is dropped.
+- WhatsApp media IDs (`media_id`) are 1 to 32 digits.
+
 **Common errors.** Besides Graph errors (below), every tool can fail with:
 
 | Message (shape) | Cause |
@@ -51,12 +65,16 @@ number is accepted either way.
 | `path X resolves outside META_MCP_FILES_DIR` | A path that escapes the jail (including through a symlink) |
 | `no such file: X`, `not a regular file: X` | The path does not name a file inside the jail |
 | `destination X already exists; pass overwrite=true to replace it` | A download would overwrite a file |
+| `X is under inbound/ in META_MCP_FILES_DIR, where files received from other people are kept, so sending it on would pass their data to someone else: pass allow_inbound=true only when the user asked to forward this exact file` | A `path` upload of a file under `inbound/` without `allow_inbound=true` |
+| `a destination name is N bytes; names are limited to 200 bytes` | A WhatsApp `dest_name` with a component over 200 bytes |
 | `file is N bytes, above the limit of C (META_MCP_MAX_FILE_BYTES)` | Above `META_MCP_MAX_FILE_BYTES` |
 
 **Graph errors** read `Graph API error <code>[/<subcode>]: <message> [fbtrace <id>]. Hint: <hint>`.
 The hint is added for known codes (see the table in the guide, Part 9). Transport failures read
-`Graph API request failed: ...`. Sends are never retried automatically, so a failed send that
-timed out may or may not have been delivered: check before sending again.
+`Graph API request failed: ...`. Sends are never retried automatically. When a send fails in a way
+that leaves the outcome open (a timeout or dropped connection, an unreadable answer or an HTTP 5xx),
+the error text ends with a note that the message may still have been delivered: read the conversation
+(Messenger) or the inbox status events (WhatsApp) before sending again.
 
 ## Index
 
@@ -71,7 +89,7 @@ timed out may or may not have been delivered: check before sending again.
 | `messenger_get_message` | Messenger | Read one message | kept |
 | `messenger_send_text` | Messenger | Send a text message as the Page | removed |
 | `messenger_send_attachment` | Messenger | Send an image, audio, video or file | removed |
-| `messenger_download_attachment` | Messenger | Save an attachment into the files directory | kept |
+| `messenger_download_attachment` | Messenger | Save an attachment into `inbound/messenger` of the files directory | kept |
 | `messenger_sender_action` | Messenger | Typing indicator, mark seen, reactions | removed |
 | `messenger_get_profile` | Messenger | Look up a person's name and picture | kept |
 | `whatsapp_send_text` | WhatsApp | Send a text message | removed |
@@ -81,7 +99,7 @@ timed out may or may not have been delivered: check before sending again.
 | `whatsapp_send_location` | WhatsApp | Send a location | removed |
 | `whatsapp_mark_read` | WhatsApp | Mark read, optionally show typing | removed |
 | `whatsapp_upload_media` | WhatsApp | Upload a file and get a media ID | removed |
-| `whatsapp_download_media` | WhatsApp | Save an inbound media file | kept |
+| `whatsapp_download_media` | WhatsApp | Save an inbound media file into `inbound/whatsapp` of the files directory | kept |
 
 ## Core tools
 
@@ -293,13 +311,18 @@ untrusted third-party content.
 - `snippet`, `unread_count`, `message_count`, `can_reply`, `link` and `is_owner` appear when
   Meta returns them. Meta's reference page documents only `id`, `updated_time`,
   `participants` and `is_owner`; the tool asks for the richer set first and, if Graph answers
-  code 100 saying a field does not exist, retries once with the documented fields and sets
-  `"fields_reduced": true`.
+  code 100 with a message that says `nonexisting field`, retries once with the documented fields
+  and sets `"fields_reduced": true`. Any other code 100 is returned as it is.
 - Paging uses cursors only: Meta offers no time-based pagination. Stop when `next_cursor` is
   absent. Do not store cursors, they can be invalidated.
 - Conversations in the Requests folder that have not been active for 30 days are not returned.
 - The Conversations API allows 2 calls per second per Page. The tool spaces conversation reads
-  at least 500 ms apart for each Page.
+  at least 500 ms apart for each Page. A read that fails with a transient error (Graph code 1, 2,
+  4, 17, 32, 613 or 80006, an HTTP 5xx, a timeout or a connection that did not complete) is
+  repeated once, after the same spacing, so the repeat never lands inside the window; the Graph
+  client's own retries are switched off for these reads. The same spacing and single repeat apply
+  to `messenger_read_conversation`, `messenger_get_message` and the lookups behind
+  `conversation_id` and `message_id` arguments.
 
 **Errors:** code 10, 200 or 230 (the token needs the `MESSAGING` task and `pages_manage_metadata`,
 `pages_read_engagement` and `pages_messaging`), code 190 (token), rate-limit codes (4, 17, 32,
@@ -389,8 +412,9 @@ Read-only. Content is untrusted third-party content.
 ### `messenger_send_text`
 
 Sends a text message as the Page to a real person. Replies more than 24 hours after the
-person's last message fail unless the app has the `HUMAN_AGENT` approval. Confirm intent first.
-Not read-only. Removed in read-only mode.
+person's last message fail. The `HUMAN_AGENT` tag (up to 7 days, needs Meta's approval) is only
+for a person replying by hand: Meta lists automated messages as a disallowed use, so never use it
+for generated replies. Confirm intent first. Not read-only. Removed in read-only mode.
 
 | Parameter | Type | Required | Meaning |
 |---|---|---|---|
@@ -399,7 +423,7 @@ Not read-only. Removed in read-only mode.
 | `conversation_id` | string | one of the two | A conversation `id`; the tool resolves the other participant's PSID |
 | `page_id` | string | no | The Page; optional when one Page is configured |
 | `messaging_type` | string | no | `RESPONSE` (default), `UPDATE` or `MESSAGE_TAG` |
-| `tag` | string | with `MESSAGE_TAG` | Only `HUMAN_AGENT` is exposed |
+| `tag` | string | with `MESSAGE_TAG` | Only `HUMAN_AGENT` is exposed, and only for a person replying by hand |
 | `reply_to_mid` | string | no | Message ID to quote |
 | `notification_type` | string | no | `REGULAR`, `SILENT_PUSH` or `NO_PUSH` |
 | `metadata` | string | no | Echoed back in the `message_echoes` webhook; fewer than 1000 characters |
@@ -411,11 +435,13 @@ Not read-only. Removed in read-only mode.
 - `RESPONSE` is for replies inside the 24-hour window and may carry promotional content;
   `UPDATE` is proactive but still needs an open window. `MESSAGE_TAG` is for outside the window
   and needs a tag. `CONFIRMED_EVENT_UPDATE`, `ACCOUNT_UPDATE` and `POST_PURCHASE_UPDATE` return
-  code 100 since 2026-04-27 and are not accepted. `HUMAN_AGENT` is for a person typing in a
-  custom inbox; Meta lists automated messages as a disallowed use of it, so do not use it for
+  code 100 since 2026-04-27 and are not accepted. `HUMAN_AGENT` is for a person replying by hand
+  in a custom inbox; Meta lists automated messages as a disallowed use of it. The tool descriptions,
+  the server instructions and the outside-window error hint all say so: do not use it for
   AI-written replies.
 
-**Errors:** outside the window (code 10, subcode 2018278 or 2534022, as documented by Meta);
+**Errors:** outside the window (code 10, subcode 2018278 or 2534022, as documented by Meta; the
+hint is keyed on the subcode, whatever the code);
 code 200 with subcode 2018028 (Development mode: the person has no role on the app); code 100
 with subcode 2018001 (no matching user: the ID must be a PSID of this Page); 551 or 200/1545041
 (person unavailable); 10/2018300 or 100/2534037 (another app owns the thread); 368; rate limits.
@@ -436,13 +462,14 @@ Removed in read-only mode.
 |---|---|---|---|
 | `kind` | string | yes | `image`, `audio`, `video` or `file` |
 | `url` | string | one of three | HTTPS URL that Meta fetches |
-| `path` | string | one of three | A file inside `META_MCP_FILES_DIR` |
+| `path` | string | one of three | A file inside `META_MCP_FILES_DIR`; a file under `inbound/` is refused unless `allow_inbound` is true |
 | `urls` | array of strings | one of three | Several image URLs, 30 at most (`kind` must be `image`) |
 | `recipient_psid` | string | one of the two | The person's PSID |
 | `conversation_id` | string | one of the two | A conversation `id` |
 | `page_id` | string | no | The Page |
 | `is_reusable` | boolean | no | Keep the uploaded asset for later sends |
-| `mime_type` | string | no | Overrides the type detected from the file name |
+| `mime_type` | string | no | Overrides the type detected from the file name; it must fit `kind` |
+| `allow_inbound` | boolean | no | With `path`: allow a file under `inbound/`, where downloads from other people are kept (default false) |
 | `messaging_type`, `tag` | string | no | As for `messenger_send_text` |
 
 **Result:** `{"recipient_id": "...", "message_id": "...", "attachment_id": "...", "uploaded_bytes": 80546, "warning": "..."}`
@@ -456,7 +483,9 @@ where `attachment_id`, `uploaded_bytes` and `warning` appear only when relevant.
   before the upload. An image over 8 MB is still attempted and the result carries a `warning`.
   Attachment IDs expire after 90 days and belong to the Page that created them.
 - The file must be inside the files directory; without `META_MCP_FILES_DIR` the call fails with
-  a message naming the variable.
+  a message naming the variable. Files under `inbound/` hold what other people sent, so the call is
+  refused unless `allow_inbound` is true: forwarding one person's file to another is a deliberate
+  step, and the flag belongs on the call only when the user asked to forward that exact file.
 - A send is never retried automatically.
 
 **Errors:** 100/2018008 (Meta could not fetch the URL), 100/2018294 (video upload timed out or
@@ -471,32 +500,59 @@ attachment ID), 100/2018109 (attachment too large), plus the errors of `messenge
 
 ### `messenger_download_attachment`
 
-Saves a Messenger attachment into the files directory and, for small images, also returns it
-inline. Attachment URLs expire. Not read-only in the MCP sense (it writes a file) but kept in
-read-only mode. The saved bytes and any inline image are untrusted content.
+Saves a Messenger attachment into `inbound/messenger` of the files directory and, for a small
+picture that passes a structural check, also returns it inline. Attachment URLs expire. Not
+read-only in the MCP sense (it writes a file) but kept in read-only mode. The saved bytes and any
+inline image are untrusted content.
 
 | Parameter | Type | Required | Meaning |
 |---|---|---|---|
 | `url` | string | one of the two | An attachment URL from `messenger_read_conversation` |
 | `message_id` | string | one of the two | A message `id`; the attachment is picked with `index` |
 | `index` | integer | no | Which attachment of the message, default 0 |
-| `dest_name` | string | no | File name to save as, inside the files directory |
-| `inline` | boolean | no | Default true: also return an image block for an image up to 2 MiB |
-| `overwrite` | boolean | no | Replace an existing file (default false) |
+| `dest_name` | string | no | File name to save as, inside `inbound/messenger`; path separators are removed |
+| `inline` | boolean | no | Default true: also return an image block for a picture that passes the check and is at most 2 MiB |
+| `overwrite` | boolean | no | Replace an existing file (default false). Refused in read-only mode |
 | `page_id` | string | no | The Page; used for the token retry |
 
 **Result:** `{"path": "...", "bytes": 80546, "mime": "image/jpeg", "sha256": "...", "source_url_host": "scontent.example"}`,
-followed by an image block when `inline` applies.
+followed by an image block when `inline` applies. `name_note` appears when the name was changed so
+as not to replace a different file, and `note` when a picture was saved but not shown inline.
 
-- The file name is `dest_name`, else the `Content-Disposition` name, else the last segment of
-  the URL path, reduced to safe characters.
-- Host rules: https only, and the host must be a Meta CDN host (`*.fbcdn.net`, `*.fbsbx.com`,
-  `*.facebook.com`, `*.messenger.com`) or one you added to `META_MCP_DOWNLOAD_HOSTS`. The first
-  attempt sends no token. After an HTTP 401 or 403 it retries once with the Page token, only for
-  those Meta hosts. A URL on any other host fails before any request is made.
-- The size cap is `META_MCP_MAX_FILE_BYTES`.
+- **File name.** `dest_name`, else the attachment's own name (when you pass `message_id`), else the
+  last segment of the URL path (percent-decoded, after redirects). meta-mcp does not read a
+  `Content-Disposition` header. A derived name without an extension gets one from the detected type.
+  Every name, `dest_name` included, is reduced to one safe path component: separators are removed;
+  control, bidirectional and zero-width characters and `: * ? " < > |` become `_`; leading dots and
+  trailing dots and spaces go; a name left empty becomes `attachment`; Windows device names such as
+  `CON` get a `_` prefix; and the result is cut to 200 bytes on a character boundary, keeping a short
+  extension. An over-long `dest_name` is shortened, not refused.
+- **Name clashes.** If the plain name already holds different content, the file is saved as
+  `stem-<8 hex characters of the URL's SHA-256>.ext` instead, and `name_note` says so. If the same
+  bytes are already there, or you gave `dest_name`, the call fails with "already exists" unless
+  `overwrite` is true.
+- **Inline images.** The picture is returned only when its bytes pass a structural check: a PNG with
+  a signature and an `IHDR` chunk, a JPEG whose segments lead to a baseline or progressive frame
+  header, a GIF with a valid header and screen descriptor (PNG, JPEG and GIF with a width and height
+  from 1 to 20,000), or a WEBP whose RIFF size matches and whose first chunk is `VP8`, `VP8L` or
+  `VP8X`; and the file is at most 2 MiB. The type that Meta or the sender reports is never trusted:
+  `mime` is the type detected from the bytes when they are a picture. Anything else is saved, and
+  `note` says why it was not shown.
+- **Host rules.** https only, and the host must be `*.fbcdn.net`, `*.fbsbx.com`, `*.whatsapp.net`,
+  `lookaside.fbsbx.com` or a bare host name you added to `META_MCP_DOWNLOAD_HOSTS`. `*.facebook.com`
+  and `*.messenger.com` are not allowed. The Graph API host (the host of `META_GRAPH_BASE_URL`) is
+  refused on every hop and in every case, even if you list it. A URL on any other host fails before
+  any request is made.
+- **Token.** The first attempt sends no token. After an HTTP 401 or 403 it retries once with the Page
+  token, only when the host ends in `.fbcdn.net` or `.fbsbx.com` or is one you listed, and only for the
+  exact host and port of that request: a redirect to another host or port gets no token.
+- **Where it goes.** Files are saved under `inbound/messenger/` because they come from other people.
+  Sending one on with `messenger_send_attachment` needs `allow_inbound=true`.
+- The size cap is `META_MCP_MAX_FILE_BYTES`. In read-only mode `overwrite=true` is refused, so the
+  tool can only create new files.
 
 **Errors:** `refusing to download from host X: not an allowed Meta media host, and no token was sent`;
+`refusing to download from X: it is the Graph API host, where a fetch is an API call made with your credentials, not a media download; nothing was fetched`;
 `download answered HTTP 4xx` (expired URL: read the message again for a fresh one); file errors
 from the table above.
 
@@ -518,7 +574,7 @@ Page. Confirm intent for reactions. Not read-only. Removed in read-only mode.
 | `conversation_id` | string | one of the two | A conversation `id` |
 | `page_id` | string | no | The Page |
 | `message_id` | string | for `react`, `unreact` | The message to react to |
-| `reaction` | string | no | For `react`: `love` (default), `like`, `wow`, `sad`, `angry`, `haha` or `smile` |
+| `reaction` | string | no | For `react`: an emoji, or one of `love` (default), `like`, `dislike`, `haha`, `wow`, `sad`, `angry` or `smile`, which are sent as the matching emoji. Other plain words are refused |
 
 **Result:** `{"recipient_id": "5012345678901234", "action": "typing_on"}`
 
@@ -583,12 +639,23 @@ through the webhook into the inbox, and are read with `inbox_list` and `inbox_wa
   and the API has no idempotency key.
 - `wa_id` is replaced by `user_id` when the recipient was addressed by, or is known only by, a
   business-scoped user ID. `message_status` appears when a template is being paced.
-- `window_warning` is added to a free-form send when the local inbox suggests the 24-hour
-  customer service window is closed. It never blocks the send: it says either `last inbound message from this user was N hours ago: a free-form message will fail with 131047, send a template`
+- `window_warning` is added to a free-form send (text, media or location; not a template or a
+  reaction) when the local inbox suggests the 24-hour customer service window is closed. It never
+  blocks the send. It is worked out after the send from the person's own newest inbound message,
+  found under every ID the person is known by: the number or user ID you addressed, the `wa_id`
+  and `user_id` that Meta answered with, and the `_sender_user_id` and `from_parent_user_id` kept
+  in an inbound event. It says either `last inbound message from this user was N hours ago: a free-form message will fail with 131047, send a template`
   or `no inbound message from this user in the local inbox: outside a 24-hour window only templates deliver`.
   When the inbox has no WhatsApp events at all, nothing is said, because the window is unknown.
 - Errors come back as Graph errors. Meta's `error_data.details` is added to the message when
   present.
+- When a send fails in a way that leaves the outcome open (a timeout or dropped connection, an
+  unreadable answer, or an HTTP 5xx), the error ends with `(the message may still have been delivered: check inbox status events before sending again)`.
+  A definite rejection, a Graph error below 500, carries no such note. If the send followed an
+  upload (`whatsapp_send_media` with `path`), the error also names the file: after a definite
+  rejection it says the file was uploaded as that `media_id`, is valid for 30 days and can be
+  resent with `media_id`; after an open outcome it says only that the uploaded file stays available
+  as that `media_id` for 30 days.
 
 ### `whatsapp_send_text`
 
@@ -598,10 +665,10 @@ intent first. Not read-only. Removed in read-only mode.
 
 | Parameter | Type | Required | Meaning |
 |---|---|---|---|
-| `to` | string | yes | Phone number with country code (spaces, dashes, parentheses and a leading plus are stripped; 6 to 15 digits must remain), or a business-scoped user ID such as `US.13491208655302741918` |
+| `to` | string | yes | Phone number with country code (spaces, dashes, dots, parentheses and a leading plus are stripped, and a `(0)` trunk prefix right after the country code is dropped; 6 to 15 digits must remain), or a business-scoped user ID such as `US.13491208655302741918`. A number that starts with `0` or `00` is a national or dialled number and is refused |
 | `body` | string | yes | At most 4096 characters; longer text is rejected before any request |
 | `preview_url` | boolean | no | Let the client preview the first link (it must start with http:// or https://) |
-| `reply_to_message_id` | string | no | A `wamid` to quote as a contextual reply |
+| `reply_to_message_id` | string | no | A `wamid` to quote as a contextual reply; the `whatsapp:` prefix of an inbox event ID is dropped |
 | `messaging_account_id` | string | no | Only when the token reaches several Messaging accounts |
 | `phone_number_id` | string | no | The sending number |
 
@@ -633,19 +700,23 @@ Sends an image, video, audio, document or sticker. Give exactly one of `media_id
 | `kind` | string | yes | `image`, `video`, `audio`, `document` or `sticker` |
 | `media_id` | string | one of three | An uploaded media ID (from `whatsapp_upload_media`) |
 | `url` | string | one of three | A public HTTPS URL that Meta fetches (cached for 10 minutes; uploads are preferred) |
-| `path` | string | one of three | A file inside `META_MCP_FILES_DIR`; it is uploaded first, then sent by ID |
+| `path` | string | one of three | A file inside `META_MCP_FILES_DIR`; it is uploaded first, then sent by ID. A file under `inbound/` is refused unless `allow_inbound` is true |
 | `caption` | string | no | For image, video and document, at most 1024 characters |
 | `filename` | string | no | Shown to the recipient for documents |
 | `voice` | boolean | no | Audio only: send as a voice message (needs OGG with the OPUS codec) |
-| `mime_type` | string | no | With `path`: overrides the type detected from the file extension |
+| `mime_type` | string | no | With `path`: must restate the type that the file extension gives, and may add parameters (for example `audio/ogg; codecs=opus`). It cannot replace a missing or unknown extension |
+| `allow_inbound` | boolean | no | With `path`: allow a file under `inbound/`, where downloads from other people are kept (default false) |
 | `reply_to_message_id` | string | no | A `wamid` to quote |
 | `phone_number_id` | string | no | The sending number |
 
 **Result:** the send result, plus `media_id` and `uploaded_bytes` when a path was uploaded.
 
 Supported types and limits (identical in Meta's media guide and the per-type pages). With
-`path`, meta-mcp detects the MIME type from the extension, enforces the size limit before any
-request and sends the type explicitly, because a MIME mismatch (error 131053) is common:
+`path`, meta-mcp detects the MIME type from the file extension (a file without one of the
+extensions below is refused), enforces the size limit before any request and sends the type
+explicitly, because a MIME mismatch (error 131053) is common. `mime_type` may only restate the
+type that the extension gives, with parameters if you like; any other type is refused with
+"rename the file instead":
 
 | Extension | MIME type | Limit |
 |---|---|---|
@@ -663,14 +734,15 @@ request and sends the type explicitly, because a MIME mismatch (error 131053) is
 | `doc`, `docx` | `application/msword`, `application/vnd.openxmlformats-officedocument.wordprocessingml.document` | 100 MiB |
 | `xls`, `xlsx` | `application/vnd.ms-excel`, `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` | 100 MiB |
 | `ppt`, `pptx` | `application/vnd.ms-powerpoint`, `application/vnd.openxmlformats-officedocument.presentationml.presentation` | 100 MiB |
-| `webp` | `image/webp` | 500 KiB in the check (Meta documents 100 KB for static and 500 KB for animated stickers); WebP is valid only for stickers |
+| `webp` | `image/webp` | Checked at 100 KiB for a static sticker and 500 KiB for an animated one (meta-mcp reads the animation flag of the file), as Meta documents; WebP is valid only for stickers |
 
 Audio takes no caption, and `voice: true` needs an OGG file with the OPUS codec. Uploaded media
 persists for 30 days. Meta says other document types may be sent but are not supported and may
 not be handled as expected.
 
-**Errors:** a file above its limit is rejected before any request; 131053 (the media upload
-failed, usually a MIME or extension mismatch); plus the errors of `whatsapp_send_text`.
+**Errors:** a file above its limit is rejected before any request, and so is a file under
+`inbound/` without `allow_inbound`; 131053 (the media upload failed, usually a MIME or extension
+mismatch); plus the errors of `whatsapp_send_text`.
 
 **Example call:**
 
@@ -720,7 +792,7 @@ read-only. Removed in read-only mode.
 |---|---|---|---|
 | `to` | string | yes | The person who sent the message |
 | `message_id` | string | yes | The `wamid` to react to |
-| `emoji` | string | yes | The emoji character; an empty string removes the reaction |
+| `emoji` | string | yes | A single emoji; words and whitespace-only values are refused, and an empty string removes the reaction |
 | `phone_number_id` | string | no | The sending number |
 
 **Result:** the send result. A reaction produces only a `sent` status, never `delivered` or
@@ -762,11 +834,12 @@ reply: use it only when a reply follows. Not read-only. Removed in read-only mod
 
 | Parameter | Type | Required | Meaning |
 |---|---|---|---|
-| `message_id` | string | yes | The `wamid` of an inbound message, up to 30 days old |
+| `message_id` | string | yes | The `wamid` of an inbound message, up to 30 days old (an inbox event ID with its `whatsapp:` prefix works too) |
 | `typing` | boolean | no | Show the typing indicator (default false) |
 | `phone_number_id` | string | no | The number that received the message |
 
-**Result:** Meta's answer, documented as `{"success": true}`. A wrong `message_id` fails with
+**Result:** `{"success": true, "message_id": "wamid.EXAMPLE", "phone_number_id": "106540352242922", "typing_indicator": true}`,
+where `success` is Meta's answer, documented as `{"success": true}`. A wrong `message_id` fails with
 131009. For group messages each message must be marked individually.
 
 **Example call:**
@@ -782,12 +855,13 @@ send. Not read-only. Removed in read-only mode.
 
 | Parameter | Type | Required | Meaning |
 |---|---|---|---|
-| `path` | string | yes | A file inside `META_MCP_FILES_DIR` |
-| `kind` | string | no | The media kind: `image`, `video`, `audio`, `document` or `sticker` |
-| `mime_type` | string | no | Overrides the type detected from the extension |
+| `path` | string | yes | A file inside `META_MCP_FILES_DIR`. A file under `inbound/` is refused unless `allow_inbound` is true |
+| `kind` | string | no | The media kind: `image`, `video`, `audio`, `document` or `sticker`; inferred from the extension when omitted |
+| `mime_type` | string | no | Must restate the type that the file extension gives, and may add parameters (for example `codecs=opus`). It cannot replace a missing or unknown extension |
+| `allow_inbound` | boolean | no | Allow a file under `inbound/`, where downloads from other people are kept (default false) |
 | `phone_number_id` | string | no | The number that owns the upload |
 
-**Result:** `{"media_id": "1037543291543636", "bytes": 80546, "mime": "image/png"}`. Media IDs
+**Result:** `{"media_id": "1037543291543636", "bytes": 80546, "mime": "image/png", "kind": "image", "phone_number_id": "106540352242922"}`. Media IDs
 returned by an upload expire after 30 days (IDs received in webhooks expire after 7 days).
 The size limits of the table above apply and are checked before the upload.
 
@@ -800,32 +874,52 @@ The size limits of the table above apply and are checked before the upload.
 ### `whatsapp_download_media`
 
 Downloads an inbound media file by its media ID (from `inbox_list`, where it is the
-attachment's `media_id`) into the files directory, and returns small images inline. Meta
-expires media IDs 7 days after receipt. Kept in read-only mode. The saved bytes are untrusted
-content.
+attachment's `media_id`) into `inbound/whatsapp` of the files directory, and returns a small
+picture inline. Meta expires media IDs 7 days after receipt. Kept in read-only mode. The saved
+bytes are untrusted content.
 
 | Parameter | Type | Required | Meaning |
 |---|---|---|---|
-| `media_id` | string | yes | The `media_id` of an inbox attachment |
-| `dest_name` | string | no | File name to save as, inside the files directory |
-| `inline` | boolean | no | Default true: also return an image block for an image up to 2 MiB |
-| `overwrite` | boolean | no | Replace an existing file (default false) |
+| `media_id` | string | yes | The `media_id` of an inbox attachment (1 to 32 digits) |
+| `dest_name` | string | no | File name to save as, inside `inbound/whatsapp`; sub-folders are allowed. Default: `whatsapp_` plus the media ID and the extension of the reported type |
+| `inline` | boolean | no | Default true: also return an image block for a real PNG, JPEG, GIF or WEBP picture up to 2 MiB |
+| `overwrite` | boolean | no | Replace an existing file (default false). Refused in read-only mode |
 | `phone_number_id` | string | no | The number that received the media |
 
 **Result:** `{"path": "...", "bytes": 80546, "mime": "image/jpeg", "sha256": "...", "sha256_checked": true, "media_id": "..."}`,
-followed by an image block when `inline` applies.
+followed by an image block when `inline` applies. `inline_skipped` says why an image was saved but not
+shown (`the picture is larger than 2 MiB`, or `the bytes are not a PNG, JPEG, GIF or WEBP picture`).
 
 - The download has two steps: `GET /{media-id}` returns a short-lived URL (valid 5 minutes), then
-  the URL is fetched with the Bearer token, which Meta requires. The URL must be on a Meta media
-  host (`lookaside.fbsbx.com` or `*.whatsapp.net` by default); any other host fails before any
-  request is made, and the token is sent only to the allowed host.
-- When Meta reports a SHA-256, the bytes are checked against it (hex, case-insensitive).
-  `sha256_checked` is false when the reported value is not valid hex.
+  the URL is fetched with the Bearer token, which Meta requires.
+- **Host rules.** The URL must be https (plain http only for loopback) on `*.fbcdn.net`,
+  `*.fbsbx.com`, `*.whatsapp.net`, `lookaside.fbsbx.com` or a bare host name you added to
+  `META_MCP_DOWNLOAD_HOSTS`, and the same check runs on every redirect. `*.facebook.com` and `*.messenger.com` are not allowed, and the Graph
+  API host (the host of `META_GRAPH_BASE_URL`) is refused in every case, even if you list it. Any
+  other host fails before the file is requested.
+- **Token.** It is sent only when the host is `lookaside.fbsbx.com`, ends in `.whatsapp.net` or is one
+  you listed, and only for the exact host and port of that request: a redirect to another host or port
+  gets no token. Other allowed hosts are fetched without one.
+- **File name.** The default is `whatsapp_<media id>.<extension>`, with the extension taken from the
+  type Meta reports (`bin` when it is unknown). `dest_name` is relative to `inbound/whatsapp`, may hold
+  sub-folders and cannot leave that folder. It is checked before any request is made: a path component
+  over 200 bytes, a component that starts with a dot, or a name that is already taken (without
+  `overwrite`) fails at once and nothing reaches Meta. meta-mcp does not read a `Content-Disposition`
+  header.
+- **Inline images.** The same structural check as `messenger_download_attachment`: the bytes must parse
+  as a PNG, JPEG, GIF or WEBP picture and fit in 2 MiB. The type Meta reports is not trusted for this.
+- When Meta reports a SHA-256, the bytes are checked against it (hex, case-insensitive) and a mismatch
+  saves nothing. `sha256_checked` is false when Meta reported no digest, or one that is not valid hex.
+- In read-only mode `overwrite=true` is refused (`overwrite=true is refused in read-only mode (META_MCP_READ_ONLY): a download may only create a new file`),
+  so the tool can only create new files there.
 - A 404 on the media URL means it expired: call the tool again to get a fresh URL.
 
-**Errors:** `refusing to download from host X: not an allowed Meta media host, and no token was sent`;
-`download answered HTTP 404`; Graph errors for an expired or unknown media ID; file errors from
-the table at the top of this page.
+**Errors:** `refusing to download from X: only https on a Meta media host or a host in META_MCP_DOWNLOAD_HOSTS is fetched (plain http for loopback only); nothing was fetched`;
+`refusing to download from host X: not an allowed Meta media host, and no token was sent` (a redirect
+to another host);
+`refusing to download from X: it is the Graph API host, where a fetch is an API call made with your credentials, not a media download; nothing was fetched`;
+`download answered HTTP 404`; Graph errors for an expired or unknown media ID; the SHA-256 mismatch;
+file errors from the table at the top of this page.
 
 **Example call:**
 
@@ -863,5 +957,6 @@ resulting list.
 | `whatsapp_download_media` | available (writes only inside the files directory) |
 
 Nine tools remain. Read-only mode does not hide data: the read tools still return conversations
-and inbox events. The webhook receiver keeps storing events, and the `setup`, `token` and
-`doctor` commands are not tools, so they are unaffected.
+and inbox events. Both download tools refuse `overwrite=true` in read-only mode and so can only
+create new files. The webhook receiver keeps storing
+events, and the `setup`, `token` and `doctor` commands are not tools, so they are unaffected.

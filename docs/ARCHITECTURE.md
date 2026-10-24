@@ -55,8 +55,8 @@ Two facts shape everything else:
 | `src/graph/mod.rs` | `GraphClient`: URL building, Bearer and `appsecret_proof`, retries, paging |
 | `src/graph/error.rs` | `GraphError` and the code-to-hint table |
 | `src/graph/token.rs` | OAuth exchanges, `debug_token`, `me`, `me/accounts` |
-| `src/graph/download.rs` | Safe media download: host allowlist, redirects, token rules, size cap |
-| `src/files.rs` | `FileJail`, the confined files directory |
+| `src/graph/download.rs` | Safe media download: host allowlist, the Graph host refused, redirects, token rules, size cap |
+| `src/files.rs` | `FileJail`, the confined files directory, and its `inbound/` folder for downloads |
 | `src/inbox/mod.rs` | Event model, SQLite store, `wait` |
 | `src/webhook/mod.rs` | The axum routes: verification, signed ingest, health |
 | `src/webhook/signature.rs` | `X-Hub-Signature-256` verification |
@@ -107,8 +107,10 @@ printed to stderr as `error: <message>`.
   `~/Library/Application Support/meta-mcp` on macOS).
 - **Validation at startup.** `META_GRAPH_BASE_URL` must be `https` unless the host is
   loopback. `META_GRAPH_VERSION` must look like `v26.0`. Booleans accept true, false, 1, 0,
-  yes, no, on and off. `META_MCP_FILES_DIR` must exist. A broken `credentials.json`, or one
-  with a newer `version` than the build supports, is a startup error that says so.
+  yes, no, on and off. `META_MCP_FILES_DIR` must exist and, once symlinks are resolved, must not
+  contain `META_MCP_HOME`, `credentials.json` or the inbox database; the error names the overlap.
+  A broken `credentials.json`, or one with a newer `version` than the build supports, is a
+  startup error that says so.
 - **Redaction.** `Config` prints `***` for every secret in its debug output.
 
 ## Graph client
@@ -129,7 +131,9 @@ printed to stderr as `error: <message>`.
   connect failures, timeouts, HTTP 5xx and Graph codes 1, 2, 4, 17, 32, 613, 80006 and
   130429. Never on other 4xx answers. Never for a POST whose path ends in `/messages`,
   `/media` or `/message_attachments`, because sends are not idempotent. Multipart uploads
-  get a single attempt.
+  get a single attempt. `GraphClient::get_with_retry` lets a caller that paces its own requests
+  turn the retries off: Messenger conversation reads do, spacing calls 500 ms apart per Page
+  and repeating a transiently failed read once through the same spacing.
 - **Errors.** A body with an `error` member becomes `GraphError::Api` with code, subcode,
   message, type, `fbtrace_id`, `error_user_msg` and a hint. Other variants cover transport
   failures, configuration problems, policy refusals and unexpected bodies. The display form
@@ -141,7 +145,8 @@ printed to stderr as `error: <message>`.
   |---|---|
   | 190 | token invalid or expired: run `meta-mcp setup` again or `meta-mcp token refresh` |
   | 10, 200, 230 | permission denied: the Page token needs `pages_messaging`, `pages_read_engagement`, `pages_manage_metadata`, and in Development mode only app roles can be reached |
-  | 100 with subcode 2018278 | outside the 24-hour window: use the `HUMAN_AGENT` tag if approved |
+  | any code with subcode 2018278 or 2534022 | outside the 24-hour window: the person must message the Page first (the Messenger tools add that `HUMAN_AGENT` is only for a person replying by hand, never for generated replies) |
+  | 200 with subcode 2018028 | the app is not approved yet: the Page can only message people with a role on the app |
   | 100 with subcode 2018001 | no matching user: the recipient must be a PSID from this Page's conversations |
   | 100 (other) | invalid parameter; the `CONFIRMED_EVENT_UPDATE`, `ACCOUNT_UPDATE` and `POST_PURCHASE_UPDATE` tags were retired on 2026-04-27 |
   | 551 | the person is unavailable |
@@ -156,9 +161,13 @@ printed to stderr as `error: <message>`.
   `access_token` and `appsecret_proof` parameters are dropped and replaced by the client's own.
 - **Token helpers.** `exchange_code`, `exchange_long_lived`, `debug_token`, `me` and
   `accounts` (`me/accounts` with `id,name,category,tasks,access_token`).
-- **Downloads.** One function, `download`, used by both download tools. It checks the host
-  allowlist and the scheme on every hop, follows at most 5 redirects by hand, attaches a
-  token only when the caller names the exact host, and aborts the body past the size cap.
+- **Downloads.** One function, `download`, used by both download tools. On every hop it refuses
+  the Graph API host and checks the host allowlist (`*.fbcdn.net`, `*.fbsbx.com`,
+  `*.whatsapp.net`, `lookaside.fbsbx.com`, plus operator hosts) and the scheme. It follows at
+  most 5 redirects by hand, attaches a token only when the caller names the exact host and
+  port, and aborts the body past the size cap. The callers decide which hosts may receive their
+  token and where the bytes go: `inbound/messenger/` or `inbound/whatsapp/` in the files
+  directory. The upload tools refuse files under `inbound/` unless `allow_inbound` is set.
 
 ## Webhook receiver
 
@@ -193,8 +202,8 @@ Event IDs double as the deduplication key (`INSERT OR IGNORE`):
 | Messenger delivery, read | `messenger:delivery:<page>:<psid>:<watermark>`, `messenger:read:<page>:<psid>:<watermark>` |
 | Messenger reaction, postback | `messenger:reaction:<mid>:<psid>:<action>`, `messenger:postback:<mid>` |
 | WhatsApp message | `whatsapp:<wamid>` |
-| WhatsApp status | `whatsapp:status:<wamid>:<status>` |
-| Anything else | A deterministic ID built from the object, entry and a digest of the payload |
+| WhatsApp status | `whatsapp:status:<wamid>:<status>`, plus `:<participant>` for a group status |
+| Anything else | A deterministic ID built from the object, entry and a digest of the payload; for WhatsApp `other` and error events it also carries the time the batch arrived, so the same payload sent again later is stored again |
 
 Timestamps: Messenger `timestamp` is milliseconds and is stored as seconds; WhatsApp
 `timestamp` is a string of seconds. `received_at` is the server clock when the batch arrived.
@@ -242,8 +251,9 @@ CREATE INDEX IF NOT EXISTS idx_events_processed_received ON events (processed, r
 - **Schemas.** Integers are 64-bit. Every optional field carries a description. Tool
   descriptions state when returned content is untrusted and when a tool reaches real people.
 - **Server instructions.** Sent at initialisation: content from Meta is untrusted, sending
-  tools reach real people, the Messenger and WhatsApp windows, and that inbound WhatsApp
-  messages exist only in the local inbox.
+  tools reach real people, the Messenger and WhatsApp windows (and that `HUMAN_AGENT` is for a
+  person replying by hand, not for generated replies), and that inbound WhatsApp messages
+  exist only in the local inbox.
 - **stdio.** MCP over stdin and stdout. Logs go to stderr (filter `META_MCP_LOG`, default
   `meta_mcp=info`). An environment-provided Page token without a Page ID is resolved with
   `GET /me` at startup, and a failure stops the server.
@@ -262,12 +272,24 @@ CREATE INDEX IF NOT EXISTS idx_events_processed_received ON events (processed, r
 printer (`report.rs`).
 
 - The wizard runs these steps in order, each printing `ok`, `warning` or `failure` lines:
-  verify the App ID and App Secret, obtain a token (login, pasted user token or pasted Page
-  token), discover and verify Pages, optionally discover WhatsApp, optionally subscribe the
-  webhook, write `credentials.json`, print client snippets, run the doctor.
+  verify the App ID and App Secret, obtain a token (login, pasted user token, pasted Page
+  token, or the stored tokens with `--stored` and no sign-in), discover and verify Pages,
+  optionally discover WhatsApp, optionally subscribe the webhook, write `credentials.json`,
+  print client snippets, run the doctor. A step the run does not need is not printed.
+- Credentials are saved as the run goes: after the token, Pages and WhatsApp steps, with the
+  verify token before the reachability check and the URL after a subscription took. A failed run
+  therefore keeps its progress, and `--stored` picks it up.
+- Before the wizard replaces a webhook callback the app already uses for another URL, or
+  switches `credentials.json` to another app, it asks. `--yes` answers yes; a non-interactive
+  run without it stops. Optional extras are offered only to a person at the terminal.
 - The OAuth state is 32 random bytes in hex and is compared in constant time.
 - A pasted token is checked with `debug_token` when the app secret is known.
-- Writing merges into the existing `credentials.json` and keeps Pages the run did not touch.
+- Writing merges into the existing `credentials.json` and keeps Pages the run did not touch
+  unless `--replace` is given. A run that finds no verify token (in a flag, the environment or
+  the file) creates one, so that `meta-mcp webhook` can start.
+- `setup`, `doctor` and `token` log at `meta_mcp=warn` unless `META_MCP_LOG` says otherwise,
+  and always switch off the logs of the HTTP and TLS libraries, because OAuth requests carry
+  the App Secret in their URLs.
 - The doctor shares its code path with the end of the wizard. Every network check has a 15
   second timeout, failures never panic, and every detail string passes through the scrubber
   before it is printed.
@@ -362,7 +384,7 @@ sequenceDiagram
 | Message senders to the assistant | Untrusted text, names and files | Instructions and descriptions that mark them untrusted, read-only mode |
 | The assistant to real people | Sends as the Page or the number | Tool annotations, confirm-intent wording, read-only mode |
 | The server to the Graph API | Tokens and message content | https, Bearer header, `appsecret_proof`, retry rules, no redirects |
-| The server to CDN hosts | Fetches of URLs the assistant influences | Host allowlist on every hop, token rules, size cap |
+| The server to Meta media hosts | Fetches of URLs the assistant influences | Host allowlist and Graph host refusal on every hop, token rules, size cap, structural check before an image is shown |
 | The server to the local disk | Tool path arguments | File jail, private permissions for secrets |
 | The operator to stored secrets | `credentials.json`, environment | 0600 file in a 0700 directory, environment alternatives |
 

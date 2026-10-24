@@ -803,6 +803,12 @@ impl Messenger {
     ) -> Result<(Value, Option<(String, String)>), GraphError> {
         let jail = self.jail()?.clone();
         let page = self.page(p.page_id.as_deref())?;
+        if p.overwrite.unwrap_or(false) && self.cfg.read_only {
+            return Err(GraphError::Refused(
+                "overwrite=true is refused in read-only mode (META_MCP_READ_ONLY): a download may only create a new file"
+                    .into(),
+            ));
+        }
         let (raw_url, source_name, source_mime) = match (clean(p.url), clean(p.message_id)) {
             (Some(u), None) => (u, None, None),
             (None, Some(mid)) => {

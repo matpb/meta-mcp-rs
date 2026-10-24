@@ -719,59 +719,106 @@ meta-mcp setup --app-id 123456789012345 --app-secret-env META_APP_SECRET \
 ```
 
 With `--non-interactive`, or whenever stdin is not a terminal, a missing value is a usage error
-that names the flag and exits with code 2.
+that names the flag and exits with code 2. A login run that cannot ask must also name the Pages to
+store (`--page-id`, repeatable, or `--all-pages`) and, for WhatsApp, the numbers (`--phone-number-id`);
+Part 4.3 has the exact rules. To run the wizard again on tokens you already stored, without a new
+sign-in, add `--stored`.
 
 ### 4.3 Every flag
 
 Precedence for every value: **flag, then environment** (`META_APP_ID`, `META_APP_SECRET`,
 `META_WEBHOOK_PUBLIC_URL`, `META_WEBHOOK_VERIFY_TOKEN`), **then the existing `credentials.json`,
-then an interactive prompt.**
+then an interactive prompt.** For the App Secret that means `--app-secret`, `--app-secret-env` or
+`--app-secret-file`, then `META_APP_SECRET`, then the secret already stored for the same App ID, then
+a hidden prompt. `meta-mcp setup --help` prints the same flags; the table follows its order.
 
 | Flag | Meaning |
 |---|---|
-| `--app-id ID` | The Meta App ID |
-| `--app-secret SECRET` | The App Secret. Accepted, but your shell history keeps it, and the wizard warns |
-| `--app-secret-env NAME` | Read the App Secret from the environment variable `NAME` (recommended) |
-| `--app-secret-file PATH` | Read the App Secret from a file |
-| `--login` | Sign in with Facebook Login in the browser. The default when no token flag is given |
+| `--app-id ID` | The Meta App ID. Without it the wizard uses `META_APP_ID`, then the one in `credentials.json`, then asks |
+| `--app-secret SECRET` | The App Secret. Accepted, but your shell history and the process list keep it, and the wizard warns |
+| `--app-secret-env NAME` | Read the App Secret from the environment variable `NAME` (recommended). An unset variable is a usage error |
+| `--app-secret-file PATH` | Read the App Secret from the first line of a file. The wizard warns when other users can read the file |
+| `--login` | Sign in with Facebook Login in the browser. It is what a non-interactive run does when no token flag is given; an interactive run without a token flag first asks how to sign in (browser, pasted user token, pasted Page token, or the stored tokens when there are any) |
 | `--user-token TOKEN` | Use a pasted user token (Graph API Explorer or System User) instead of signing in |
-| `--page-token TOKEN` | Use a pasted Page token. No user token is stored |
+| `--page-token TOKEN` | Use a pasted Page token. This run stores no user token (one already stored stays) |
+| `--stored` | Reuse the tokens already in `credentials.json` instead of signing in. The app, the Pages and the numbers are still checked, and the webhook step still runs. This is how you subscribe or re-subscribe the webhook later, for example after downtime (Parts 6.4 and 8.6). It stops when the file holds no token for this App ID |
 | `--redirect-mode loopback\|paste` | `loopback` (default) or `paste` (Part 3.2) |
-| `--redirect-uri URI` | Override the redirect URI in either mode |
+| `--redirect-uri URI` | Override the redirect URI in either mode. In loopback mode it must be a plain `http` address on `localhost` or `127.0.0.1` with an explicit port, and `--port` must agree with that port |
 | `--port N` | Loopback or paste port, default 8766. A busy port is an error that names the fix |
-| `--config-id ID` | Facebook Login for Business configuration ID (Part 3.3) |
+| `--config-id ID` | Facebook Login for Business configuration ID (Part 3.3). It replaces the scope list |
 | `--rerequest` | Re-ask permissions the person declined earlier (`auth_type=rerequest`) |
 | `--no-browser` | Print the dialog URL and do not open a browser |
-| `--timeout-seconds N` | How long to wait for the sign-in callback, default 300 |
-| `--page-id ID` | Select this Page; repeatable |
-| `--all-pages` | Select every Page the user manages |
-| `--no-messenger` | Skip Page discovery (a WhatsApp-only setup) |
-| `--replace` | Replace the stored Pages instead of keeping those this run did not touch |
-| `--whatsapp` | Also set up WhatsApp |
-| `--whatsapp-token TOKEN` | A System User token for WhatsApp |
+| `--page-id ID` | Store this Page; repeatable. With `--stored` it narrows the stored Pages, and an ID that is not stored is an error |
+| `--all-pages` | Store every Page the login can manage |
+| `--no-messenger` | Skip Messenger and Pages (a WhatsApp-only setup). Alone it is a usage error: it needs `--whatsapp` (or `--stored`) |
+| `--replace` | Drop the stored Pages this run did not select, instead of keeping them. It also allows switching `credentials.json` to another app |
+| `--whatsapp` | Also set up the WhatsApp Cloud API. `--whatsapp-token`, `--waba-id` and `--phone-number-id` imply it |
+| `--whatsapp-token TOKEN` | A System User token for WhatsApp. Without it the wizard keeps the System User token already stored, else uses the user token |
 | `--waba-id ID` | The WhatsApp Business Account ID |
-| `--phone-number-id ID` | A business phone number ID; repeatable |
+| `--phone-number-id ID` | A business phone number ID to store; repeatable |
 | `--instagram` | Also request the Instagram scopes (`instagram_basic`, `instagram_manage_messages`) |
-| `--webhook-url URL` | The public webhook URL to subscribe. Plain `http` is accepted for loopback hosts only |
-| `--webhook-override` | Also register the URL as a WhatsApp override callback (Part 7.5) |
-| `--verify-token TOKEN` | The webhook verify token; generated (32 random bytes in hex) when none exists |
-| `--non-interactive` | Never prompt; a missing value exits with code 2 |
-| `--yes` | Accept confirmation prompts |
+| `--webhook-url URL` | The public webhook URL to subscribe (or `META_WEBHOOK_PUBLIC_URL`). Plain `http` is accepted for loopback hosts only, and the URL must be the bare callback, without `hub.*` parameters |
+| `--webhook-override` | Point only the WhatsApp account at the webhook and leave the app-level callback alone (Part 7.5). The account gets a callback override, sent as a JSON body, and the app-level WhatsApp attempt is skipped |
+| `--verify-token TOKEN` | The webhook verify token (or `META_WEBHOOK_VERIFY_TOKEN`). Generated (32 random bytes in hex) when none is given or stored |
+| `--non-interactive` | Never prompt; a missing value is a usage error (exit code 2) |
+| `--timeout-seconds N` | How long to wait for the sign-in callback or the pasted URL, default 300 |
+| `-y`, `--yes` | Answer yes to the confirmations: replacing a different webhook callback, switching apps, and continuing when the current callback cannot be read |
+| `-h`, `--help` | Print the help (`-h` is the short summary) |
+
+Some flags exclude each other, and the command line is then refused with exit code 2: `--app-secret`,
+`--app-secret-env` and `--app-secret-file` (at most one); `--login`, `--user-token`, `--page-token` and
+`--stored` (at most one); `--page-token` with `--no-messenger`; and `--page-id`, `--all-pages` and
+`--no-messenger` (at most one of the three).
+
+**Runs that cannot ask.** With `--non-interactive`, or whenever stdin is not a terminal, nothing is
+prompted and a missing value is a usage error (exit code 2) that names the flag. Two selections are
+checked before the sign-in, so that it is not wasted:
+
+- A run that signs in (the default, `--login` or `--user-token`) and keeps Messenger needs `--page-id`
+  (repeatable) or `--all-pages`, because the sign-in lists the Pages and nobody can pick. A run with
+  `--page-token`, `--stored` or `--no-messenger` needs no Page selection.
+- A run that sets up WhatsApp needs `--phone-number-id` (repeatable), unless the numbers already stored
+  for this App ID can be reused: that is the case when `credentials.json` holds numbers and you did not
+  pass `--waba-id`.
+
+**Confirmations.** The wizard asks before it does something that is hard to take back: replacing a
+webhook callback the app already uses for another URL, replacing everything stored when
+`credentials.json` belongs to another app, and continuing when it cannot read which callback the app
+has today. `--yes` answers yes to those three (`--replace` also covers the app switch). Without it a
+non-interactive run answers no and stops with a message that names the flag. Optional extras, such as
+"Also set up WhatsApp?" or "Subscribe to webhooks now?", are offered only to a person at the terminal:
+`--yes` does not accept them.
+
+**Logs.** `setup`, `doctor` and `token` log to stderr at `meta_mcp=warn` unless `META_MCP_LOG` says
+otherwise, and they always switch off the logs of the HTTP and TLS libraries, because the OAuth requests
+carry the App Secret in their URLs. The login URL is printed in full; secrets never are.
 
 ### 4.4 What each step does and verifies
 
-The wizard prints numbered steps with `✅` (done), `⚠️` (warning), `❌` (failed) and `ℹ️` lines,
-no colour codes, and every `❌` is followed by a `Fix:` line.
+The wizard prints a `Step N: <title>` header, then `✅` (done), `⚠️` (warning), `❌` (failed) and `ℹ️`
+lines, with no colour codes, and every `❌` is followed by a `Fix:` line. Steps are numbered as they
+run, so a step the run does not need is not printed.
 
 | Step | What it does | What it verifies |
 |---|---|---|
-| 1. App | Resolves the App ID and App Secret | `GET /{app-id}?fields=id,name,link` with the app token proves the pair, and prints `✅ App <name> (<id>)`. On error 190 or 101: `❌ App ID or App Secret rejected: Settings > Basic in the App Dashboard` |
-| 2. Token | Obtains a token (login, pasted user token, or pasted Page token) | Login: `state` is 32 random bytes in hex and is compared in constant time; the code is exchanged for a short-lived token and then a long-lived one; `debug_token` records scopes and expiry. Missing scopes print `⚠️ missing scope X: rerun with --rerequest`, which is fatal only when `pages_messaging` is missing in a Messenger setup. Pasted Page token: `debug_token` warns when `pages_messaging`, `pages_manage_metadata` or `pages_read_engagement` is missing, and `GET /me` names the Page |
-| 3. Pages | Lists the Pages (`GET /me/accounts`, paginated), selects (flags or a numbered prompt) and stores each Page token | Each Page: `GET /{page-id}?fields=id,name` and `GET /{page-id}/conversations?limit=1&platform=messenger`. A result of code 10, 200 or 230 prints `⚠️` with the permission and task names |
-| 4. WhatsApp | Discovers businesses, WhatsApp Business Accounts and phone numbers, or uses `--waba-id` and `--phone-number-id` | Each number: `GET /{phone-number-id}?fields=display_phone_number,verified_name,quality_rating,code_verification_status,status`. Warns that a user token expires in 60 days |
-| 5. Webhook | Generates or reuses the verify token, checks reachability, subscribes at app and Page level, and for WhatsApp tries the app level and subscribes the WABA | The reachability self-check, then read-backs of the subscriptions. Detail in Part 6.4 |
-| 6. Save | Writes `credentials.json` by merging into the existing file | Prints the path and its permissions |
-| 7. Finish | Prints client snippets and runs the doctor | Exits with the doctor's code |
+| App | Resolves the App ID and App Secret | `GET /{app-id}?fields=id,name,link` with the app token proves the pair, and prints `✅ App <name> (<id>)`. On error 190 or 101: `❌ App ID or App Secret rejected: Settings > Basic in the App Dashboard`. If the rejected secret came from `credentials.json` (was it reset?), an interactive run asks for the current one and a non-interactive run stops and names `--app-secret-env`. If `credentials.json` belongs to another App ID, the run stops unless you pass `--replace` or `--yes` (or answer yes), because switching apps drops the stored Pages, tokens, WhatsApp account and webhook settings |
+| Sign in with Facebook, User token, Page token or Stored tokens | Obtains the token by the route you chose (`--login`, `--user-token`, `--page-token` or `--stored`) | Login: `state` is 32 random bytes in hex and is compared in constant time; the code is exchanged for a short-lived token and then a long-lived one; `debug_token` records scopes and expiry. Missing scopes print `⚠️ missing scope X: rerun with --rerequest`, which is fatal only when `pages_messaging` is missing in a Messenger setup. Pasted user token: `debug_token` refuses a Page token, and a token that expires within two hours is exchanged for a long-lived one. Pasted Page token: `debug_token` refuses any other token type, warns when `pages_messaging`, `pages_manage_metadata` or `pages_read_engagement` is missing or when the token expires, and `GET /me` names the Page. Stored tokens: nothing is requested, and the step stops when `credentials.json` holds no token for this App ID. When a login would ask for no permission at all (Messenger off, and a stored System User token serves WhatsApp), the sign-in is skipped with `ℹ️ no sign-in is needed` |
+| Pages | Lists the Pages (`GET /me/accounts`, paginated), selects (flags or a numbered prompt) and stores each Page token | Each Page: `GET /{page-id}?fields=id,name` and `GET /{page-id}/conversations?limit=1&platform=messenger`. A result of code 10, 200 or 230 prints `⚠️` with the permission and task names. With `--stored` the stored Pages are re-checked and no list is fetched; with `--page-token` the one Page is checked. A login that manages no Page continues with WhatsApp when WhatsApp is on |
+| WhatsApp | Uses `--whatsapp-token`, else the System User token already stored, else the user token. Discovers businesses, WhatsApp Business Accounts and phone numbers, or skips discovery when a System User token comes with `--waba-id` and `--phone-number-id`, or reuses the stored numbers when you pass neither | Each number: `GET /{phone-number-id}?fields=display_phone_number,verified_name,quality_rating,code_verification_status,status`. Warns that a user token expires in about 60 days, and when a System User token expires within 7 days. A stored System User token that no longer works is replaced by the user token if that has the WhatsApp permissions; otherwise the step stops and names `--whatsapp-token` |
+| Webhook | Skipped, with the command to run later, unless a URL comes from `--webhook-url`, `META_WEBHOOK_PUBLIC_URL` or the prompt. Then it settles the verify token, checks that the URL is reachable and subscribes at app, Page and WhatsApp level | The reachability self-check, then read-backs of the subscriptions. A callback the app already uses for another URL is replaced only after a yes or `--yes`. Detail in Part 6.4 |
+| Credentials | Writes `credentials.json` by merging into the existing file; Pages the run did not touch are kept unless you pass `--replace` | Prints the path and its permissions |
+| Connect your client and check everything | Prints client snippets and runs the doctor | Exits with the doctor's code |
+
+**Progress is saved as it goes.** The token, Pages and WhatsApp steps each write `credentials.json` as
+soon as they have something to keep, the webhook step stores the verify token before the reachability
+check and the URL after a subscription took, and the Credentials step writes the final merge. When a
+step fails after something was saved, the wizard prints `ℹ️ progress so far is saved in <path>`, so
+the rerun (or `--stored`) does not start from nothing.
+
+**The verify token.** A run that finds no verify token anywhere (not in `--verify-token`, not in
+`META_WEBHOOK_VERIFY_TOKEN`, not in `credentials.json`) creates one, 32 random bytes as 64 hex
+characters, even when no webhook URL was given, so that `meta-mcp webhook` can start. It is created
+once, kept on later runs and never printed.
 
 ### 4.5 The `credentials.json` result
 
@@ -810,7 +857,7 @@ others.
 |---|---|
 | `version` | Schema version, 1. A newer file than the build supports is refused |
 | `app_id`, `app_secret` | Omitted when unknown |
-| `user_token` | `null` when you used `--page-token`. `expires_at` is Unix seconds or `null`; `scopes` are what `debug_token` reported |
+| `user_token` | `null` when none was ever stored (for example after a first run with `--page-token`, which stores no user token). `expires_at` is Unix seconds or `null`; `scopes` are what `debug_token` reported |
 | `pages` | One entry per stored Page, each with its own non-expiring Page token (when derived from a long-lived user token) |
 | `whatsapp` | `null` without WhatsApp. `token_kind` is `user` or `system_user` |
 | `webhook` | The verify token and the public URL |
@@ -821,31 +868,36 @@ An empty `{}` file loads as an empty configuration.
 
 ```bash
 meta-mcp doctor            # exit 0 when no check failed, 1 otherwise
-meta-mcp doctor --json     # {"checks": [...], "ok": true|false}
-meta-mcp doctor --webhook  # also GET the public callback URL
+meta-mcp doctor --json     # {"checks": [...], "ok": true|false, "summary": {...}}
+meta-mcp doctor --webhook  # also test that the public callback answers the verification handshake
 ```
 
-The summary line reads `N ok, N warnings, N failures`. Each check is a status (`✅`, `⚠️`, `❌`), a
-detail, and for anything not green a `Fix:` line. Every network check has a 15-second timeout and
-a failure never crashes the command. Tokens and the app secret are never printed. Line by line:
+The summary line reads `N ok, N warnings, N failures`. Each check is a status (`✅`, `⚠️`, `❌`, or `ℹ️`
+for information, which the counts leave out), a name, a detail, and for anything not green a `Fix:` line.
+Every network check has a 15-second timeout and a failure never crashes the command. Tokens and the app
+secret are never printed. A configuration error, for example a bad `META_MCP_FILES_DIR`, shows up as one
+failing `config` check. The `--json` document has three keys: `checks` (each with `name`, `status` as
+`ok`, `warn`, `fail` or `info`, `detail`, and `fix`, which is `null` when there is none), `ok` (true when
+nothing failed) and `summary` (the `ok`, `warnings` and `failures` counts). Line by line:
 
 | Check | Calls and looks at | Warning when | Failure when |
 |---|---|---|---|
-| App | `GET /{app-id}?fields=id,name` with the app token; the mode of `credentials.json` when the file exists | The file's mode is not 0600 (the fix offers `chmod 600`) | The app token is rejected |
-| User token | `debug_token`: validity, days left, scopes | Under 10 days left (fix: `meta-mcp token refresh`); a scope is missing | The token is invalid (fix: `meta-mcp setup`) |
-| Each Page | `debug_token` (type, expiry), `GET /{page-id}?fields=id,name`, the conversations probe, `subscribed_apps` fields | A webhook is configured but `messages` is missing from the subscribed fields (fix: `meta-mcp setup --webhook-url ...`) | The token is invalid or a call fails; the line names `meta-mcp setup` |
-| App subscriptions | `GET /{app-id}/subscriptions` | A public URL is stored but no `object=page` subscription matches it | The call fails |
-| WhatsApp | The token with `debug_token`, each phone number, and the WABA's `subscribed_apps` (does it list this app) | | A call fails |
-| Webhook | The stored public URL and verify token; with `--webhook`, our own verification GET against the callback | | With `--webhook`, the callback does not answer with the challenge |
-| Inbox | Opens the database; counts and the age of the last event | A webhook is configured and no event arrived in 7 days ("send a test from the dashboard") | The database cannot be opened |
-| Files directory | Configured and writable (information) | | |
-| Read-only | The flag is reported (information) | | |
+| `setup` | Whether any Page or WhatsApp number is configured | | None is (fix: `meta-mcp setup`) |
+| `app` | `GET /{app-id}?fields=id,name` with the app token | The App ID or App Secret is unknown | The app token is rejected, or the call fails |
+| `credentials` | The mode of `credentials.json` | The file is missing, or its mode is not 0600 (the fix offers `chmod 600`) | |
+| `user token`, `user scopes` | `debug_token`: validity, days left, scopes | Under 10 days left (fix: `meta-mcp token refresh`); a scope is missing | The token is invalid or expired (fix: `meta-mcp setup`) |
+| Each Page | `debug_token` (type, expiry, scopes), `GET /{page-id}?fields=id,name`, the conversations probe, `subscribed_apps` fields | The conversations probe is refused or fails; a webhook is configured but `messages` is missing from the subscribed fields (fix: `meta-mcp setup --stored --webhook-url ...`) | The token is invalid or a call fails; the line names `meta-mcp setup` |
+| `app subscription` | `GET /{app-id}/subscriptions`, when a public URL is stored and a Page is configured | There is no `object=page` subscription, it calls another URL, lacks `messages` or is inactive | |
+| WhatsApp | The token with `debug_token`, each phone number, and the WABA's `subscribed_apps` (does it list this app, and does a callback override send events elsewhere) | The token is close to expiry, the app is not subscribed while a webhook is configured, or an override points elsewhere | The token is invalid or a number cannot be read |
+| `webhook`, `webhook reachability` | The stored public URL and verify token; with `--webhook`, our own verification GET against the callback | A public URL is stored without a verify token | With `--webhook`, the callback does not answer with the challenge |
+| `inbox` | Opens the database; counts and the age of the last event | A webhook is configured and no event arrived in 7 days ("send a test from the dashboard"), or there is no database yet | The database cannot be opened |
+| `files`, `mode`, `access` | The files directory is writable, the read-only flag, and (when a Page is configured) the gate test of Part 2.5 as a reminder | The files directory is not writable | |
 
 ### 4.7 The token commands
 
 ```bash
 meta-mcp token refresh              # re-exchange the stored user token and re-derive Page tokens
-meta-mcp token refresh --whatsapp   # refresh the stored WhatsApp token the same way
+meta-mcp token refresh --whatsapp   # also refresh the stored WhatsApp token
 meta-mcp token import --page-token TOKEN
 meta-mcp token import --user-token TOKEN
 meta-mcp token import --whatsapp-token TOKEN --phone-number-id ID --waba-id ID
@@ -853,11 +905,26 @@ meta-mcp token show                 # kinds, expiry, scopes, names; never a toke
 meta-mcp token show --json
 ```
 
-`token refresh` uses the stored app secret to trade the user token for a fresh long-lived one
-(`fb_exchange_token`), stores the new token and expiry, and replaces the stored Page tokens of the
-same Pages. With `--whatsapp` it refreshes the WhatsApp token with `set_token_expires_in_60_days=true`.
-`token import` checks the value with `debug_token` when the app secret is known, then stores it.
-`token show` prints at most `EAA` plus 4 characters of any token, and normally none.
+`token refresh` needs the App ID and App Secret (from `credentials.json` or the environment). It trades
+the stored user token for a fresh long-lived one (`fb_exchange_token`), stores the new token and expiry,
+and replaces the stored Page tokens of the same Pages (a Page that `me/accounts` no longer returns keeps
+its old token and gets a warning). A WhatsApp token that is the user token follows it. `--whatsapp` also
+handles a separate stored WhatsApp token: it asks `debug_token` first, leaves a token that never expires
+alone ("nothing to refresh"), stops on one that is no longer valid, and otherwise exchanges it, with
+`set_token_expires_in_60_days=true` for a System User token. It still runs when the user token cannot be
+refreshed, and what was refreshed and saved before a failure stays saved. With no stored user token,
+`token refresh` stops and points at `meta-mcp setup --login` and `token import --user-token`;
+`--whatsapp` alone can still refresh a WhatsApp token.
+
+`token import` stores exactly one kind per run: `--page-token`, `--user-token` or `--whatsapp-token`
+(none, or more than one, is a usage error). `--phone-number-id` and `--waba-id` go with `--whatsapp-token`
+only. It checks the value with `debug_token` when the app secret is known (an invalid token is refused
+and nothing is stored, and so is a `--page-token` that is not a Page token), asks `GET /me` who owns
+it, checks a phone number with the token, and then stores it in `credentials.json`.
+
+`token show` prints the stored kinds, issue and expiry dates, scopes, Page and number IDs and names,
+and whether the app secret and the verify token are set. It never prints a token value, the app
+secret or the verify token; `--json` gives the same facts as one document.
 
 **Lifetimes** (as documented): a short-lived user token lasts about 1 to 2 hours; a long-lived one
 about 60 days ("You can not use an expired token to request a long-lived token"); Page tokens
@@ -955,9 +1022,12 @@ against Meta's rules.
    resolves to the PSID: Meta offers no way to send to a conversation ID). Use `reply_to_mid` to
    quote a message.
 5. **Attachments.** `messenger_send_attachment` sends an image, audio, video or file by URL or from a
-   file in `META_MCP_FILES_DIR`. `messenger_download_attachment` saves one the customer sent. Meta
-   documents no supported-format list for Messenger attachments (UNVERIFIED), and the docs do not say
-   whether text and an attachment can share one message (UNVERIFIED), so send them as two calls.
+   file in `META_MCP_FILES_DIR`. `messenger_download_attachment` saves one the customer sent, into
+   `inbound/messenger/` in that directory. Files under `inbound/` came from other people, so
+   sending one on needs `allow_inbound=true` on the send call; pass it only when the user asked to
+   forward that exact file. Meta documents no supported-format list for Messenger attachments
+   (UNVERIFIED), and the docs do not say whether text and an attachment can share one message
+   (UNVERIFIED), so send them as two calls.
 6. **Sender actions.** `messenger_sender_action` with `typing_on` while the model thinks, `mark_seen`
    when you have read, `react` or `unreact` for reactions.
 7. **Names.** The `name` in `counterpart` comes with the conversation. `messenger_get_profile` needs
@@ -970,8 +1040,13 @@ against Meta's rules.
 undocumented (UNVERIFIED). Third-party samples show a signed expiry parameter (`oe`) that Meta does
 not document, and Meta's pages say only that profile picture URLs "will expire". Download promptly,
 and re-read the message by ID for fresh URLs.
-meta-mcp tries the URL without a token and retries once with the Page token after a 401 or 403, for
-Meta CDN hosts only.
+meta-mcp tries the URL without a token and retries once with the Page token after a 401 or 403, only for
+`*.fbcdn.net` and `*.fbsbx.com` hosts (or hosts you listed in `META_MCP_DOWNLOAD_HOSTS`) and only for
+the exact host and port of that URL. It refuses to fetch the Graph API host at all, and it shows a
+saved picture to the assistant only when the bytes themselves parse as a PNG, JPEG, GIF or WEBP
+picture of at most 2 MiB. The saved file's name comes from your `dest_name`, the attachment's own name
+or the URL, never from a `Content-Disposition` header, and a name that clashes with different content
+gets a short URL hash.
 
 ### 5.2 The 24-hour window, and the dead tags
 
@@ -998,11 +1073,13 @@ Meta: "Effective April 27th, 2026, all API requests containing the Message Tags
 CONFIRMED_EVENT_UPDATE, ACCOUNT_UPDATE, and POST_PURCHASE_UPDATE will receive error code 100." The
 Graph reference enum still lists the old values, so the enum lags behaviour.
 
-**Do not use `HUMAN_AGENT` for AI-written replies.** It is for a person typing in a custom inbox.
-Inside the window, AI replies are normal. Outside it, Meta's documented routes are utility messages
-(a pre-approved template sent with `pages_utility_messaging`, which "must not contain marketing
-materials"), Marketing Messages, One-Time Notification and Sponsored Messages. None of them has a
-meta-mcp tool.
+**Do not use `HUMAN_AGENT` for AI-written replies.** It is for a person replying by hand in a custom
+inbox, and Meta lists automated messages as a disallowed use of it. meta-mcp says so in the
+descriptions of the Messenger send tools, in the server instructions and in the hint it attaches to
+an outside-window error, so the assistant is told in three places. Inside the window, AI replies are
+normal. Outside it, Meta's documented routes are utility messages (a pre-approved template sent with
+`pages_utility_messaging`, which "must not contain marketing materials"), Marketing Messages,
+One-Time Notification and Sponsored Messages. None of them has a meta-mcp tool.
 
 ### 5.3 The 20-message detail limit
 
@@ -1022,7 +1099,7 @@ Also, Requests-folder conversations that have not been active for 30 days are no
 
 | Limit | Value |
 |---|---|
-| Conversations API | 2 calls per second per Page (meta-mcp spaces conversation reads at least 500 ms apart per Page) |
+| Conversations API | 2 calls per second per Page (meta-mcp spaces conversation reads at least 500 ms apart per Page, and repeats a read that failed with a transient error once, after the same spacing) |
 | Send API: text, links, reactions, stickers | 300 calls per second per Page |
 | Send API: audio or video | 10 calls per second per Page |
 | 24-hour cap | `200 * Number of Engaged Users` calls |
@@ -1033,8 +1110,14 @@ Error codes: 4 (app limit), 17 (user token limit), 32, 613 (custom limit; 613/25
 api have exceeded the rate limit"), 80001 (Pages calls with a Page token), 80006 (Messenger: "too
 many messenger api calls to this Page account"), 341 (application limit), 368 (temporarily blocked
 for policy), 1 and 2 (temporary). Meta: "When the limit has been reached, stop making API calls.
-Continuing to make calls will continue to increase your call count." meta-mcp retries reads twice
-(400 ms, then 1200 ms, plus jitter) on 1, 2, 4, 17, 32, 613 and 80006, and never retries a send.
+Continuing to make calls will continue to increase your call count." meta-mcp's Graph client retries
+reads twice (400 ms, then 1200 ms, plus jitter) on 1, 2, 4, 17, 32, 613, 80006 and 130429, and never
+retries a send. Messenger conversation reads (`messenger_list_conversations`,
+`messenger_read_conversation`, `messenger_get_message` and the lookups behind a `conversation_id` or
+`message_id`) are paced instead: the client's retries are off for them, calls on one Page are spaced
+500 ms apart, and a transient failure (Graph code 1, 2, 4, 17, 32, 613 or 80006, an HTTP 5xx, a
+timeout or a connection that did not complete) is repeated once through the same spacing, so a repeat
+never lands inside the 500 ms window.
 Meta publishes `X-App-Usage` and `X-Business-Use-Case-Usage` headers; meta-mcp does not surface
 them. Whether reads other than the conversation list use the 2-per-second budget is UNVERIFIED.
 
@@ -1140,35 +1223,61 @@ this matters only if your proxy requires and verifies it.
 
 ### 6.4 Subscribe: `meta-mcp setup --webhook-url`
 
+The receiver must already answer on the public URL (6.2 and 6.3), because Meta calls it while you
+subscribe. On a first setup, add the URL to the wizard run:
+
 ```bash
 meta-mcp setup --webhook-url https://hooks.example.org/webhook
 ```
 
-With an existing `credentials.json` the wizard reuses the stored App ID and App Secret, and with
-`META_WEBHOOK_VERIFY_TOKEN` exported it uses the token your receiver already has. It signs you in again
-unless you pass `--user-token` or `--page-token`, then repeats the subscription steps below, which are
-idempotent: run it as often as you need, for example after a long outage (6.5). Steps:
+Once `credentials.json` holds your tokens, subscribe or re-subscribe **without a new sign-in** by adding
+`--stored`:
+
+```bash
+meta-mcp setup --stored --webhook-url https://hooks.example.org/webhook
+```
+
+`--stored` reuses the stored App ID, App Secret, user token, Page tokens and WhatsApp account, checks
+them again, and repeats the subscription steps below, which are idempotent: run it as often as you need,
+for example after a long outage (6.5). Without `--stored` the wizard signs you in again unless you pass
+`--user-token` or `--page-token`. With `META_WEBHOOK_VERIFY_TOKEN` exported it uses the token your
+receiver already has. If the reachability check fails, the wizard prints the exact `--stored` command
+to rerun once the receiver answers, with the flags that shaped the run. Steps:
 
 1. **Verify token.** `--verify-token`, else `META_WEBHOOK_VERIFY_TOKEN`, else the stored one, else a
-   new 32-byte hex value.
+   new 32-byte hex value. It is saved to `credentials.json` before anything is sent to Meta.
 2. **Reachability self-check.** It sends our own handshake to your URL (`GET` with `hub.mode`,
    `hub.verify_token` and a random `hub.challenge`, 10-second timeout) and needs 200 with the
-   challenge as the body. If it fails, setup stops and tells you to start `meta-mcp webhook` and the
-   tunnel, then rerun. **Why:** Meta sends the same `GET` while you subscribe, so the receiver must
-   already be reachable. Plain `http` URLs are accepted for loopback hosts only.
-3. **App level.** `POST /{app-id}/subscriptions` with the app token: `object=page`, `callback_url`,
-   the field list, `verify_token`, `include_values=true`.
+   challenge as the body. If it fails, setup stops, says why (403: the verify token differs; 404:
+   check the path; a redirect: use the final URL; 502 to 504: the tunnel is up but nothing answers
+   behind it) and tells you to start `meta-mcp webhook` and the tunnel, then rerun. **Why:** Meta
+   sends the same `GET` while you subscribe, so the receiver must already be reachable. Plain `http`
+   URLs are accepted for loopback hosts only.
+3. **App level.** The wizard first reads what the app sends for `object=page` today. If that is a
+   callback for a different URL it asks "Replace it?" (default no; `--yes` answers yes), and a
+   non-interactive run without `--yes` stops and leaves the old callback in place. Then it calls
+   `POST /{app-id}/subscriptions` with the app token: `object=page`, `callback_url`, the field list,
+   `verify_token`, `include_values=true`.
 4. **Page level.** `POST /{page-id}/subscribed_apps` with the Page token and `subscribed_fields` set
    to the same list. Meta: "only fields with subscriptions at both the page and app levels will get
    Webhooks."
-5. **WhatsApp**, when configured. It tries `POST /{app-id}/subscriptions` with
-   `object=whatsapp_business_account`, `fields=messages`. Meta's docs describe that call, but its
-   Graph reference says WhatsApp objects must be configured in the dashboard, so on any error the
-   wizard prints the dashboard steps (Part 7.5). Then it subscribes the WABA: `POST
-   /{waba-id}/subscribed_apps`, with `--webhook-override` also sending `override_callback_uri` and
-   `verify_token`.
-6. **Read-back.** It reads `GET /{app-id}/subscriptions` and `GET /{page-id}/subscribed_apps` and
-   prints the fields that are active.
+5. **WhatsApp**, when configured. Without `--webhook-override` it tries `POST /{app-id}/subscriptions`
+   with `object=whatsapp_business_account`, `fields=messages` (after the same "Replace it?" question
+   for that object). Meta's docs describe that call, but its Graph reference says WhatsApp objects must
+   be configured in the dashboard, so on an error the wizard prints the dashboard steps (Part 7.5) and
+   carries on; if you decline to replace a different app-level callback, it leaves the account alone
+   and suggests `--webhook-override`. Then it subscribes the WABA: `POST /{waba-id}/subscribed_apps`.
+   With `--webhook-override` the app-level attempt is skipped and the app-level callback stays
+   untouched; the WABA call then carries a JSON body with `override_callback_uri` and `verify_token`,
+   so only that account's events go to your URL.
+6. **Read-back.** It reads `GET /{app-id}/subscriptions`, `GET /{page-id}/subscribed_apps` and the
+   WABA's `subscribed_apps`, and prints the fields that are active, with a warning for an inactive
+   subscription, a missing field or an override that points elsewhere.
+
+The URL is recorded in `credentials.json` only once at least one subscription of the run went through.
+If none did, setup stops with `no subscription of this run sends events to <url>, so it was not
+recorded` and suggests `--webhook-override` (only the WhatsApp account moves) or `--yes` (replace the
+existing callback).
 
 The field list: `messages`, `message_echoes`, `message_reads`, `message_deliveries`,
 `message_reactions`, `message_edits`, `messaging_postbacks`, `messaging_referrals`,
@@ -1194,7 +1303,8 @@ Webhooks configured-app, and if the Page has not disabled the App platform in it
   Webhooks Disabled alert, and your app will be unsubscribed from the webhooks for the Page or
   Instagram Professional account." Meta first tries "a few more times", alerts after 15 minutes,
   then unsubscribes. A receiver switched off overnight loses its Messenger subscription.
-  **Re-run `meta-mcp setup --webhook-url`** after any outage longer than an hour.
+  **Re-run `meta-mcp setup --stored --webhook-url ...`** (no new sign-in) after any outage longer than
+  an hour.
 - **Retries.** The generic Graph page says retries run "over the next 36 hours" and unacknowledged
   responses are dropped after 36 hours; the WhatsApp docs say Meta "retries delivery with decreasing
   frequency until the request succeeds, for up to 7 days". Plan for the shorter one.
@@ -1388,12 +1498,13 @@ do so would result in forfeiting the access token."
    stores fields it does not recognise as `other` events.
 
 **Why the dashboard:** `meta-mcp setup` first tries `POST /{app-id}/subscriptions` with
-`object=whatsapp_business_account`, which Meta's WhatsApp docs describe but whose Graph reference says
-is dashboard-only. When it fails the wizard prints these steps.
+`object=whatsapp_business_account` (unless you pass `--webhook-override`), which Meta's WhatsApp docs
+describe but whose Graph reference says is dashboard-only. When it fails the wizard prints these steps.
 
 **Overrides.** Precedence is: phone number override, then Messaging account override, then the app's
 callback URL. `meta-mcp setup --webhook-url URL --webhook-override` registers URL as a Messaging
-account override (`override_callback_uri` and `verify_token` in the `subscribed_apps` body). A
+account override (`override_callback_uri` and `verify_token` as the JSON body of `POST
+/{waba-id}/subscribed_apps`) and skips the app-level attempt, so the app's own callback stays as it is. A
 per-number override uses `POST /{phone-number-id}` with `webhook_configuration`. Overrides cover
 `messages`, `message_echoes`, `calls`, `consumer_profile`, `messaging_handovers`, `standby`, the
 `group_*` fields and a few others; template and account-level webhooks always go to the app's
@@ -1446,8 +1557,13 @@ whose replies are free for up to 7 days.
 recipient last replied to the sender number." Meta says errors arrive "either synchronously as a
 Graph API response, asynchronously via Webhook, or sometimes through both", so handle both: a
 synchronous 400 on the send call, and a `failed` status event in the inbox. meta-mcp helps in two
-ways: sends check the local inbox and add a `window_warning` when the window looks closed (it never
-blocks the send), and the error hint says to send a template.
+ways. Free-form sends (text, media, location) look in the local inbox, after the send, for the newest
+message from the person you wrote to, under every ID the person is known by (the number or user ID
+you used, the `wa_id` and `user_id` Meta answered with, and the user and parent user IDs kept in the
+inbound event), and add a `window_warning` when the window looks closed; it never blocks the send.
+And the error hint says to send a template. When a send ends in a timeout, a dropped connection, an
+unreadable answer or an HTTP 5xx, its outcome is open: the error says the message may still have been
+delivered, so check the inbox status events before you send again.
 
 **Templates.** `whatsapp_send_template` takes the template `name`, a `language` code (default
 `en_US`) and the `components` list. Templates must be `APPROVED` in WhatsApp Manager; names are lowercase
@@ -1464,9 +1580,14 @@ Use `whatsapp_send_media` with `path` (a file in `META_MCP_FILES_DIR`), `media_i
 `whatsapp_upload_media`) or `url`. Prefer uploads: Meta calls `link` "not recommended" and caches the
 file for 10 minutes. Uploaded media persists 30 days; media IDs received in webhooks expire after 7
 days. meta-mcp checks the type and size limit before any request and always sends the MIME type
-explicitly, because a mismatch (error 131053) is common. The limits are in
-[TOOLS.md](TOOLS.md#whatsapp_send_media). Documents outside Meta's list "may be sent via the API,
-but they are not supported and may not be handled as expected".
+explicitly, because a mismatch (error 131053) is common. The file extension decides the type:
+`mime_type` may only restate it (with parameters such as `codecs=opus`) and cannot stand in for a
+missing or unknown extension. A file under `inbound/`, where downloads from other people are kept,
+is refused unless the call says `allow_inbound=true`. If a send fails after an upload, the error
+names the media ID: after a definite rejection you can resend with `media_id` (valid for 30 days),
+and after an open outcome (a timeout or an HTTP 5xx) check the inbox status events first. The limits
+are in [TOOLS.md](TOOLS.md#whatsapp_send_media). Documents outside Meta's list "may be sent via the
+API, but they are not supported and may not be handled as expected".
 
 ### 7.10 Receiving through the inbox
 
@@ -1479,8 +1600,12 @@ three `status` events (`sent`, `delivered`, `read`), or `failed` with error deta
 
 To fetch media use `whatsapp_download_media` with the event attachment's `media_id`: it asks Graph for
 a fresh URL, which expires after 5 minutes, and downloads it with your token, which Meta requires. A
-404 means the URL expired. `whatsapp_mark_read` sets the blue ticks, and with `typing` shows a typing
-indicator for up to 25 seconds, so use it only when a reply follows.
+404 means the URL expired. The file is saved in `inbound/whatsapp/` of `META_MCP_FILES_DIR`, named
+`whatsapp_<media id>.<extension>` unless you give `dest_name`, and the result carries a picture inline
+only when its bytes parse as a PNG, JPEG, GIF or WEBP of at most 2 MiB (`inline_skipped` says why not).
+Forwarding the file with a send tool needs `allow_inbound=true`. `whatsapp_mark_read` sets the blue
+ticks, and with `typing` shows a typing indicator for up to 25 seconds, so use it only when a reply
+follows.
 
 ### 7.11 Business-scoped user IDs
 
@@ -1578,14 +1703,19 @@ standalone `meta-mcp webhook` publicly: it reports event counts.
 ### 8.3 Read-only mode, the file jail and log levels
 
 - **Read-only.** `META_MCP_READ_ONLY=true` removes the 11 tools that send or change state (list in
-  [TOOLS.md](TOOLS.md#read-only-mode)). Start here and open up deliberately.
+  [TOOLS.md](TOOLS.md#read-only-mode)). Start here and open up deliberately. The two download tools
+  stay, and both refuse `overwrite=true` there ([SECURITY.md](../SECURITY.md#read-only-mode)).
 - **File jail.** `META_MCP_FILES_DIR` is the only place file tools read and write. Use an empty,
-  dedicated directory, never the one that holds `credentials.json`, and read the limits in
-  [SECURITY.md](../SECURITY.md#file-jail). `META_MCP_MAX_FILE_BYTES` caps file size (default 100 MiB).
+  dedicated directory: meta-mcp refuses to start if it contains `META_MCP_HOME`, `credentials.json` or
+  the inbox database, and the error says which. Downloads are saved under `inbound/messenger/` and
+  `inbound/whatsapp/` in it, and the upload tools refuse files there unless `allow_inbound` is true.
+  Read the limits in [SECURITY.md](../SECURITY.md#file-jail). `META_MCP_MAX_FILE_BYTES` caps file size
+  (default 100 MiB).
 - **Logs.** They go to stderr (journald under systemd). `META_MCP_LOG` takes tracing filter syntax;
-  the default is `meta_mcp=info`. Use `meta_mcp=debug` to see retries and `meta_mcp=trace` for the most
-  detail. Tokens and the app secret are never logged, webhook bodies are not logged (batch counts
-  are), and error text is scrubbed of anything shaped like a Graph token.
+  the default is `meta_mcp=info` (`meta_mcp=warn` for `setup`, `doctor` and `token`). Use
+  `meta_mcp=debug` to see retries and `meta_mcp=trace` for the most detail. Tokens and the app secret
+  are never logged, webhook bodies are not logged (batch counts are), and error text is scrubbed of
+  anything shaped like a Graph token.
 
 ### 8.4 A systemd unit
 
@@ -1675,12 +1805,14 @@ by `systemctl restart meta-mcp`, leaves a wide margin inside the 60 days; add `m
 ### 8.6 Re-subscribing after downtime
 
 A Messenger subscription is dropped after 1 hour of failed deliveries (Part 6.5). After any outage
-longer than that, run `meta-mcp setup --webhook-url https://meta.example.org/webhook` again (it signs
-in again unless you pass a token flag, and the subscription steps are idempotent) and
-`meta-mcp doctor --webhook` to confirm. Meta cannot replay what you missed, and a
-Messenger subscription that was dropped delivers nothing until you subscribe again. For WhatsApp Meta
-keeps retrying for up to 7 days (36 hours on the generic Graph page), so a receiver that comes back
-catches up inside that window.
+longer than that, start the receiver again and run
+`meta-mcp setup --stored --webhook-url https://meta.example.org/webhook`. `--stored` reuses the tokens
+in `credentials.json`, so there is no new sign-in, and the subscription steps are idempotent. Add
+`--webhook-override` if you use a WhatsApp callback override, and `--yes` to replace a callback the app
+already has for another URL. Then run `meta-mcp doctor --webhook` to confirm. Meta cannot replay what
+you missed, and a Messenger subscription that was dropped delivers nothing until you subscribe again.
+For WhatsApp Meta keeps retrying for up to 7 days (36 hours on the generic Graph page), so a receiver
+that comes back catches up inside that window.
 
 ### 8.7 Rotating the app secret
 
@@ -1691,7 +1823,8 @@ catches up inside that window.
    webhook process and the MCP server alike.
 3. Restart. Until you do, webhook signatures fail with 401 and, with **Require App Secret** on, calls
    fail for lack of a valid `appsecret_proof`.
-4. Run `meta-mcp doctor --webhook`, then `meta-mcp setup --webhook-url ...` if deliveries stopped.
+4. Run `meta-mcp doctor --webhook`, then `meta-mcp setup --stored --webhook-url ...` if deliveries
+   stopped.
 
 Whether existing tokens survive a reset is not stated in the fetched pages: UNVERIFIED. If a token
 fails with 190 afterwards, sign in again.
@@ -1731,9 +1864,9 @@ Messenger and general Graph codes (Meta's error tables as documented on 2026-10-
 | Code / subcode | Cause | Fix |
 |---|---|---|
 | 190 (subcodes 458 app not installed, 459 user checkpointed, 460 password changed or logged out, 463 expired, 464 unconfirmed user, 467 invalid) | The token is dead | `meta-mcp token refresh` while the user token is valid, else `meta-mcp setup`. A Page token from a short-lived user token lasts only 1 hour |
-| 10, 200 to 299, 230 | Permission or Page task missing, or app role missing | Check scopes with `meta-mcp token show` or `debug_token`; the person needs the `MESSAGING` and `MODERATE` tasks (Part 2.1); in Development mode only role users can be reached |
-| 200 / 2018028 | "Cannot message users who are not admins, developers or testers of the app until pages_messaging permission is reviewed and the app is live." | Give the person a Tester role, or run the gate test (Part 2.5) |
-| 10 / 2018278, 10 / 2534022 | "This message is sent outside of allowed window." | The person must message the Page again. There is no tag for AI replies (Part 5.2). meta-mcp keys its window hint on these two subcodes whatever the code |
+| 10, 200 to 299, 230 | Permission or Page task missing, or app role missing (200 / 2018028 and the window subcodes below have their own hints) | Check scopes with `meta-mcp token show` or `debug_token`; the person needs the `MESSAGING` and `MODERATE` tasks (Part 2.1); in Development mode only role users can be reached |
+| 200 / 2018028 | "Cannot message users who are not admins, developers or testers of the app until pages_messaging permission is reviewed and the app is live." | Give the person a Tester role, or run the gate test (Part 2.5). meta-mcp has a hint of its own for this subcode: the app is not approved yet, so the Page can only message people with a role on the app |
+| 10 / 2018278, 10 / 2534022 | "This message is sent outside of allowed window." | The person must message the Page again. There is no tag for AI replies (Part 5.2): `HUMAN_AGENT` is only for a person replying by hand. meta-mcp keys its window hint on these two subcodes whatever the code |
 | 10 / 2018300, 100 / 2534037 | Another app owns the thread (a default app or Meta Business AI) | Wait for `pass_thread_control` (Part 5.5) |
 | 100 / 2018001 | "No matching user found": the ID is not a PSID of this Page (for example an app-scoped Facebook Login ID, or a PSID of another Page) | Use `counterpart.psid` from this Page's conversations |
 | 551, 200 / 1545041 | "This person isn't available right now." | The person blocked the Page, deactivated, or is unreachable |
@@ -1764,7 +1897,7 @@ WhatsApp codes (Meta's current error table; HTTP statuses are not in the current
 | 131008, 131009 | Missing or invalid parameter value | 131009 also covers a bad `message_id` on read receipts and a reaction target older than 30 days |
 | 131047 | More than 24 hours since the person last replied | Send a template (Part 7.8) |
 | 131026 | The recipient is not on WhatsApp, has not accepted the new terms, or uses an old version | Ask the person to confirm, accept and update |
-| 131030 | Recipient not in the allowed list of a test number (community reports; **UNVERIFIED**) | Add the number to the recipient list (Part 7.2) |
+| 131030 | Recipient not in the allowed list of a test number (community reports; **UNVERIFIED**). meta-mcp's hint names no limit on the number of recipients | Add the number to the recipient list (Part 7.2) |
 | 131021 | Sender and recipient are the same number | Use another recipient |
 | 131042 | Payment method problem | Check the Billing Hub, currency, time zone and credit line |
 | 131049 | "Not delivered to maintain healthy ecosystem engagement" | Wait at least 24 hours before resending a template |
@@ -1787,17 +1920,26 @@ WhatsApp codes (Meta's current error table; HTTP statuses are not in the current
 
 | Message | Cause | Fix |
 |---|---|---|
-| `App ID or App Secret rejected` | `GET /{app-id}` failed with 190 or 101 | Copy both again from **Settings > Basic**; check **Settings > Advanced > App Type** is not Native/Desktop (Part 1.7) |
-| `no callback received: is http://localhost:<port>/callback listed under Facebook Login for Business > Settings > Valid OAuth Redirect URIs?` | The sign-in did not reach the listener within `--timeout-seconds` | Register the exact URI (Part 3.2); or use `--redirect-mode paste` |
-| A busy port | Something else uses 8766 | Free it, or pass `--port N` and register that URI |
-| A state mismatch (HTTP 400 on the callback) | The callback did not carry the `state` this run created | Rerun the wizard and use the new URL it prints |
-| `error_reason=user_denied` | The sign-in was cancelled | Rerun and approve |
-| `missing scope X: rerun with --rerequest` | The person declined a permission | Rerun with `--rerequest`. Fatal only when `pages_messaging` is missing in a Messenger setup |
+| `App ID or App Secret rejected: Settings > Basic in the App Dashboard` | `GET /{app-id}` failed with 190 or 101 | Copy both again from **Settings > Basic**; check **Settings > Advanced > App Type** is not Native/Desktop (Part 1.7). If the secret came from `credentials.json` and was reset, pass the current one with `--app-secret-env NAME` (an interactive run asks for it) |
+| `credentials.json belongs to another app: pass --replace (or --yes) to switch apps, or check --app-id and META_APP_ID` (exit code 2) | The stored file is for a different App ID, and switching drops its Pages, tokens, WhatsApp account and webhook settings | Check the App ID; pass `--replace` or `--yes` only if you mean to start over for the new app |
+| `no callback received within N seconds` | The sign-in did not reach the listener within `--timeout-seconds`. The `Fix:` line asks whether the redirect URI is listed, exactly, under **Valid OAuth Redirect URIs** | Register the exact URI (Part 3.2); or use `--redirect-mode paste` |
+| `port N is already in use` | Something else uses the loopback port (8766 by default) | Free it, or pass `--port N` and register that URI, or use `--redirect-mode paste` |
+| A state mismatch: HTTP 400 on the callback, or `the state in the pasted URL does not match this sign-in attempt` | The callback did not carry the `state` this run created | Rerun the wizard and use the new URL it prints. In loopback mode a wrong-state request is refused and counted, and the timeout message says how many |
+| `the sign-in did not finish: Facebook reported user_denied` | The sign-in was cancelled | Rerun and approve |
+| `missing scope X: rerun with --rerequest` | The person declined a permission | Rerun with `--rerequest`. Fatal only when `pages_messaging` is missing in a Messenger setup (`pages_messaging was not granted`) |
+| `exchanging the login code failed` | Meta refused the code exchange | The redirect URI must be byte-identical to the one the wizard printed and be listed under **Valid OAuth Redirect URIs**; codes work once, so rerun the wizard |
+| `missing value: pass --page-id ID (repeatable) or --all-pages ...` (exit code 2) | A non-interactive login run with no Page selection | Pass one of them (Part 4.3) |
+| `missing value: pass --phone-number-id ID (repeatable) ...` (exit code 2) | A non-interactive WhatsApp run that cannot reuse stored numbers | Pass the numbers |
+| `there are no stored tokens for this app yet` | `--stored` on a file without a token for this App ID | Run `meta-mcp setup --login` first (`--login --replace` when the file belongs to another app) |
+| `Page X is not stored (stored: ...)` | `--stored --page-id X` names a Page that is not in `credentials.json` | Pick a stored ID, or add the Page with `meta-mcp setup --login --page-id X` |
 | A per-Page warning with a Graph hint | The conversations probe failed, usually code 10, 200 or 230 | Page tasks and permissions (Parts 2.1, 1.3) |
-| The reachability self-check fails | The receiver or the tunnel is down, or the URL is wrong | Start `meta-mcp webhook` and the tunnel, then rerun (Part 6.4) |
+| `the callback URL is not reachable: ...` | The receiver or the tunnel is down, or the URL is wrong; the message says which | Start `meta-mcp webhook` and the tunnel, then run the `meta-mcp setup --stored --webhook-url ...` command the message prints (Part 6.4) |
+| `left the existing page webhook callback in place` | The app already sends events to another URL, and the "Replace it?" question was answered no or could not be asked | Rerun with `--yes` to replace it, or look at **App Dashboard > Webhooks** first |
+| `no subscription of this run sends events to <url>, so it was not recorded` | Every subscription failed or was left alone | Rerun with `--webhook-override` (only the WhatsApp account moves), or with `--yes`, or fix the warning above it |
 | The WhatsApp app-level subscription errors | Meta's Graph reference says WhatsApp objects are dashboard-only | Follow the dashboard steps the wizard prints (Part 7.5) |
-| A usage error naming a flag, exit code 2 | `--non-interactive` and a missing value | Pass the flag or its environment variable |
-| `--webhook-url` refused | Plain `http` to a non-loopback host | Use `https` |
+| A usage error naming a flag, exit code 2 | `--non-interactive` and a missing value, flags that exclude each other, or an invalid ID | Pass the flag or its environment variable, or drop the conflicting flag |
+| `--webhook-url` refused | Plain `http` to a non-loopback host, credentials or a fragment in the URL, or `hub.*` parameters | Use the bare `https` callback URL |
+| `configuration problem: ...` | A startup setting is invalid, for example `META_MCP_FILES_DIR (...) contains META_MCP_HOME (...)` | Fix the setting the message names. For a corrupt `credentials.json` the `Fix:` line prints the exact `mv` command |
 
 ### 9.3 The webhook is not firing
 
@@ -1816,8 +1958,9 @@ Work down the list; stop at the first failure.
 6. The Page installed the app and has not disabled the App platform in its App Settings.
 7. In Development mode, webhooks fire only for people with an app role; for WhatsApp some webhooks need
    Live mode.
-8. The app has not been unsubscribed after an hour of failures: re-run `meta-mcp setup --webhook-url`
-   (Part 6.5). The dashboard's **Messenger > Settings > Webhooks card > Show recent errors** lists them.
+8. The app has not been unsubscribed after an hour of failures: re-run
+   `meta-mcp setup --stored --webhook-url ...` (Part 6.5). The dashboard's **Messenger > Settings >
+   Webhooks card > Show recent errors** lists them.
 9. Behind `http --with-webhook`: the proxy's `Host` is allowed (Meta sees a 403 `forbidden host or
    origin`, and the log says `rejected request with disallowed Host or Origin header`), and `/webhook`
    is routed to the process.
@@ -1888,9 +2031,9 @@ apply to a solo, own-Page app. Its list includes `business_management`, `pages_s
 
 | Setup | Scopes in the login dialog |
 |---|---|
-| Messenger (always) | `pages_show_list`, `pages_manage_metadata`, `pages_messaging`, `pages_read_engagement`, `business_management` |
-| With `--whatsapp` | adds `whatsapp_business_messaging`, `whatsapp_business_management` |
-| With `--instagram` | adds `instagram_basic`, `instagram_manage_messages` |
+| Messenger (unless `--no-messenger`) | `pages_show_list`, `pages_manage_metadata`, `pages_messaging`, `pages_read_engagement`, `business_management` |
+| With WhatsApp | adds `business_management`, `whatsapp_business_messaging`, `whatsapp_business_management`, unless a System User token serves WhatsApp (`--whatsapp-token`, or one already stored and still valid), in which case the login does not ask for them |
+| With `--instagram` | adds `pages_show_list`, `instagram_basic`, `instagram_manage_messages` |
 | With `--config-id` | the configuration decides; `scope` may be omitted |
 
 `business_management` is requested because Meta documents it as a dependency of `pages_messaging`

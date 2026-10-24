@@ -2889,3 +2889,72 @@ async fn the_global_file_cap_limits_messenger_uploads_too() {
     assert_eq!(out["uploaded_bytes"], json!(1000));
     graph.verify().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn read_only_mode_never_replaces_a_downloaded_file_but_still_saves_new_ones() {
+    let graph = mock_graph().await;
+    Mock::given(method("GET"))
+        .and(path("/cdn/contract.pdf"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(b"%PDF attacker".to_vec())
+                .insert_header("content-type", "application/pdf"),
+        )
+        .mount(&graph)
+        .await;
+    let files = files_dir();
+    std::fs::create_dir_all(files.path().join("inbound/messenger")).expect("mkdir");
+    std::fs::write(
+        files.path().join("inbound/messenger/contract.pdf"),
+        b"ORIGINAL",
+    )
+    .expect("fixture");
+    let url = format!("{}/cdn/contract.pdf", graph.uri());
+    let base = graph_base(&graph.uri());
+    let dir = files.path().display().to_string();
+    let (refused, fresh) = blocking(move || {
+        let home = TempHome::new();
+        let mut s = Session::start(
+            &home,
+            &base,
+            &[
+                ("META_PAGE_ACCESS_TOKEN", TOKEN),
+                ("META_PAGE_ID", PAGE),
+                ("META_APP_SECRET", "secret"),
+                ("META_MCP_DOWNLOAD_HOSTS", "127.0.0.1"),
+                ("META_MCP_FILES_DIR", &dir),
+                ("META_MCP_READ_ONLY", "1"),
+            ],
+        );
+        let refused = s.call_tool(
+            "messenger_download_attachment",
+            json!({"url": url, "dest_name": "contract.pdf", "overwrite": true, "inline": false}),
+        );
+        let fresh = s.call_tool(
+            "messenger_download_attachment",
+            json!({"url": url, "dest_name": "new.pdf", "inline": false}),
+        );
+        (refused, fresh)
+    })
+    .await;
+    assert!(is_error(&refused), "{refused}");
+    let text = tool_text(&refused);
+    assert!(
+        text.contains("read-only") && text.contains("META_MCP_READ_ONLY"),
+        "{text}"
+    );
+    assert_eq!(
+        std::fs::read(files.path().join("inbound/messenger/contract.pdf")).expect("kept"),
+        b"ORIGINAL"
+    );
+    assert!(!is_error(&fresh), "{fresh}");
+    assert_eq!(
+        std::fs::read(files.path().join("inbound/messenger/new.pdf")).expect("new"),
+        b"%PDF attacker"
+    );
+    assert_eq!(
+        requests(&graph).await.len(),
+        1,
+        "the refused call sent nothing"
+    );
+}

@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Hardening of the download, file and send paths, and the setup wizard as built.
+
+### Security
+
+- Downloads never fetch the Graph API host. The host of `META_GRAPH_BASE_URL` is refused on every redirect
+  hop, whether or not a token would be attached and even when `META_MCP_DOWNLOAD_HOSTS` names it.
+  `*.facebook.com` and `*.messenger.com` leave the default download allowlist, which is now
+  `*.fbcdn.net`, `*.fbsbx.com`, `*.whatsapp.net` and `lookaside.fbsbx.com`.
+- Download tokens are tied to the exact host and port of the request, and a redirect to another host or
+  port drops them. Messenger sends the Page token only after an HTTP 401 or 403, and only to
+  `.fbcdn.net`, `.fbsbx.com` or an operator host; WhatsApp sends its token only to `lookaside.fbsbx.com`,
+  `*.whatsapp.net` or an operator host.
+- A picture is returned inline only after a structural check of its bytes (PNG `IHDR`, JPEG frame header,
+  GIF screen descriptor, WEBP RIFF size) and only up to 2 MiB. The type a sender or server reports is never
+  trusted, and a picture that is saved but not shown says why (`note` for Messenger, `inline_skipped` for
+  WhatsApp).
+- Downloads are saved under `inbound/messenger/` and `inbound/whatsapp/` in the files directory. The `path`
+  of `messenger_send_attachment` and `whatsapp_send_media`, and `whatsapp_upload_media`, refuse files under
+  `inbound/` unless `allow_inbound` is true.
+- Download file names are reduced to one safe component of at most 200 bytes: control, bidirectional and
+  zero-width characters are replaced, Windows device names are prefixed, and a Messenger name that already
+  holds different content gets a short URL hash instead of replacing it. `Content-Disposition` is never
+  read. A WhatsApp `dest_name` with a component over 200 bytes is refused before any request.
+- `whatsapp_download_media` refuses `overwrite=true` in read-only mode.
+- `META_MCP_FILES_DIR` may not contain `META_MCP_HOME`, `credentials.json` or the inbox database: startup
+  fails and the error names the overlap.
+- IDs are checked more strictly. A Graph ID must start with a letter, a digit or `_` and cannot be `.`, `..`
+  or begin like a Graph version such as `v26.0`. WhatsApp message IDs must start with `wamid.` (the
+  `whatsapp:` prefix of an inbox event ID is dropped) and media IDs are 1 to 32 digits.
+
+### Changed
+
+- `HUMAN_AGENT` is described as a tag for a person replying by hand, with Meta's note that automated
+  messages are a disallowed use, in the tool descriptions, the server instructions and the outside-window
+  hint.
+- Messenger conversation reads are spaced 500 ms apart per Page, and a transient failure is repeated once
+  through the same spacing; the Graph client's own retries are off for these reads. The reduced-fields
+  fallback of `messenger_list_conversations` fires only on a code 100 whose message says `nonexisting field`.
+- WhatsApp sends work out `window_warning` from the person's own newest inbound message under every ID the
+  person is known by (number, `wa_id`, `user_id` and parent user ID). A send that fails with an open outcome
+  (a transport error, an unreadable answer or an HTTP 5xx) says the message may still have been delivered,
+  and the advice to resend with `media_id` after an upload appears only after a definite rejection.
+- WhatsApp recipients lose a `(0)` trunk prefix after the country code and numbers that start with 0 are
+  refused; reactions must be emoji; a `mime_type` on a path upload must restate the type of the file
+  extension.
+- Error hints: the outside-window hint is keyed on subcode 2018278 or 2534022 whatever the code, 200 with
+  subcode 2018028 has its own "app not approved" hint, and the 131030 hint states no recipient count.
+- `meta-mcp setup` as built: credentials are saved after the token, Pages and WhatsApp steps and around the
+  webhook step; a verify token is created when none exists; `--webhook-override` points only the WhatsApp
+  account at the webhook (a JSON body) and skips the app-level WhatsApp attempt; a different webhook
+  callback, or a different app in `credentials.json`, is replaced only after a confirmation (`--yes`
+  answers it, and `--replace`, which also drops the Pages a run did not select, covers the app switch);
+  a run that cannot ask must give `--page-id` or `--all-pages` when it signs in, and `--phone-number-id`
+  for WhatsApp unless stored numbers can be reused. `meta-mcp doctor --json` gains a `summary` key and
+  carries information lines such as the gate-test hint. `setup`, `doctor` and `token` switch off the
+  logs of the HTTP and TLS libraries.
+
+### Added
+
+- `meta-mcp setup --stored` reuses the tokens in `credentials.json` instead of signing in, which is how to
+  subscribe or re-subscribe a webhook after downtime.
+- `allow_inbound` on `messenger_send_attachment`, `whatsapp_send_media` and `whatsapp_upload_media`.
+
+### Fixed
+
+- Documentation: the tool reference now matches the code for the results of `whatsapp_mark_read` and
+  `whatsapp_upload_media`, the static sticker limit (100 KiB), the reactions of `messenger_sender_action`,
+  the file names of `messenger_download_attachment` and the event IDs of WhatsApp group statuses.
+
 ## [0.1.0] - unreleased
 
 First version: an MCP server for the Meta Graph API that reads and sends Facebook

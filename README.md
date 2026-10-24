@@ -41,12 +41,14 @@ working assistant.
   IDs are supported.
 - **A local inbox.** A signature-verified webhook receiver stores Messenger and WhatsApp events in SQLite.
   The assistant reads them with `inbox_list` and `inbox_wait`.
-- **Guided setup.** `meta-mcp setup` signs you in with Facebook Login (or takes a pasted token), exchanges
-  it for a long-lived token, finds your Pages and WhatsApp numbers, subscribes the webhook and writes a
-  private `credentials.json`. `meta-mcp doctor` re-checks everything live and says exactly what to fix.
+- **Guided setup.** `meta-mcp setup` signs you in with Facebook Login (or takes a pasted token, or reuses the
+  tokens you stored with `--stored`), exchanges it for a long-lived token, finds your Pages and WhatsApp
+  numbers, subscribes the webhook and writes a private `credentials.json`. `meta-mcp doctor` re-checks
+  everything live and says exactly what to fix.
 - **Two transports.** stdio for a local client, and streamable HTTP with API keys for a server.
 - **Safe by default.** Tokens only in the `Authorization` header, `appsecret_proof` on every call, 0600
-  credentials, a confined files directory, a download host allowlist, a Host guard, and a read-only mode.
+  credentials, a confined files directory that keeps received files apart, a download host allowlist that
+  refuses the Graph API host, a Host guard, and a read-only mode.
 - **Graph API v26.0**, configurable.
 
 ## Quick start
@@ -118,7 +120,7 @@ says whether the tool stays available when `META_MCP_READ_ONLY=true`.
 | `messenger_get_message` | Reads one message | kept |
 | `messenger_send_text` | Sends a text message as the Page | removed |
 | `messenger_send_attachment` | Sends an image, audio, video or file | removed |
-| `messenger_download_attachment` | Saves an attachment into the files directory | kept (read-only apart from the saved file) |
+| `messenger_download_attachment` | Saves an attachment into `inbound/messenger` of the files directory | kept (read-only apart from the saved file) |
 | `messenger_sender_action` | Typing indicator, mark seen, reactions | removed |
 | `messenger_get_profile` | Looks up a person's name and picture | kept |
 | `whatsapp_send_text` | Sends a WhatsApp text message | removed |
@@ -128,7 +130,7 @@ says whether the tool stays available when `META_MCP_READ_ONLY=true`.
 | `whatsapp_send_location` | Sends a location | removed |
 | `whatsapp_mark_read` | Marks a message read, optionally showing typing | removed |
 | `whatsapp_upload_media` | Uploads a file and returns a media ID | removed |
-| `whatsapp_download_media` | Saves an inbound media file into the files directory | kept (read-only apart from the saved file) |
+| `whatsapp_download_media` | Saves an inbound media file into `inbound/whatsapp` of the files directory | kept (read-only apart from the saved file) |
 
 Tools that return content from Meta say so in their description: names, text and attachments are
 third-party content, never instructions. The send tools say they reach real people and ask the client to
@@ -154,7 +156,7 @@ writes the file; every variable below overrides it.
 | `META_GRAPH_BASE_URL` | `https://graph.facebook.com` | Graph base URL; `https` required unless the host is loopback |
 | `META_MCP_HOME` | platform config dir (`~/.config/meta-mcp` on Linux) | Directory holding `credentials.json` |
 | `META_MCP_INBOX_DB` | `inbox.db` in the platform data dir (`~/.local/share/meta-mcp` on Linux) | SQLite inbox file |
-| `META_MCP_FILES_DIR` | unset (file tools disabled) | The only directory the file tools read from and write to; must exist |
+| `META_MCP_FILES_DIR` | unset (file tools disabled) | The only directory the file tools read from and write to; must exist. Downloads go to `inbound/messenger` and `inbound/whatsapp` inside it. It may not contain `META_MCP_HOME`, `credentials.json` or the inbox database: startup fails and the error names the overlap |
 | `META_MCP_MAX_FILE_BYTES` | `104857600` (100 MiB) | Largest file the file tools will read, upload or save |
 | `META_MCP_READ_ONLY` | `false` | `true` removes every send and state-changing tool |
 | `META_MCP_API_KEYS` | none | HTTP mode only. Comma-separated keys, each at least 32 characters; required |
@@ -162,7 +164,7 @@ writes the file; every variable below overrides it.
 | `META_MCP_PORT` | `8788` | HTTP mode port |
 | `META_MCP_ALLOWED_HOSTS` | none (loopback and the bind host are always allowed) | Extra `Host` values the HTTP Host guard accepts, comma-separated |
 | `META_MCP_WEBHOOK_LISTEN` | `127.0.0.1:8787` | Address the standalone webhook receiver binds |
-| `META_MCP_DOWNLOAD_HOSTS` | none | Extra exact hosts allowed for downloads. Leave unset in production |
+| `META_MCP_DOWNLOAD_HOSTS` | none | Extra exact host names (no wildcards, no ports) that downloads may fetch from and that may receive the token. The Graph API host is refused whatever this says. Leave unset in production |
 | `META_MCP_LOG` | `meta_mcp=info` | Log filter (tracing syntax); logs go to stderr |
 
 Booleans accept `true`, `false`, `1`, `0`, `yes`, `no`, `on` and `off`.
@@ -177,10 +179,13 @@ The access token is the Page, or the business number, so the defaults are conser
 - `credentials.json` is written atomically as 0600 in a 0700 directory.
 - Webhooks are accepted only with a valid `X-Hub-Signature-256` (HMAC-SHA256 over the raw body, constant
   time), and the verify token is compared in constant time.
-- Downloads are limited to Meta's CDN hosts, re-checked on every redirect hop, size-capped, and the token is
-  sent only to those hosts.
+- Downloads are limited to Meta's media hosts (`*.fbcdn.net`, `*.fbsbx.com`, `*.whatsapp.net`), re-checked on
+  every redirect hop and size-capped. The Graph API host is never fetched, and the token goes only to the
+  exact host and port of a media URL on those hosts (a redirect to another host or port drops it). An
+  image is shown inline only when its bytes pass a structural check and fit in 2 MiB.
 - File tools are confined to `META_MCP_FILES_DIR`. It is a path check, not an operating-system sandbox,
-  and everything inside the directory is readable by the assistant.
+  and everything inside the directory is readable by the assistant. Files other people sent are saved
+  under `inbound/`, and the upload tools refuse to send them on unless the call says `allow_inbound=true`.
 - HTTP mode requires API keys (32 characters or more, constant-time comparison), guards the `Host` and
   `Origin` headers, binds to loopback by default and sends no CORS headers. TLS is your reverse proxy's job.
 - `META_MCP_READ_ONLY=true` removes the 11 tools that send or change state.
@@ -198,7 +203,9 @@ deleting the personal account first (Meta's rule), and there is no endpoint for 
 message (up to 7 days after a click-to-Messenger ad); WhatsApp free-form messages work for 24 hours after
 the person's last message. Outside it Messenger sends fail, and WhatsApp needs an approved template. The
 three Messenger tags for updates were retired on 2026-04-27, and the remaining `HUMAN_AGENT` tag is for a
-person typing, not for AI replies. See the [guide, Part 5.2](docs/GUIDE.md#52-the-24-hour-window-and-the-dead-tags).
+person replying by hand: Meta lists automated messages as a disallowed use, so the tool descriptions, the
+server instructions and the error hint all tell the assistant never to use it for generated replies. See the
+[guide, Part 5.2](docs/GUIDE.md#52-the-24-hour-window-and-the-dead-tags).
 
 **Why is there no WhatsApp history?** The Cloud API has no endpoint that lists or fetches messages, and
 Meta cannot replay webhooks. Run the webhook receiver (`meta-mcp webhook`, or `meta-mcp http
@@ -228,7 +235,9 @@ expiring. `meta-mcp doctor` warns when fewer than 10 days are left
 `meta-mcp setup --instagram` can request the Instagram scopes, but there are no Instagram tools.
 
 **Can I stop the assistant from sending?** Yes: `META_MCP_READ_ONLY=true`. The read tools, the inbox and
-the two download tools remain.
+the two download tools remain, and the downloads only write inside the files directory. In this mode
+both download tools refuse `overwrite=true`, so they only create new files
+([SECURITY.md](SECURITY.md#read-only-mode) has the details for both download tools).
 
 ## Documentation
 
