@@ -6,21 +6,31 @@ a WhatsApp Business number. It comes with a guided setup that handles Facebook L
 Page discovery for you, and with a step-by-step guide that takes you from no Meta developer account to a
 working assistant.
 
+A second, separate mode, **personal mode**, reaches your own personal Messenger and WhatsApp accounts through
+unofficial clients. It is outside the platforms' terms and can get an account restricted or banned: see
+[Personal mode](#personal-mode) before you decide to use it.
+
 > **Scope, honestly.**
 >
-> - **Facebook Page inboxes and WhatsApp Business numbers only.** The Graph API does not reach personal
->   Messenger accounts or personal WhatsApp accounts, and neither does meta-mcp.
-> - **WhatsApp inbound needs a public HTTPS webhook.** The WhatsApp Cloud API has no message history
+> - **Business mode: Facebook Page inboxes and WhatsApp Business numbers only.** It uses Meta's official Graph
+>   API, which does not reach personal Messenger accounts or personal WhatsApp accounts.
+> - **Personal mode: your own personal accounts, through unofficial clients.** It reaches what the Graph API cannot,
+>   and it is **outside the terms of Facebook and WhatsApp for personal accounts**. It can get the account
+>   restricted or banned (for WhatsApp, temporarily or permanently, with the chat history and backups out of reach
+>   while banned). It is separate from business mode and you opt in to it by installing its daemon. Read
+>   [Personal mode](#personal-mode) first.
+> - **Business WhatsApp inbound needs a public HTTPS webhook.** The WhatsApp Cloud API has no message history
 >   endpoint, so received messages exist only if the webhook receiver stored them. Messenger works by
->   polling, and a webhook is optional there.
+>   polling, and a webhook is optional there. Personal mode needs no webhook.
 > - **In Development mode the Page can only talk to people with a role on your Meta app.** Reaching real
 >   customers may need Meta's App Review: the guide has a test that tells you.
 > - **Everything Meta returns is untrusted text.** An assistant that can read messages and send replies
->   can be steered by them. Read-only mode removes the send tools.
+>   can be steered by them, in personal mode as you. Read-only mode removes the send tools.
 
 ## Contents
 
 - [Features](#features)
+- [Personal mode](#personal-mode)
 - [Quick start](#quick-start)
 - [Three ways to configure it](#three-ways-to-configure-it)
 - [Tools](#tools)
@@ -41,6 +51,9 @@ working assistant.
   IDs are supported.
 - **A local inbox.** A signature-verified webhook receiver stores Messenger and WhatsApp events in SQLite.
   The assistant reads them with `inbox_list` and `inbox_wait`.
+- **Personal mode.** Your own Messenger and WhatsApp accounts through unofficial clients and a local daemon:
+  list, read, wait, send text and files, react, mark read, typing and attachments, with a write-ahead audit log
+  of sends and a read-only mode. Opt-in, outside the platforms' terms, with a real risk to the account.
 - **Guided setup.** `meta-mcp setup` signs you in with Facebook Login (or takes a pasted token, or reuses the
   tokens you stored with `--stored`), exchanges it for a long-lived token, finds your Pages and WhatsApp
   numbers, subscribes the webhook and writes a private `credentials.json`. `meta-mcp doctor` re-checks
@@ -51,7 +64,59 @@ working assistant.
   refuses the Graph API host, a Host guard, and a read-only mode.
 - **Graph API v26.0**, configurable.
 
+## Personal mode
+
+Personal mode lets an assistant read and send on **your own** Facebook Messenger and WhatsApp accounts, the ones on
+your phone, the way you do. Meta has no API for that, so it uses two **unofficial clients**, written in Go and run
+as child processes of a small local daemon: `meta-messenger-sidecar` (Messenger, logged in with your browser
+cookies, built on the `messagix` library of the mautrix-meta bridge and on `whatsmeow` for encrypted chats) and
+`meta-whatsapp-sidecar` (WhatsApp as a linked device, built on `whatsmeow`). It needs no Meta developer account,
+app, token or webhook. The daemon, the sidecars and everything they store run on your machine; the message text your
+assistant reads goes wherever the assistant runs.
+
+> **Read this before you use it.** Unofficial clients are outside the terms of Facebook and WhatsApp for personal
+> accounts. WhatsApp's own pages say that linking an account to an unofficial app "violates our Terms of Service"
+> and that the account "might also be temporarily or permanently banned", that the wording reaches back ("now or in
+> the past"), and that a banned account cannot reach its chat history or backups while the ban lasts. Facebook's
+> terms forbid automated access, and users of the Messenger library report checkpoints and "suspect automated
+> behaviour" locks. The design offers no way to start a new chat, create a group or send a broadcast (the kind of
+> behaviour WhatsApp's own pages warn about), keeps one connection set per account, and adds a read-only mode and an
+> audit log of sends, but **the risk is not zero** and no source shows how much any of that helps.
+> The account at risk is your phone number or your Facebook identity: use one you can afford to lose. Details:
+> [SECURITY.md](SECURITY.md#unofficial-clients-the-risk-to-the-account) and the
+> [guide, Part 10.0](docs/GUIDE.md#100-what-this-is-and-is-not).
+
+- **What the assistant can do.** List and read conversations, wait for the next incoming message, send text and
+  files, react, mark read, show typing, and save attachments. 18 tools in all
+  ([docs/TOOLS.md](docs/TOOLS.md#personal-tools)); the messages also land in the local inbox as the platforms
+  `messenger_personal` and `whatsapp_personal`.
+- **What it needs.** Rust 1.89 or newer, Go 1.26 or newer, and Linux: the daemon reads its own user id from `/proc`, and
+  `meta-mcp personal install` writes systemd user units. Without systemd, run `meta-mcp personal daemon` under your own
+  supervisor, still on Linux.
+- **What it does not do.** Start new chats (each sidecar sends only into a conversation it already holds), manage
+  groups, send polls, or pace sends for you (neither the daemon nor the sidecars rate-limit sends). Encrypted
+  Messenger history from before the device was registered is not available.
+
+From the repository root:
+
+```bash
+scripts/build-all.sh                       # meta-mcp and both sidecars, into dist/
+install -m 0755 dist/meta-mcp dist/meta-messenger-sidecar dist/meta-whatsapp-sidecar ~/.local/bin/
+meta-mcp personal install                  # the daemon and its socket, as systemd user units
+meta-mcp personal login whatsapp           # QR code in the terminal (or --pair-code YOUR_NUMBER)
+meta-mcp personal login messenger --cookies-file cookies.json
+meta-mcp personal status
+claude mcp add meta-mcp -- meta-mcp
+```
+
+The cookies, the QR flow, the passkey step some WhatsApp accounts need, operations and troubleshooting are in the
+[guide, Part 10](docs/GUIDE.md#part-10-personal-mode-your-own-messenger-and-whatsapp). Session files live in
+`META_MCP_HOME/personal/` (folders 0700, files 0600) and are as sensitive as passwords; the daemon listens on a
+Unix socket that only your user can open.
+
 ## Quick start
+
+This is the quick start for business mode (Pages and business numbers). Personal mode has its own, above.
 
 You need a Meta app first. The guide walks through it: [Part 1](docs/GUIDE.md#part-1-meta-developer-account-and-app)
 (developer account and app), [Part 2](docs/GUIDE.md#part-2-pages-roles-and-access) (roles and access)
@@ -60,7 +125,8 @@ register as a developer, create an app with the Messenger use case, copy the App
 **Settings > Basic**, and register `http://localhost:8766/callback` as a redirect URI under **Facebook
 Login for Business > Settings** (the guide explains why, and what to do if Meta refuses it).
 
-1. **Install.** You need Rust 1.89 or newer and a C compiler.
+1. **Install.** You need Rust 1.89 or newer and a C compiler. Since personal mode was added the crate uses Unix-only
+   APIs without a platform guard, so a build for Windows is not expected to work (not tried).
 
    ```bash
    git clone https://github.com/matpb/meta-mcp-rs.git
@@ -102,18 +168,19 @@ Facebook account you test with as a **Tester** ([guide, Part 2.2](docs/GUIDE.md#
 | **HTTP mode** | A shared or remote server | `META_MCP_API_KEYS="$(openssl rand -hex 32)" meta-mcp http`, behind TLS. Add `--with-webhook` to receive Meta's webhooks in the same process |
 
 `env.example` lists every variable. meta-mcp never reads `.env` files: load them through your shell,
-systemd or your process manager.
+systemd or your process manager. Personal mode needs none of these routes: it has no Meta credentials.
 
 ## Tools
 
-20 tools. Full parameters, results and examples are in [docs/TOOLS.md](docs/TOOLS.md). "Read-only mode"
-says whether the tool stays available when `META_MCP_READ_ONLY=true`.
+38 tools: 20 for business mode and 18 for personal mode. Full parameters, results and examples are in
+[docs/TOOLS.md](docs/TOOLS.md). "Read-only mode" says whether the tool stays available when
+`META_MCP_READ_ONLY=true`.
 
 | Tool | What it does | Read-only mode |
 |---|---|---|
 | `meta_status` | Shows the app, Pages, WhatsApp numbers, token expiry, webhook and inbox health | kept |
-| `inbox_list` | Lists stored webhook events, newest first, with filters | kept |
-| `inbox_wait` | Waits for new webhook events | kept |
+| `inbox_list` | Lists stored events (webhook and personal), newest first, with filters | kept |
+| `inbox_wait` | Waits for new inbox events | kept |
 | `inbox_mark_processed` | Flags inbox events as handled | removed |
 | `messenger_list_conversations` | Lists a Page's conversations and the customers' PSIDs | kept |
 | `messenger_read_conversation` | Reads the messages of one conversation | kept |
@@ -131,10 +198,28 @@ says whether the tool stays available when `META_MCP_READ_ONLY=true`.
 | `whatsapp_mark_read` | Marks a message read, optionally showing typing | removed |
 | `whatsapp_upload_media` | Uploads a file and returns a media ID | removed |
 | `whatsapp_download_media` | Saves an inbound media file into `inbound/whatsapp` of the files directory | kept (read-only apart from the saved file) |
+| `personal_status` | Shows both personal accounts: login, connection, sending state, versions | kept |
+| `messenger_personal_list_threads` | Lists your own Messenger conversations | kept |
+| `messenger_personal_read_thread` | Reads the messages of one of them | kept |
+| `messenger_personal_send_text` | Sends a text message from your Messenger account | removed |
+| `messenger_personal_send_media` | Sends an image, video, audio clip or file from your Messenger account (encrypted chats: images only, no captions) | removed |
+| `messenger_personal_react` | Reacts to a message, or removes your reaction with an empty emoji (removal is not verified in encrypted threads) | removed |
+| `messenger_personal_mark_read` | Marks a conversation read (the other person sees it) | removed |
+| `messenger_personal_typing` | Starts or stops the typing indicator | removed |
+| `messenger_personal_download_attachment` | Saves an attachment into `inbound/messenger_personal` of the files directory | kept (read-only apart from the saved file) |
+| `whatsapp_personal_list_chats` | Lists your own WhatsApp chats | kept |
+| `whatsapp_personal_read_chat` | Reads the messages of one of them, asking the phone for older ones when needed | kept |
+| `whatsapp_personal_send_text` | Sends a text message from your WhatsApp account | removed |
+| `whatsapp_personal_send_media` | Sends an image, video, audio clip or file from your WhatsApp account | removed |
+| `whatsapp_personal_react` | Reacts to a message, or removes your reaction with an empty emoji (removal is not verified on WhatsApp) | removed |
+| `whatsapp_personal_mark_read` | Marks a chat read (blue ticks) | removed |
+| `whatsapp_personal_typing` | Starts or stops the typing indicator | removed |
+| `whatsapp_personal_download_media` | Saves media into `inbound/whatsapp_personal` of the files directory | kept (read-only apart from the saved file) |
+| `personal_wait_for_message` | Waits for the next live incoming personal message | kept |
 
 Tools that return content from Meta say so in their description: names, text and attachments are
 third-party content, never instructions. The send tools say they reach real people and ask the client to
-confirm first.
+confirm first; the personal ones reach them as you.
 
 ## Configuration
 
@@ -154,11 +239,11 @@ writes the file; every variable below overrides it.
 | `META_WEBHOOK_PUBLIC_URL` | none | Public HTTPS URL of the webhook (also feeds the Host guard) |
 | `META_GRAPH_VERSION` | `v26.0` | Graph API version; must look like `v26.0` |
 | `META_GRAPH_BASE_URL` | `https://graph.facebook.com` | Graph base URL; `https` required unless the host is loopback |
-| `META_MCP_HOME` | platform config dir (`~/.config/meta-mcp` on Linux) | Directory holding `credentials.json` |
+| `META_MCP_HOME` | platform config dir (`~/.config/meta-mcp` on Linux) | Directory holding `credentials.json` and, for personal mode, `personal/` (session state, the sidecars' data and the audit log) |
 | `META_MCP_INBOX_DB` | `inbox.db` in the platform data dir (`~/.local/share/meta-mcp` on Linux) | SQLite inbox file |
-| `META_MCP_FILES_DIR` | unset (file tools disabled) | The only directory the file tools read from and write to; must exist. Downloads go to `inbound/messenger` and `inbound/whatsapp` inside it. It may not contain `META_MCP_HOME`, `credentials.json` or the inbox database: startup fails and the error names the overlap |
+| `META_MCP_FILES_DIR` | unset (file tools disabled) | The only directory the file tools read from and write to; must exist. Downloads go to `inbound/messenger` and `inbound/whatsapp` inside it (`inbound/messenger_personal` and `inbound/whatsapp_personal` in personal mode). It may not contain `META_MCP_HOME`, `credentials.json` or the inbox database: startup fails and the error names the overlap |
 | `META_MCP_MAX_FILE_BYTES` | `104857600` (100 MiB) | Largest file the file tools will read, upload or save |
-| `META_MCP_READ_ONLY` | `false` | `true` removes every send and state-changing tool |
+| `META_MCP_READ_ONLY` | `false` | `true` removes every send and state-changing tool. The personal daemon reads it too and refuses writes with `read_only` |
 | `META_MCP_API_KEYS` | none | HTTP mode only. Comma-separated keys, each at least 32 characters; required |
 | `META_MCP_HOST` | `127.0.0.1` | HTTP mode bind address |
 | `META_MCP_PORT` | `8788` | HTTP mode port |
@@ -166,6 +251,8 @@ writes the file; every variable below overrides it.
 | `META_MCP_WEBHOOK_LISTEN` | `127.0.0.1:8787` | Address the standalone webhook receiver binds |
 | `META_MCP_DOWNLOAD_HOSTS` | none | Extra exact host names (no wildcards, no ports) that downloads may fetch from and that may receive the token. The Graph API host is refused whatever this says. Leave unset in production |
 | `META_MCP_LOG` | `meta_mcp=info` | Log filter (tracing syntax); logs go to stderr |
+| `META_MCP_PERSONAL_SOCKET` | `$XDG_RUNTIME_DIR/meta-mcp/personal.sock`, else `META_MCP_HOME/personal/personal.sock` | Personal mode. The Unix socket of the personal daemon, used by the daemon, the MCP server and every `meta-mcp personal` command. Keep the path under about 100 bytes |
+| `META_MCP_SIDECAR_DIR` | the directory of the `meta-mcp` executable | Personal mode. Where `meta-messenger-sidecar` and `meta-whatsapp-sidecar` are |
 
 Booleans accept `true`, `false`, `1`, `0`, `yes`, `no`, `on` and `off`.
 
@@ -188,16 +275,35 @@ The access token is the Page, or the business number, so the defaults are conser
   under `inbound/`, and the upload tools refuse to send them on unless the call says `allow_inbound=true`.
 - HTTP mode requires API keys (32 characters or more, constant-time comparison), guards the `Host` and
   `Origin` headers, binds to loopback by default and sends no CORS headers. TLS is your reverse proxy's job.
-- `META_MCP_READ_ONLY=true` removes the 11 tools that send or change state.
+- `META_MCP_READ_ONLY=true` removes the 21 tools that send or change state (11 business, 10 personal).
+- Personal mode keeps a copy of your logged-in session, so its files (`META_MCP_HOME/personal/`) are 0600 in 0700
+  folders and the daemon socket accepts only your own user. The sidecars start with an empty environment, the
+  logs are scrubbed, and sends are written to an audit log (hashes and ids, never the text) before they are
+  attempted. Nothing paces sends. The HTTP transport serves the personal tools too, so every holder of one of its API
+  keys can reach your accounts. The risk that no control removes is the platforms': an unofficial client can get the
+  account restricted or banned.
 
 The full threat model, each control's limits and how to report a vulnerability are in
 [SECURITY.md](SECURITY.md).
 
 ## FAQ
 
-**Can it read my personal Messenger or WhatsApp?** No. The Graph API reaches Facebook Page inboxes and
-WhatsApp Business numbers only. A personal WhatsApp number can become a Business API number only by
-deleting the personal account first (Meta's rule), and there is no endpoint for personal Messenger.
+**Can it read my personal Messenger or WhatsApp?** Business mode cannot: the Graph API reaches Facebook
+Page inboxes and WhatsApp Business numbers only. A personal WhatsApp number can become a Business API
+number only by deleting the personal account first (Meta's rule), and there is no endpoint for personal
+Messenger. **Personal mode can**, through unofficial clients, outside the platforms' terms and with a real risk to
+the account: see [Personal mode](#personal-mode).
+
+**Will personal mode get my account banned?** Nobody can promise it will not. WhatsApp states that linking an
+account to an unofficial app can lead to a temporary or permanent ban, retroactively, and the Messenger
+library's users report checkpoints and automated-behaviour locks. The design offers no way to start a new chat,
+create a group or send a broadcast, the kind of behaviour WhatsApp's pages warn about, and adds a read-only mode and a
+client that can ask you before each send, and none of that removes the risk or is shown to lower it. Use an account
+you can afford to lose, and read
+[SECURITY.md](SECURITY.md#unofficial-clients-the-risk-to-the-account).
+
+**Does personal mode need a Meta app or a webhook?** No. It needs the two sidecars and the daemon on one machine
+you control, and a login on each platform.
 
 **What is the 24-hour window?** A Messenger Page can reply to a person for 24 hours after their last
 message (up to 7 days after a click-to-Messenger ad); WhatsApp free-form messages work for 24 hours after
@@ -235,16 +341,20 @@ expiring. `meta-mcp doctor` warns when fewer than 10 days are left
 `meta-mcp setup --instagram` can request the Instagram scopes, but there are no Instagram tools.
 
 **Can I stop the assistant from sending?** Yes: `META_MCP_READ_ONLY=true`. The read tools, the inbox and
-the two download tools remain, and the downloads only write inside the files directory. In this mode
-both download tools refuse `overwrite=true`, so they only create new files
-([SECURITY.md](SECURITY.md#read-only-mode) has the details for both download tools).
+the download tools remain, and the downloads only write inside the files directory. In this mode
+the two business download tools refuse `overwrite=true`, so they only create new files
+([SECURITY.md](SECURITY.md#read-only-mode) has the details). For personal mode set the variable for the
+personal daemon as well as for the MCP server: they are two switches.
 
 ## Documentation
 
 - [docs/GUIDE.md](docs/GUIDE.md): the implementation guide, from no Meta account to a working assistant,
-  with the WhatsApp track, production advice and troubleshooting.
+  with the WhatsApp track, production advice and troubleshooting, and Part 10 for personal mode.
 - [docs/TOOLS.md](docs/TOOLS.md): every tool with parameters, results, errors and examples.
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): modules, data flow, trust boundaries and sequence diagrams.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): modules, data flow, the personal daemon and its sidecars, trust
+  boundaries and sequence diagrams.
+- [sidecars/messenger/docs/SIDECAR-MESSENGER.md](sidecars/messenger/docs/SIDECAR-MESSENGER.md) and
+  [sidecars/whatsapp/docs/SIDECAR-WHATSAPP.md](sidecars/whatsapp/docs/SIDECAR-WHATSAPP.md): the two Go sidecars.
 - [SECURITY.md](SECURITY.md): the threat model, the limits of each control and how to report a problem.
 - [CHANGELOG.md](CHANGELOG.md) and [env.example](env.example).
 
@@ -257,6 +367,14 @@ both download tools refuse `overwrite=true`, so they only create new files
 ./scripts/check.sh
 ```
 
+The Go sidecars have their own gate: each `sidecars/*/build.sh` runs `go vet`, `go test`, a static build and
+`govulncheck`. `scripts/build-all.sh` builds `meta-mcp` and both sidecars into `dist/`; it needs Go 1.26 or newer,
+`govulncheck` and `file`.
+
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). What to know about the personal-mode sidecars, which are separate Go programs built from
+`sidecars/`: the Messenger sidecar links mautrix-meta, which is AGPL-3.0, so its documentation states that the
+combined `meta-messenger-sidecar` binary is AGPL-3.0 and that distributing it carries the AGPL source obligations. The
+WhatsApp sidecar links `whatsmeow` (MPL-2.0), and both sidecars link `go.mau.fi/libsignal` (the Messenger sidecar
+through mautrix-meta and `whatsmeow`), which is GPL-3.0. Check the terms before you distribute a sidecar binary. Not legal advice.
