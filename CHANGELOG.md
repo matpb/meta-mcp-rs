@@ -77,7 +77,7 @@ download, file and send paths, and the setup wizard as built.
 
 ### Changed
 
-- WhatsApp personal sends accept the owner's own number before any chat exists (the "message yourself" chat is created on first use), so a fresh link can be tested without messaging anyone else. Every other unknown chat is still `thread_not_found`.
+- WhatsApp personal `send_text` and `send_media` accept any phone-number id that WhatsApp confirms as registered (the chat is created on first use; the owner's own number skips the check). Unregistered numbers, unknown groups and LIDs, and reactions, read marks and typing on unknown chats stay `thread_not_found`.
 - `inbox_list` and `inbox_wait` accept `messenger_personal` and `whatsapp_personal` as `platform`, and the
   unknown-platform error names them. Read-only mode now removes 21 tools instead of 11 (the 10 personal write tools
   join the 11 business ones) and keeps 17.

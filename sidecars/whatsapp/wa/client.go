@@ -68,6 +68,8 @@ type Client interface {
 	DecryptReaction(ctx context.Context, evt *events.Message) (*waE2E.ReactionMessage, error)
 
 	GetGroupInfo(ctx context.Context, jid types.JID) (*types.GroupInfo, error)
+	// IsOnWhatsApp asks the server which of the phone numbers (international, with the plus) are registered.
+	IsOnWhatsApp(ctx context.Context, phones []string) ([]types.IsOnWhatsAppResponse, error)
 	GetContact(ctx context.Context, jid types.JID) (types.ContactInfo, error)
 	GetPNForLID(ctx context.Context, lid types.JID) (types.JID, error)
 	GetLIDForPN(ctx context.Context, pn types.JID) (types.JID, error)

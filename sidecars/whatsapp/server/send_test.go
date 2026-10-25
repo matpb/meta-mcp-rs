@@ -45,6 +45,11 @@ func TestSendGateOrder(t *testing.T) {
 	c.mu.Unlock()
 	rep := h.call("send_text", map[string]any{"thread_id": peerPN, "text": "x"})
 	h.wantErr(rep, api.CodeThreadNotFound)
+	if !strings.Contains(rep.Error.Message, "not registered") {
+		t.Fatalf("message %q", rep.Error.Message)
+	}
+	rep = h.call("send_reaction", map[string]any{"thread_id": peerPN, "message_id": "A1", "emoji": "x"})
+	h.wantErr(rep, api.CodeThreadNotFound)
 	if !strings.Contains(rep.Error.Message, "open this chat on the phone") {
 		t.Fatalf("message %q", rep.Error.Message)
 	}
@@ -632,5 +637,42 @@ func TestSendTextToOwnNumberCreatesTheSelfChat(t *testing.T) {
 	chat, found, err := h.srv.store.GetChat(h.srv.ctx, selfPN)
 	if err != nil || !found || chat.Kind != api.KindDM {
 		t.Fatalf("self chat not stored: found=%v kind=%q err=%v", found, chat.Kind, err)
+	}
+}
+
+// A send to an unknown phone number opens the chat once WhatsApp confirms the number; unregistered numbers,
+// non-phone ids and the reaction, read and typing ops stay thread_not_found.
+func TestSendTextOpensANewChatForARegisteredNumber(t *testing.T) {
+	h, c := startPaired(t, true)
+	c.mu.Lock()
+	c.onWA = map[string]bool{"15550009999": true}
+	c.mu.Unlock()
+	rep := h.call("send_text", map[string]any{"thread_id": "15550001111@s.whatsapp.net", "text": "x"})
+	h.wantErr(rep, api.CodeThreadNotFound)
+	if !strings.Contains(rep.Error.Message, "not registered") {
+		t.Fatalf("message %q", rep.Error.Message)
+	}
+	h.wantErr(h.call("send_text", map[string]any{"thread_id": "123@g.us", "text": "x"}), api.CodeThreadNotFound)
+	h.wantErr(h.call("send_text", map[string]any{"thread_id": "abc@s.whatsapp.net", "text": "x"}), api.CodeThreadNotFound)
+	h.wantErr(h.call("send_reaction", map[string]any{"thread_id": "15550009999@s.whatsapp.net", "message_id": "A1", "emoji": "x"}), api.CodeThreadNotFound)
+	if len(c.sentSnapshot()) != 0 {
+		t.Fatal("nothing may be sent before the number is confirmed")
+	}
+	res := h.mustCall("send_text", map[string]any{"thread_id": "15550009999@s.whatsapp.net", "text": "hello there"})
+	if res["message_id"] == "" || len(c.sentSnapshot()) != 1 {
+		t.Fatalf("result %v, sent %d", res, len(c.sentSnapshot()))
+	}
+	chat, found, err := h.srv.store.GetChat(h.srv.ctx, "15550009999@s.whatsapp.net")
+	if err != nil || !found || chat.Kind != api.KindDM {
+		t.Fatalf("new chat not stored: found=%v kind=%q err=%v", found, chat.Kind, err)
+	}
+	c.mu.Lock()
+	queries := len(c.onWAQuery)
+	c.mu.Unlock()
+	h.mustCall("send_text", map[string]any{"thread_id": "15550009999@s.whatsapp.net", "text": "again"})
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.onWAQuery) != queries {
+		t.Fatal("a known chat must not be re-checked with WhatsApp")
 	}
 }

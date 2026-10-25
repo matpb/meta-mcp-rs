@@ -351,9 +351,11 @@ precaution whose effect is unproven. None of it brings the risk to zero, and no 
 
 The rule is enforced by the sidecars, not by the daemon, which checks only the shape of an id.
 
-- **WhatsApp** sends only into a chat that is already in the sidecar's store, and answers `thread_not_found` otherwise
-  ("the owner must open this chat on the phone first"). The owner's own number is the one exception: it is always
-  accepted and its chat is created on first use, so a link can be tested without messaging anyone else. WhatsApp's own pages list "you can't start chats or calls
+- **WhatsApp** `send_text` and `send_media` accept a chat from the sidecar's store or any phone-number id that
+  WhatsApp confirms as registered (the sidecar asks before every first send; the owner's own number skips the
+  check). An unregistered number, a group or LID absent from the store, and any unknown chat for reactions, read
+  marks and typing are `thread_not_found`. First contact with a number that has not messaged you is the pattern
+  WhatsApp flags most, so the tool descriptions still ask for a confirmation before every send. WhatsApp's own pages list "you can't start chats or calls
   with new contacts" among the restrictions and name contacts who "have contacted you first" as the best practice.
 - **Messenger** sends, reacts, marks read and shows typing only in a thread that is in the sidecar's thread list. Any
   other id, the id of a contact you have no conversation with included, is `thread_not_found`: it might be an

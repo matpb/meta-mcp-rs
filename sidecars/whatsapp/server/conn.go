@@ -96,6 +96,11 @@ func (s *server) fatal(reason, action string) error {
 
 // sendGate applies the shared send checks and resolves the target chat.
 func (s *server) sendGate(ctx context.Context, threadID string) (wa.Client, store.Chat, error) {
+	return s.sendGateOpen(ctx, threadID, false)
+}
+
+// sendGateOpen is sendGate; with openNew, an unknown phone number that is registered on WhatsApp becomes a new DM.
+func (s *server) sendGateOpen(ctx context.Context, threadID string, openNew bool) (wa.Client, store.Chat, error) {
 	if r := s.blockedReason(); r != "" {
 		return nil, store.Chat{}, blockedError(r)
 	}
@@ -107,10 +112,50 @@ func (s *server) sendGate(ctx context.Context, threadID string) (wa.Client, stor
 		return nil, store.Chat{}, api.Errorf(api.CodeNotConnected, "not connected to WhatsApp")
 	}
 	chat, err := s.chatFor(ctx, threadID)
+	if err != nil && openNew && api.AsError(err).Code == api.CodeThreadNotFound {
+		chat, err = s.openNewDM(ctx, cl, threadID)
+	}
 	if err != nil {
 		return nil, store.Chat{}, err
 	}
 	return cl, chat, nil
+}
+
+// openNewDM creates the DM for a phone-number JID once the server confirms the number is on WhatsApp.
+func (s *server) openNewDM(ctx context.Context, cl wa.Client, threadID string) (store.Chat, error) {
+	jid, err := types.ParseJID(threadID)
+	if err != nil || jid.Server != types.DefaultUserServer || jid.User == "" || strings.Trim(jid.User, "0123456789") != "" {
+		return store.Chat{}, api.Errorf(api.CodeThreadNotFound, "unknown thread; a new chat needs a phone-number id like 15551234567@s.whatsapp.net")
+	}
+	res, err := cl.IsOnWhatsApp(ctx, []string{"+" + jid.User})
+	if err != nil {
+		return store.Chat{}, api.Errorf(api.CodeNotConnected, "could not check the number with WhatsApp")
+	}
+	var hit *types.IsOnWhatsAppResponse
+	for i := range res {
+		if strings.TrimPrefix(res[i].Query, "+") == jid.User {
+			hit = &res[i]
+		}
+	}
+	if hit == nil || !hit.IsIn {
+		s.log.Info().Str("thread", jid.ToNonAD().String()).Msg("number check: not on WhatsApp")
+		return store.Chat{}, api.Errorf(api.CodeThreadNotFound, "unknown thread; this number is not registered on WhatsApp")
+	}
+	res = []types.IsOnWhatsAppResponse{*hit}
+	pn := jid.ToNonAD().String()
+	alt := ""
+	if res[0].JID.Server == types.HiddenUserServer {
+		alt = res[0].JID.ToNonAD().String()
+		if err := s.store.PutLIDMapping(ctx, alt, pn); err != nil {
+			return store.Chat{}, api.Errorf(api.CodeIO, "message database error")
+		}
+	}
+	chat, _, err := s.store.EnsureChat(ctx, pn, alt, api.KindDM)
+	if err != nil {
+		return store.Chat{}, api.Errorf(api.CodeIO, "message database error")
+	}
+	s.log.Info().Str("thread", pn).Msg("opened a new chat for a send")
+	return chat, nil
 }
 
 // chatFor finds a stored chat by either of its ids.

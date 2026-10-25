@@ -165,6 +165,10 @@ func (r *Real) DecryptReaction(ctx context.Context, evt *events.Message) (*waE2E
 	return r.cli.DecryptReaction(ctx, evt)
 }
 
+func (r *Real) IsOnWhatsApp(ctx context.Context, phones []string) ([]types.IsOnWhatsAppResponse, error) {
+	return r.cli.IsOnWhatsApp(ctx, phones)
+}
+
 func (r *Real) GetGroupInfo(ctx context.Context, jid types.JID) (*types.GroupInfo, error) {
 	return r.cli.GetGroupInfo(ctx, jid)
 }

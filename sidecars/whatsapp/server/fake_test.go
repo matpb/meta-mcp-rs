@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -84,6 +85,9 @@ type fakeClient struct {
 	prekeys     chan struct{}
 
 	presences  chan types.Presence
+	onWA       map[string]bool // phone digits -> registered, for IsOnWhatsApp
+	onWAErr    error
+	onWAQuery  []string
 	chatPres   []chatPresCall
 	sent       []sentMsg
 	sendFn     func(to types.JID, msg *waE2E.Message, extra whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error)
@@ -425,6 +429,27 @@ func (c *fakeClient) DecryptReaction(_ context.Context, evt *events.Message) (*w
 		return nil, errors.New("no decrypt scripted")
 	}
 	return c.decReaction(evt)
+}
+
+func (c *fakeClient) IsOnWhatsApp(_ context.Context, phones []string) ([]types.IsOnWhatsAppResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onWAQuery = append(c.onWAQuery, phones...)
+	if c.onWAErr != nil {
+		return nil, c.onWAErr
+	}
+	var out []types.IsOnWhatsAppResponse
+	for _, q := range phones {
+		p := strings.TrimPrefix(q, "+")
+		in := c.onWA[p]
+		r := types.IsOnWhatsAppResponse{Query: q, IsIn: in}
+		if in {
+			r.JID = types.NewJID(p, types.DefaultUserServer)
+			r.PhoneNumber = r.JID
+		}
+		out = append(out, r)
+	}
+	return out, nil
 }
 
 func (c *fakeClient) GetGroupInfo(_ context.Context, jid types.JID) (*types.GroupInfo, error) {

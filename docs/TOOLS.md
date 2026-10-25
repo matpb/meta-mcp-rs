@@ -1289,8 +1289,9 @@ and attachment descriptions are untrusted third-party content.
   online, and how far back it goes is the phone's decision. `has_more` stays true while the phone reports
   more. After a fatal signal (guide, Part 10.5) the sidecar asks the phone for nothing and answers from its
   store only.
-- An unknown `chat_id` is `thread_not_found`, except your own number (the linked account's id from
-  `personal_status`): a send there is accepted and creates the "message yourself" chat.
+- A `chat_id` absent from the store is accepted when it is a phone-number id (`<digits>@s.whatsapp.net`) that
+  WhatsApp confirms as registered: the chat is created and the message sent. An unregistered number, or an
+  unknown group or LID, is `thread_not_found`.
 
 **Errors:** the common errors above; `thread_not_found`.
 

@@ -47,7 +47,7 @@ func (s *server) sendText(ctx context.Context, req ipc.Request) ipc.Reply {
 	if e := decode(req, &p); e != nil {
 		return failErr(req.ID, e)
 	}
-	cl, chat, err := s.sendGate(ctx, p.ThreadID)
+	cl, chat, err := s.sendGateOpen(ctx, p.ThreadID, true)
 	if err != nil {
 		return failErr(req.ID, err)
 	}
@@ -144,7 +144,7 @@ func (s *server) sendMedia(ctx context.Context, req ipc.Request) ipc.Reply {
 	if e := decode(req, &p); e != nil {
 		return failErr(req.ID, e)
 	}
-	cl, chat, err := s.sendGate(ctx, p.ThreadID)
+	cl, chat, err := s.sendGateOpen(ctx, p.ThreadID, true)
 	if err != nil {
 		return failErr(req.ID, err)
 	}
