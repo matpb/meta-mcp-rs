@@ -66,7 +66,7 @@ pub const BUSINESS_READ_ONLY_TOOL_NAMES: [&str; 9] = [
 
 /// Every tool the stdio server exposes, sorted.
 #[cfg(unix)]
-pub const ALL_TOOL_NAMES: [&str; 38] = [
+pub const ALL_TOOL_NAMES: [&str; 39] = [
     "inbox_list",
     "inbox_mark_processed",
     "inbox_wait",
@@ -79,6 +79,7 @@ pub const ALL_TOOL_NAMES: [&str; 38] = [
     "messenger_personal_mark_read",
     "messenger_personal_react",
     "messenger_personal_read_thread",
+    "messenger_personal_search_users",
     "messenger_personal_send_media",
     "messenger_personal_send_text",
     "messenger_personal_typing",
@@ -113,7 +114,7 @@ pub const ALL_TOOL_NAMES: [&str; 20] = BUSINESS_TOOL_NAMES;
 
 /// The tools left in read-only mode (downloads stay: they only write local files).
 #[cfg(unix)]
-pub const READ_ONLY_TOOL_NAMES: [&str; 17] = [
+pub const READ_ONLY_TOOL_NAMES: [&str; 18] = [
     "inbox_list",
     "inbox_wait",
     "messenger_download_attachment",
@@ -123,6 +124,7 @@ pub const READ_ONLY_TOOL_NAMES: [&str; 17] = [
     "messenger_personal_download_attachment",
     "messenger_personal_list_threads",
     "messenger_personal_read_thread",
+    "messenger_personal_search_users",
     "messenger_read_conversation",
     "meta_status",
     "personal_status",
@@ -767,7 +769,7 @@ mod tests {
             .copied()
             .filter(|n| n.contains("personal"))
             .collect();
-        assert_eq!(names.len(), 18);
+        assert_eq!(names.len(), 19);
         for name in names {
             let tool = build_router(false, true).get(name).cloned().expect("tool");
             let props = tool

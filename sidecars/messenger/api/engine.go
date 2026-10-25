@@ -41,6 +41,7 @@ type Session interface {
 	SendReaction(ctx context.Context, p SendReactionParams) error
 	MarkRead(ctx context.Context, p MarkReadParams) error
 	SetTyping(ctx context.Context, p SetTypingParams) error
+	SearchUsers(ctx context.Context, p SearchUsersParams) (SearchUsersResult, error)
 }
 
 // Params arrive already validated by the server (ranges, required fields, absolute paths).
@@ -84,6 +85,22 @@ type SendTextParams struct {
 	ThreadID string `json:"thread_id"`
 	Text     string `json:"text"`
 	ReplyTo  string `json:"reply_to,omitempty"`
+}
+
+type SearchUsersParams struct {
+	Query string `json:"query"`
+	Limit int    `json:"limit"`
+}
+
+// Person is one messageable account from a user search; HasThread is true when the thread list already has it.
+type Person struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	HasThread bool   `json:"has_thread"`
+}
+
+type SearchUsersResult struct {
+	Users []Person `json:"users"`
 }
 
 type SendMediaParams struct {

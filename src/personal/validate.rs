@@ -4,6 +4,8 @@ pub const MAX_TEXT_CHARS: usize = 4000;
 pub const MAX_CAPTION_CHARS: usize = 1024;
 pub const MAX_ID_BYTES: usize = 128;
 pub const MAX_EMOJI_CHARS: usize = 10;
+pub const MAX_SEARCH_CHARS: usize = 200;
+pub const MAX_SEARCH_LIMIT: i64 = 50;
 
 /// `\r\n` becomes `\n`, the result is trimmed.
 fn normalise(raw: &str) -> String {
@@ -67,6 +69,31 @@ fn id(raw: &str, what: &str) -> Result<(), String> {
         Err(format!(
             "{what} must be 1 to {MAX_ID_BYTES} printable ASCII characters without spaces"
         ))
+    }
+}
+
+/// A people-search query: 1 to 200 characters.
+pub fn search_query(raw: &str) -> Result<(), String> {
+    if (1..=MAX_SEARCH_CHARS).contains(&raw.chars().count()) {
+        Ok(())
+    } else {
+        Err(format!("query must be 1 to {MAX_SEARCH_CHARS} characters"))
+    }
+}
+
+/// An optional people-search limit: absent, null or an integer from 1 to 50.
+pub fn search_limit(raw: Option<&serde_json::Value>) -> Result<(), String> {
+    match raw {
+        None | Some(serde_json::Value::Null) => Ok(()),
+        Some(v)
+            if v.as_i64()
+                .is_some_and(|n| (1..=MAX_SEARCH_LIMIT).contains(&n)) =>
+        {
+            Ok(())
+        }
+        Some(_) => Err(format!(
+            "limit must be an integer from 1 to {MAX_SEARCH_LIMIT}"
+        )),
     }
 }
 
@@ -138,6 +165,19 @@ pub fn emoji(raw: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_query_and_limit_are_bounded() {
+        assert!(search_query("a").is_ok());
+        assert!(search_query(&"\u{1F600}".repeat(MAX_SEARCH_CHARS)).is_ok());
+        assert!(search_query("").is_err());
+        assert!(search_query(&"a".repeat(MAX_SEARCH_CHARS + 1)).is_err());
+        let ok = |v: serde_json::Value| search_limit(Some(&v)).is_ok();
+        assert!(search_limit(None).is_ok() && ok(serde_json::json!(null)));
+        assert!(ok(serde_json::json!(1)) && ok(serde_json::json!(50)));
+        assert!(!ok(serde_json::json!(0)) && !ok(serde_json::json!(51)));
+        assert!(!ok(serde_json::json!("5")) && !ok(serde_json::json!(2.5)));
+    }
 
     #[test]
     fn text_is_normalised_trimmed_and_bounded() {

@@ -104,7 +104,7 @@ func (s *session) SendMedia(ctx context.Context, p api.SendMediaParams) (api.Sen
 	if err := s.writable(); err != nil {
 		return api.SendResult{}, err
 	}
-	t, err := s.resolveThread(p.ThreadID)
+	t, err := s.resolveSendTarget(ctx, p.ThreadID)
 	if err != nil {
 		return api.SendResult{}, err
 	}

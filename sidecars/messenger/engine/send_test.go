@@ -223,7 +223,7 @@ func TestSendTextReplyMetadata(t *testing.T) {
 
 func TestSendTextValidation(t *testing.T) {
 	s, fc := sendSession(t)
-	fc.exec = replyWith("mid.$x")
+	fc.exec = replyWithEmptySearch("mid.$x")
 	cases := []struct {
 		name string
 		p    api.SendTextParams
@@ -244,25 +244,20 @@ func TestSendTextValidation(t *testing.T) {
 	if _, err := s.SendText(t.Context(), api.SendTextParams{ThreadID: "222", Text: strings.Repeat("é", 20000)}); err != nil {
 		t.Fatalf("20000 runes must pass: %v", err)
 	}
-	fc.mu.Lock()
-	n := len(fc.tasks)
-	fc.mu.Unlock()
-	if n != 1 {
-		t.Fatalf("%d tasks executed, want only the valid send", n)
+	if n := countTasks[*socket.SendMessageTask](fc); n != 1 {
+		t.Fatalf("%d sends executed, want only the valid send", n)
 	}
 }
 
 // A contact id without a registry thread could be an encrypted chat that is not listed yet, so it is never sent to.
 func TestSendTextKnownContactWithoutThreadIsNotFound(t *testing.T) {
 	s, fc := sendSession(t)
-	fc.exec = replyWith("mid.$c")
+	fc.exec = replyWithEmptySearch("mid.$c")
 	s.names.set(777, "New Friend")
 	_, err := s.SendText(t.Context(), api.SendTextParams{ThreadID: "777", Text: "hi"})
 	wantCode(t, err, api.CodeThreadNotFound)
-	fc.mu.Lock()
-	defer fc.mu.Unlock()
-	if len(fc.tasks) != 0 {
-		t.Fatalf("%d tasks executed for an unknown thread", len(fc.tasks))
+	if n := countTasks[*socket.SendMessageTask](fc); n != 0 {
+		t.Fatalf("%d sends executed for an unknown thread", n)
 	}
 }
 

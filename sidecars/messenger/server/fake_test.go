@@ -25,6 +25,7 @@ type fakeFactory struct {
 	validate    func(ctx context.Context) (api.Account, error)
 	listThreads func(ctx context.Context, p api.ListThreadsParams) (api.ListThreadsResult, error)
 	sendText    func(ctx context.Context, p api.SendTextParams) (api.SendResult, error)
+	searchUsers func(ctx context.Context, p api.SearchUsersParams) (api.SearchUsersResult, error)
 }
 
 func (f *fakeFactory) Open(st api.State, dataDir string, sink api.Sink) (api.Session, error) {
@@ -146,3 +147,10 @@ func (s *fakeSession) SendMedia(context.Context, api.SendMediaParams) (api.SendR
 func (s *fakeSession) SendReaction(context.Context, api.SendReactionParams) error { return nil }
 func (s *fakeSession) MarkRead(context.Context, api.MarkReadParams) error         { return nil }
 func (s *fakeSession) SetTyping(context.Context, api.SetTypingParams) error       { return nil }
+
+func (s *fakeSession) SearchUsers(ctx context.Context, p api.SearchUsersParams) (api.SearchUsersResult, error) {
+	if s.f.searchUsers != nil {
+		return s.f.searchUsers(ctx, p)
+	}
+	return api.SearchUsersResult{}, nil
+}

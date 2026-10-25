@@ -2084,9 +2084,10 @@ precaution whose effect is unproven. None of it brings the risk to zero, and no 
   `whatsapp_personal_mark_read`. The reason is notification routing (marking a companion available may change when
   your phone buzzes), not a known ban trigger, and whether staying unavailable makes the Linked devices screen show the
   device as stale for the 30-day inactivity rule is **UNVERIFIED** (Part 10.3).
-- **No new chats, no bulk operations.** No operation creates a group or a broadcast, or edits or unsends a message.
-  Each sidecar sends only into a conversation it already holds: the WhatsApp sidecar into a chat that is in its
-  store, the Messenger sidecar into a thread that is in its thread list (Part 10.4).
+- **No bulk operations, first contact only on purpose.** No operation creates a group or a broadcast, or edits or
+  unsends a message. A text or file can start a conversation with one person: on WhatsApp with a phone number that
+  WhatsApp confirms as registered, on Messenger with a person the account can message (Part 10.4). Every other
+  write (reactions, read marks, typing, groups) needs a conversation the sidecar already holds.
 - **A human can approve each send, through your MCP client.** The personal send tools are marked as not read-only
   and their descriptions say they reach real people as you and to confirm intent first. meta-mcp has no approval
   step of its own: whether your client asks you depends on its settings.
@@ -2161,11 +2162,14 @@ The `meta-mcp` binary stays MIT. Not legal advice.
 5. **Install and start the daemon** as systemd user units:
 
    ```bash
-   meta-mcp personal install
+   mkdir -p ~/.local/share/meta-mcp/files
+   META_MCP_FILES_DIR=~/.local/share/meta-mcp/files meta-mcp personal install
    meta-mcp personal status
    ```
 
-   `install` refuses to run (and says which file it could not find) when a sidecar binary cannot be located, and when
+   Set `META_MCP_FILES_DIR` before installing when you want attachments: `install` copies it into the unit, and
+   without it the daemon reports `files dir not configured` and the media tools refuse. Running `install` again
+   with the variable set rewrites the units. `install` refuses to run (and says which file it could not find) when a sidecar binary cannot be located, and when
    `META_MCP_FILES_DIR` is set in your shell to a folder that does not exist (create it first: the service may only
    write where a folder already is). It creates the meta-mcp home and the inbox folder with mode 0700, because the
    sandboxed service can only write to folders that exist when it starts. It
@@ -2295,7 +2299,7 @@ The `meta-mcp` binary stays MIT. Not legal advice.
    claude mcp add --env META_MCP_FILES_DIR=/var/lib/meta-mcp/files --env META_MCP_READ_ONLY=true --transport stdio meta-mcp -- meta-mcp
    ```
 
-   Without `meta-mcp setup` the business tools simply report that no Page or number is configured; the 18 personal
+   Without `meta-mcp setup` the business tools simply report that no Page or number is configured; the 19 personal
    tools work. Their tool descriptions are in [TOOLS.md](TOOLS.md#personal-tools). (An HTTP server lists them only
    with `META_MCP_PERSONAL_HTTP=1`.)
 
@@ -2511,6 +2515,7 @@ re-link right after an unlink for a while (reported, **UNVERIFIED**). 10.5 says 
 | Check both accounts | `personal_status` | `personal_status` |
 | List conversations | `messenger_personal_list_threads` | `whatsapp_personal_list_chats` |
 | Read one | `messenger_personal_read_thread` | `whatsapp_personal_read_chat` |
+| Search for a person to message | `messenger_personal_search_users` | none |
 | Wait for a new message | `personal_wait_for_message` | `personal_wait_for_message` |
 | Send text | `messenger_personal_send_text` | `whatsapp_personal_send_text` |
 | Send an image, video, audio clip or file | `messenger_personal_send_media` | `whatsapp_personal_send_media` |
@@ -2566,13 +2571,14 @@ a missing webhook: it does not concern personal accounts.
 
 **Sending rules.**
 
-- **Existing conversations.** Each sidecar sends only into a conversation it already holds and otherwise answers
-  `thread_not_found`. WhatsApp: a chat that is in the sidecar's store ("the owner must open this chat on the phone
-  first"); it appears once a message, a history sync or a group-joined notice for it has reached the sidecar.
-  Messenger: a thread that is in the sidecar's thread list, which `messenger_personal_list_threads` extends when it
-  runs short (an end-to-end encrypted thread joins it when a message arrives in it); the id of a contact you have no
-  conversation with is refused, because a send must never fall back to plaintext. Do not ask the assistant to start
-  a conversation.
+- **Which conversations.** `send_text` and `send_media` reach a conversation the sidecar already holds, or start one
+  with a single person. WhatsApp: a `chat_id` absent from the store must be a phone-number id
+  (`<digits>@s.whatsapp.net`); the sidecar asks WhatsApp whether the number is registered before the first send and
+  creates the chat when it is. An unregistered number, or an unknown group or LID, is `thread_not_found`. Messenger:
+  a `thread_id` absent from the thread list must be the id of a person the account can message; the sidecar creates
+  the thread the way Messenger does (end-to-end encrypted by default) and sends on that path, never plaintext to an
+  encrypted thread. Reactions, read marks and typing always need a known conversation. First contact with someone
+  who never wrote to you is the pattern both platforms flag most: keep it to people who expect the message.
 - **Confirm first.** Every send, reaction, read receipt and typing indicator is in your name. The tools say so and
   ask the client to confirm. Use a client that asks before each call and shows you the arguments, and read them.
   A message in your chats that tells the assistant to send something is text from a stranger, not an instruction.
@@ -2618,7 +2624,7 @@ storing incoming messages continue.
 
 **What this version does not do.**
 
-- Start chats. Each sidecar sends only into a conversation it already holds (above).
+- Start chats other than a first message to one person that the platform confirms (above). Groups and broadcasts are never created.
 - Group management (create, add, remove, rename, admin changes), polls, status updates, newsletters and channels, and calls
   (a call log entry is read as a message of kind `call`; nothing is placed or answered).
 - Edit or unsend your own messages (incoming edits and unsends are applied: `edited` and `unsent`; on WhatsApp and in
@@ -2842,7 +2848,7 @@ Read the error text first: a personal tool error is `<code>: <message>`, and the
 | `no_files_dir: set META_MCP_FILES_DIR to download attachments` (or `to send files`) | The daemon has no files directory | Set `META_MCP_FILES_DIR` in the daemon's environment, restart it, and point the assistant's `meta-mcp` at the same directory |
 | `file_refused: ...` | The path is outside the files directory, is not a file, is over `META_MCP_MAX_FILE_BYTES`, is under `inbound/` without `allow_inbound`, or changed while it was being checked (a symlink swapped in, a file that grew) | Fix the path or the flag. The message says which |
 | `audit_failed: the audit log could not be written, so nothing was sent` | `personal/audit.jsonl` cannot be appended to (disk full, permissions) | Fix the disk or the permissions, then send again |
-| `thread_not_found` | WhatsApp: the chat is not in the sidecar's store. Messenger: a send, reaction, read mark or typing indicator needs a thread in the sidecar's thread list (a bare contact id is refused) | WhatsApp: open the chat on your phone and let a message or history arrive. Messenger: page through `messenger_personal_list_threads` (the `cursor` or a larger `limit`), or let a message arrive in an encrypted thread. Take ids from the list tools or from an event's `recipient` |
+| `thread_not_found` | WhatsApp: the chat is not in the sidecar's store. Messenger: a reaction, read mark or typing indicator needs a thread in the sidecar's thread list, and a send needs a thread in it or an id that is vetted as a person you can message (an id that is not one is refused) | WhatsApp: open the chat on your phone and let a message or history arrive. Messenger: page through `messenger_personal_list_threads` (the `cursor` or a larger `limit`), or let a message arrive in an encrypted thread; for a new chat take the id from `messenger_personal_search_users`. Take ids from the list tools or from an event's `recipient` |
 | `attachment_expired` | The platform refused the media even after a refresh | WhatsApp needs the phone online to re-upload expired media and does not ask after a fatal signal. Ask for the file to be sent again |
 | `too_many_requests`, `too_many_waiters` | More than 32 requests, 16 waits or 64 replies outstanding on one connection | Wait for earlier calls to finish |
 | `inbox_list` or `inbox_wait` shows no personal events | The call did not ask for them: personal rows are left out unless `platform` names `messenger_personal` or `whatsapp_personal`, or `include_personal` is true. Or the daemon and the assistant's `meta-mcp` use different inbox files, or the daemon is not connected | Pass `platform` or `include_personal`. Compare `META_MCP_INBOX_DB` in both (10.1, step 7) and check `meta-mcp personal status` |

@@ -1,7 +1,7 @@
 # Tool reference
 
-meta-mcp exposes 38 MCP tools: 20 for the business mode (the Meta Graph API: Facebook Page inboxes
-and WhatsApp Business numbers) and 18 for the personal mode (your own Messenger and WhatsApp
+meta-mcp exposes 39 MCP tools: 20 for the business mode (the Meta Graph API: Facebook Page inboxes
+and WhatsApp Business numbers) and 19 for the personal mode (your own Messenger and WhatsApp
 accounts, through unofficial clients). This page lists every tool with its parameters, result,
 expected errors and an example call. For how the pieces fit together see
 [ARCHITECTURE.md](ARCHITECTURE.md); for setting up Meta see [GUIDE.md](GUIDE.md), and for the personal
@@ -18,7 +18,7 @@ serves the 20 business tools). Over stdio they are always listed. `meta-mcp http
 - [Messenger tools](#messenger-tools)
 - [WhatsApp tools](#whatsapp-tools)
 - [Personal tools](#personal-tools): `personal_status`, the Messenger and WhatsApp list, read, send, react,
-  mark-read, typing and download tools, and `personal_wait_for_message`
+  mark-read, typing and download tools, `messenger_personal_search_users`, and `personal_wait_for_message`
 - [Read-only mode](#read-only-mode)
 
 ## Conventions
@@ -115,6 +115,7 @@ the error text ends with a note that the message may still have been delivered: 
 | `personal_status` | personal | Both personal accounts as the daemon sees them | kept |
 | `messenger_personal_list_threads` | personal | List your Messenger conversations | kept |
 | `messenger_personal_read_thread` | personal | Read messages of one Messenger conversation | kept |
+| `messenger_personal_search_users` | personal | Search for people your Messenger account can message, by name | kept |
 | `messenger_personal_send_text` | personal | Send a text message from your Messenger account | removed |
 | `messenger_personal_send_media` | personal | Send an image, video, audio clip or file from your Messenger account | removed |
 | `messenger_personal_react` | personal | React to a Messenger message, or remove your reaction (removal is not verified in encrypted threads) | removed |
@@ -974,7 +975,7 @@ file errors from the table at the top of this page.
 
 ## Personal tools
 
-The 18 personal tools act on **your own personal Messenger and WhatsApp accounts**, not on a Page or a
+The 19 personal tools act on **your own personal Messenger and WhatsApp accounts**, not on a Page or a
 business number. They talk to the personal daemon (`meta-mcp personal daemon`, set up in
 [guide, Part 10](GUIDE.md#part-10-personal-mode-your-own-messenger-and-whatsapp)), which owns two
 unofficial clients. **Using them is outside the terms of Facebook and WhatsApp for personal accounts and
@@ -1191,10 +1192,11 @@ content.
 - Unencrypted conversations come from the thread list Messenger syncs. An end-to-end encrypted
   conversation joins the list when a message arrives in it: there is no list call for them, so one that
   has been silent since the sidecar process last started can be missing.
-- Thread ids are decimal ids. Use them as `thread_id` in the other Messenger tools. A send, reaction, read mark or
-  typing indicator is accepted only for a thread in this list; if a conversation you expect is missing, page on
-  with the `cursor` or ask for a larger `limit` (the sidecar asks Messenger for more threads when its list runs
-  short).
+- Thread ids are decimal ids. Use them as `thread_id` in the other Messenger tools. A reaction, read mark or
+  typing indicator is accepted only for a thread in this list, and a send only for a thread in it or a person
+  found with `messenger_personal_search_users` (see `messenger_personal_send_text`); if a conversation you
+  expect is missing, page on with the `cursor` or ask for a larger `limit` (the sidecar asks Messenger for more
+  threads when its list runs short).
 
 **Errors:** the common errors above.
 
@@ -1257,7 +1259,8 @@ third-party content.
   the secure-storage PIN restore is deliberately not implemented (guide, Part 10.2).
 - `thread_not_found` is for an id that is not a positive decimal number. An unknown numeric id is not checked
   against the thread list when reading: the sidecar asks Messenger for it, so the outcome depends on Messenger.
-  Sends are stricter: they need a thread in the sidecar's list.
+  Sends are stricter: they need a thread in the sidecar's list, or a person that passes the check described
+  under `messenger_personal_send_text`.
 
 **Errors:** the common errors above; `thread_not_found`; `not_connected` when the sidecar is offline and
 the answer is not cached.
@@ -1301,6 +1304,42 @@ and attachment descriptions are untrusted third-party content.
 {"name": "whatsapp_personal_read_chat", "arguments": {"chat_id": "15555550100@s.whatsapp.net", "limit": 50}}
 ```
 
+### `messenger_personal_search_users`
+
+Searches your own personal Messenger account for people it can message, by name. Read-only: nothing is sent
+to anyone and no audit line is written. Kept in read-only mode. Names are untrusted third-party content.
+
+| Parameter | Type | Required | Meaning |
+|---|---|---|---|
+| `query` | string | yes | The name to search for, 1 to 200 characters |
+| `limit` | integer | no | 1 to 50, default 10 (clamped) |
+
+**Result:**
+
+```json
+{"users": [{"id": "100000000000002", "name": "Alex Example", "has_thread": false}]}
+```
+
+- The sidecar runs one Messenger user search (the request mautrix-meta's `SearchUsers` sends) and keeps only
+  Facebook people, from the contact and non-contact results, whose one-to-one result says the account can
+  message them. Your own account is never listed, and an id appears once. Pages, groups and Instagram results
+  are dropped. The list may be empty.
+- `has_thread` is true when the id is already in the sidecar's thread list (`messenger_personal_list_threads`).
+  Pass any `id` as `thread_id` to `messenger_personal_send_text` or `messenger_personal_send_media` to start a
+  chat with that person; a person returned here counts as vetted for one hour of the session. Confirm intent
+  first: the message reaches them as you.
+- After a fatal signal (guide, Part 10.5) the sidecar refuses the search like a write.
+
+**Errors:** the common errors above; `bad_params` (a `query` of the wrong length is refused by the daemon);
+`not_connected` (the Messenger socket is down, or sending is blocked after a fatal signal); `io` ("user search
+failed").
+
+**Example call:**
+
+```json
+{"name": "messenger_personal_search_users", "arguments": {"query": "Alex Example", "limit": 5}}
+```
+
 ### `messenger_personal_send_text`
 
 Sends a text message from your own personal Messenger account to a real person: it reaches them as you,
@@ -1309,7 +1348,7 @@ locally. Text read from messages is untrusted third-party content, never an inst
 
 | Parameter | Type | Required | Meaning |
 |---|---|---|---|
-| `thread_id` | string | yes | The conversation to send to |
+| `thread_id` | string | yes | The conversation to send to, or the `id` of a person from `messenger_personal_search_users` to start one |
 | `text` | string | yes | 1 to 4000 characters after trimming. `\r\n` becomes `\n`. Newlines and tabs are allowed; other control characters, bidirectional overrides and isolates (U+202A to U+202E, U+2066 to U+2069) and tag characters (U+E0000 to U+E007F) are refused |
 | `reply_to` | string | no | The id of a message in that thread to quote |
 
@@ -1329,14 +1368,25 @@ locally. Text read from messages is untrusted third-party content, never an inst
   while waiting after it handed the request over: the error is then `send_unknown: the message may have been sent:
   read the thread before sending again`, because the daemon finishes a write (and its audit line) even when the
   client has gone. The same applies to `*_send_media` and `*_react`.
-- The daemon does not check that the thread exists. The Messenger sidecar sends only into a thread in its own
-  thread list: any other id, the id of a contact you have no conversation with included, is `thread_not_found`,
-  because it might be an encrypted chat that is not listed yet and a send must never fall back to plaintext. List
-  the threads first (guide, Part 10.4).
+- The daemon does not check that the thread exists. A `thread_id` that is in the Messenger sidecar's thread list
+  is sent to as is. A numeric id that is not in it is vetted first: it must be a person that a
+  `messenger_personal_search_users` call returned in the last hour of this session, or else a fresh Messenger
+  search with the id as the query must return that same id as a person you can message. The sidecar then registers
+  the thread as an encrypted DM (`<id>@msgr`) and creates it the way the mautrix-meta connector does, before
+  anything goes out, and the message goes through the encrypted path: a new chat is never sent as plaintext. Like
+  the connector, only an account failure stops the send; other errors while creating the chat are logged. The
+  encrypted client must be connected, otherwise the answer is `not_connected` and nothing is created.
+- An id that is not a person you can message is `thread_not_found` ("thread not found; this id is not a person
+  you can message"), with nothing created or sent; an unknown group id gets that answer too. A non-numeric id, a
+  `reply_to` on a thread that is not in the list, and (for the other Messenger tools) a reaction, read mark or
+  typing indicator on one, are `thread_not_found` with no network call.
+- First contact with someone who has not messaged you is the pattern Meta's anti-spam watches most. The audit
+  and the confirm-intent-first rule are the same as for any other send.
 
 **Errors:** the common errors above; `read_only`; `shutting_down`; `sending_blocked`; `rate_limited`; `audit_failed`; `thread_not_found`; `send_failed` (Messenger
 rejected it); `send_unknown`; `not_connected`; `bad_params` for a `reply_to` that belongs to the
-other side (encrypted or not) or a text that fails the checks above.
+other side (encrypted or not) or a text that fails the checks above. `not_connected` also covers a new chat while the
+encrypted client is down. `thread_not_found` also covers an id that is not a messageable person.
 
 **Example call:**
 
@@ -1352,7 +1402,7 @@ audited locally.
 
 | Parameter | Type | Required | Meaning |
 |---|---|---|---|
-| `chat_id` | string | yes | The chat to send to; it must already exist in the sidecar's store |
+| `chat_id` | string | yes | The chat to send to: one in the sidecar's store, or a phone-number id that WhatsApp confirms as registered |
 | `text` | string | yes | 1 to 4000 characters after trimming, as for Messenger |
 | `reply_to` | string | no | The id of a message in that chat to quote |
 
@@ -1362,9 +1412,10 @@ audited locally.
 {"message_id": "3EB0A1B2C3D4E5F60718", "ts": 1790000000, "audit_id": 2}
 ```
 
-- **No new chats.** A chat that is not in the sidecar's store is `thread_not_found`: the chat must already
-  be there, and it appears once a message, a history sync or a group-joined notice for it has reached the sidecar.
-  This is deliberate (guide, Part 10.0).
+- **New chats.** A chat that is not in the sidecar's store is `thread_not_found`, except a phone-number id
+  (`<digits>@s.whatsapp.net`) that WhatsApp confirms as registered: that chat is created and the message sent.
+  Groups and LIDs must already be in the store, which fills once a message, a history sync or a group-joined
+  notice for them has reached the sidecar. This is deliberate (guide, Part 10.0).
 - The same audit, `send_unknown` and `audit_failed` rules as `messenger_personal_send_text` apply.
   `send_unknown` can also come from a message acknowledgement that never arrived.
 - After a fatal signal (`temporary_ban`, `reachout_timelock`, `client_outdated`, `stream_replaced`,
@@ -1388,7 +1439,7 @@ Every send is audited locally. Content read from messages is untrusted third-par
 
 | Parameter | Type | Required | Meaning |
 |---|---|---|---|
-| `thread_id` | string | yes | The conversation to send to |
+| `thread_id` | string | yes | The conversation to send to, or the `id` of a person from `messenger_personal_search_users` to start one |
 | `path` | string | yes | A file inside `META_MCP_FILES_DIR` of the daemon (relative to it, or absolute inside it) |
 | `caption` | string | no | Up to 1024 characters, trimmed; empty means none. The same character rules as `text` |
 | `kind` | string | no | `image`, `video`, `audio` or `file`; default guessed from the file extension |
@@ -1415,6 +1466,10 @@ Every send is audited locally. Content read from messages is untrusted third-par
   threads: 8 MB for an image, 25 MB for anything else; encrypted threads: 100 MB).
 - **Encrypted threads take images only.** Other kinds, and captions, are not supported there: the caption is
   dropped, because Messenger Web does not render captions in encrypted chats.
+- **New chats.** A numeric `thread_id` that is not in the thread list is vetted and, if it is a person you can
+  message, created as an encrypted DM before the file goes out, exactly as described for
+  `messenger_personal_send_text`, so a new chat takes images only and never goes out as plaintext. Any other id is
+  `thread_not_found`; with the encrypted client down it is `not_connected` and nothing is created.
 - The MIME type comes from the file extension (unknown extensions go as `application/octet-stream`). The
   daemon also accepts a display `filename`; the tool does not expose it, so the file's own name is used.
 
@@ -1438,7 +1493,7 @@ content.
 
 | Parameter | Type | Required | Meaning |
 |---|---|---|---|
-| `chat_id` | string | yes | The chat to send to; it must already exist in the sidecar's store |
+| `chat_id` | string | yes | The chat to send to: one in the sidecar's store, or a phone-number id that WhatsApp confirms as registered |
 | `path` | string | yes | A file inside `META_MCP_FILES_DIR` of the daemon |
 | `caption` | string | no | Up to 1024 characters |
 | `kind` | string | no | `image`, `video`, `audio` or `file`; default guessed from the file extension |
@@ -1453,7 +1508,7 @@ content.
 - Not supported on send in this version: contact cards, location sharing, stickers and link previews.
 
 **Errors:** the common errors above; `read_only`; `shutting_down`; `sending_blocked`; `rate_limited`; `no_files_dir`; `file_refused`;
-`audit_failed`; `thread_not_found` (a chat that is not in the store); `bad_params`; `send_failed`; `send_unknown`;
+`audit_failed`; `thread_not_found` (a chat that is not in the store and not a registered phone number); `bad_params`; `send_failed`; `send_unknown`;
 `not_connected`.
 
 **Example call:**
@@ -1782,6 +1837,7 @@ resulting list.
 | `personal_status` | available |
 | `messenger_personal_list_threads` | available |
 | `messenger_personal_read_thread` | available |
+| `messenger_personal_search_users` | available |
 | `messenger_personal_send_text` | **removed** |
 | `messenger_personal_send_media` | **removed** |
 | `messenger_personal_react` | **removed** |
@@ -1798,7 +1854,7 @@ resulting list.
 | `whatsapp_personal_download_media` | available (writes only inside the files directory) |
 | `personal_wait_for_message` | available |
 
-Seventeen tools remain and 21 are removed: 11 business tools and the 10 personal tools that send, react,
+Eighteen tools remain and 21 are removed: 11 business tools and the 10 personal tools that send, react,
 mark read or show typing. Read-only mode does not hide data: the read tools still return conversations
 and inbox events. The four download tools (`messenger_download_attachment`, `whatsapp_download_media`,
 `messenger_personal_download_attachment`, `whatsapp_personal_download_media`) only write inside the files

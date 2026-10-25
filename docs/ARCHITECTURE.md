@@ -6,7 +6,7 @@ share the same configuration, Graph client and local inbox.
 
 A second mode, the **personal mode**, reaches your own Messenger and WhatsApp accounts, which the Graph
 API cannot. It adds a long-lived daemon (`meta-mcp personal daemon`), two Go sidecar programs that the
-daemon owns, a command group (`meta-mcp personal ...`) and 18 more tools on the same MCP server (served over
+daemon owns, a command group (`meta-mcp personal ...`) and 19 more tools on the same MCP server (served over
 stdio; `meta-mcp http` leaves them out unless `META_MCP_PERSONAL_HTTP=1`). Personal mode is compiled on Unix systems
 only (`#[cfg(unix)]`); elsewhere the server has the 20 business tools. It is described in
 [Personal mode](#personal-mode). The rest of this page, up to that section, is about the business mode.
@@ -80,7 +80,7 @@ Two facts shape everything else:
 | `src/mcp/mod.rs` | `MetaMcp` handler, core tools, router composition, result helpers |
 | `src/mcp/messenger_tools.rs` | Messenger tool definitions (schemas, descriptions, annotations) |
 | `src/mcp/whatsapp_tools.rs` | WhatsApp tool definitions |
-| `src/mcp/personal_tools.rs` | The 18 personal tool definitions (Unix only), and the lazily connected socket client they share |
+| `src/mcp/personal_tools.rs` | The 19 personal tool definitions (Unix only), and the lazily connected socket client they share |
 | `src/messenger/` | Messenger operations: conversations, messages, sends, attachments, profile |
 | `src/whatsapp/` | WhatsApp operations: sends, media, templates, window warning |
 | `src/setup/` | The wizard, the doctor and the token commands (OAuth, discovery, subscription, prompts, report) |
@@ -294,7 +294,7 @@ CREATE INDEX IF NOT EXISTS idx_events_processed_received ON events (processed, r
 ## MCP layer and transports
 
 - **Handler.** `MetaMcp` holds the configuration, the Graph client, the inbox and a tool
-  router. The router is the sum of the core, Messenger, WhatsApp and personal routers (38 tools on Unix over stdio).
+  router. The router is the sum of the core, Messenger, WhatsApp and personal routers (39 tools on Unix over stdio).
   The personal router is added for stdio, and for `meta-mcp http` only when `META_MCP_PERSONAL_HTTP=1`; without
   personal mode compiled in (non-Unix) it is absent, leaving 20 tools. In read-only mode the write tools (11
   business, 10 personal) are removed from the router, so they are neither listed nor callable.
@@ -379,7 +379,7 @@ flowchart LR
 
 | Process | Started by | Lives | Role |
 |---|---|---|---|
-| `meta-mcp` (stdio, or `meta-mcp http`) | The MCP client, or the owner for HTTP | One assistant session, or until stopped | Serves the 18 personal tools over stdio. `meta-mcp http` registers them only with `META_MCP_PERSONAL_HTTP=1`; then, with a daemon under the same user, every holder of one of its API keys reaches your accounts (see SECURITY.md). Holds one lazily connected socket client, shared by all calls, that reconnects when the daemon was restarted and refuses a daemon that runs as another uid. Keeps no personal state |
+| `meta-mcp` (stdio, or `meta-mcp http`) | The MCP client, or the owner for HTTP | One assistant session, or until stopped | Serves the 19 personal tools over stdio. `meta-mcp http` registers them only with `META_MCP_PERSONAL_HTTP=1`; then, with a daemon under the same user, every holder of one of its API keys reaches your accounts (see SECURITY.md). Holds one lazily connected socket client, shared by all calls, that reconnects when the daemon was restarted and refuses a daemon that runs as another uid. Keeps no personal state |
 | `meta-mcp personal login`, `status`, `logout`, `restart` | The owner | One command | Short-lived socket clients. The login commands also subscribe to events (QR codes, passkey requests) |
 | `meta-mcp personal daemon` | systemd (`personal install`) or the owner | Until SIGTERM or SIGINT | Owns the socket, the sidecars, the session state, the audit log and the writes into the inbox. One per `META_MCP_HOME`: it takes an exclusive lock on `personal/daemon.lock`, so a second daemon on the same home exits with `another personal daemon already uses ...`, even on another socket |
 | `meta-messenger-sidecar`, `meta-whatsapp-sidecar` | The daemon | Until the daemon stops or replaces it (`restart`, a reconnect, shutdown, or a heartbeat kill after two missed pings); a `logout` stops it too | One process per account and one connection set. No network listener. Started at daemon start for a platform that has a stored session, otherwise at its first `login_start` |
@@ -916,7 +916,7 @@ sequenceDiagram
 | The assistant to your contacts (personal) | Sends, reactions, read receipts and typing, as you | Confirm-intent wording and tool annotations, read-only in two layers, the write-ahead audit log |
 | The MCP server or a command to the daemon | JSON lines on a Unix socket | Socket mode 0600 (a folder that the daemon, or a socket unit written by `personal install`, creates is 0700), same-uid peer check in both directions (the client refuses a daemon of another uid), connection, request and outstanding-reply caps, a byte-capped event ring, 16 MiB line limit, a sandboxed service unit, paced writes |
 | The daemon to a sidecar | JSON lines on pipes | Empty environment but `HOME`, line limit, a malformed line kills the sidecar, error codes reduced to plain words, `state_updated` and `ready` never forwarded |
-| A sidecar to Messenger or WhatsApp | An unofficial client speaking the platform's own protocol | Pinned libraries, scrubbed logs, one connection set per account, presence unavailable on WhatsApp, each sidecar sends only into a conversation it already holds. The account itself is at risk: outside the platforms' terms |
+| A sidecar to Messenger or WhatsApp | An unofficial client speaking the platform's own protocol | Pinned libraries, scrubbed logs, one connection set per account, presence unavailable on WhatsApp, a sidecar starts a chat only for a first send to one person the platform confirms (a registered WhatsApp number, a Messenger person found by user search), and reactions, read marks and typing need an existing conversation. The account itself is at risk: outside the platforms' terms |
 | The daemon to the local disk (personal) | Session state, databases, audit log, downloads | 0600 files in 0700 folders, atomic writes, downloads confined to the files directory, files directory may not contain the home |
 
 ## Threat model summary

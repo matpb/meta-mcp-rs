@@ -819,6 +819,64 @@ async fn reactions_reads_and_typing_are_proxied() {
 }
 
 #[tokio::test]
+async fn search_users_is_proxied_for_messenger_and_refused_for_whatsapp() {
+    let env = TestEnv::new();
+    let (_daemon, client) = env.start_logged_in("messenger").await;
+    let found = ok(
+        &client,
+        "search_users",
+        json!({"platform": "messenger", "query": "Ali", "limit": 5}),
+    )
+    .await;
+    assert_eq!(found["users"][0]["id"], "100001", "{found}");
+    assert_eq!(
+        env.last_request("messenger", "search_users").expect("req")["params"],
+        json!({"query": "Ali", "limit": 5})
+    );
+    for params in [
+        json!({"platform": "messenger"}),
+        json!({"platform": "messenger", "query": ""}),
+        json!({"platform": "messenger", "query": "a".repeat(201)}),
+        json!({"platform": "messenger", "query": "Ali", "limit": 0}),
+        json!({"platform": "messenger", "query": "Ali", "limit": 51}),
+        json!({"platform": "messenger", "query": "Ali", "limit": "5"}),
+        json!({"platform": "whatsapp", "query": "Ali"}),
+    ] {
+        assert_eq!(
+            err(&client, "search_users", params).await.code,
+            "bad_params"
+        );
+    }
+    assert_eq!(env.request_count("messenger", "search_users"), 1);
+    assert_eq!(env.request_count("whatsapp", "search_users"), 0);
+}
+
+#[tokio::test]
+async fn search_users_tool_proxies_through_daemon() {
+    let env = TestEnv::new();
+    let (_daemon, _client) = env.start_logged_in("messenger").await;
+    let socket = env.socket();
+    let out = common::blocking(move || {
+        let home = common::TempHome::new();
+        let mut s = common::Session::start(
+            &home,
+            OFFLINE,
+            &[(
+                "META_MCP_PERSONAL_SOCKET",
+                socket.to_str().expect("utf8 socket path"),
+            )],
+        );
+        common::tool_json(&s.call_tool("messenger_personal_search_users", json!({"query": "Ali"})))
+    })
+    .await;
+    assert_eq!(out["users"][0]["name"], "Alice", "{out}");
+    assert_eq!(
+        env.last_request("messenger", "search_users").expect("req")["params"],
+        json!({"query": "Ali", "limit": 10})
+    );
+}
+
+#[tokio::test]
 async fn send_refused_in_read_only_daemon_client() {
     let env = TestEnv::new();
     env.preseed_session("messenger");
@@ -1675,12 +1733,13 @@ async fn a_failed_completion_line_still_replies_with_a_warning() {
 
 const OFFLINE: &str = "http://127.0.0.1:9";
 
-const PERSONAL_TOOLS: [&str; 18] = [
+const PERSONAL_TOOLS: [&str; 19] = [
     "messenger_personal_download_attachment",
     "messenger_personal_list_threads",
     "messenger_personal_mark_read",
     "messenger_personal_react",
     "messenger_personal_read_thread",
+    "messenger_personal_search_users",
     "messenger_personal_send_media",
     "messenger_personal_send_text",
     "messenger_personal_typing",
@@ -1732,6 +1791,18 @@ fn mcp_tools_list_includes_personal_tools() {
         assert!(props.contains_key(field), "{field} in {props:?}");
     }
     assert_eq!(read["inputSchema"]["required"], json!(["chat_id"]));
+    let search = tools
+        .iter()
+        .find(|t| t["name"] == "messenger_personal_search_users")
+        .expect("search users tool");
+    let props = search["inputSchema"]["properties"]
+        .as_object()
+        .expect("props");
+    for field in ["query", "limit"] {
+        assert!(props.contains_key(field), "{field} in {props:?}");
+    }
+    assert_eq!(search["inputSchema"]["required"], json!(["query"]));
+    assert_eq!(search["annotations"]["readOnlyHint"], json!(true));
 }
 
 #[test]
@@ -1988,7 +2059,7 @@ fn personal_write_tools_hidden_in_read_only() {
         .copied()
         .filter(|t| names.iter().any(|n| n == t))
         .collect();
-    assert_eq!(left.len(), 8, "{left:?}");
+    assert_eq!(left.len(), 9, "{left:?}");
     for tool in PERSONAL_TOOLS {
         let writes = ["send_text", "send_media", "react", "mark_read", "typing"];
         let is_write = writes.iter().any(|w| tool.ends_with(w));

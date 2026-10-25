@@ -48,6 +48,9 @@ type session struct {
 	procMu sync.Mutex
 	sends  sendWaiter
 
+	openMu sync.Mutex
+	people vettedPeople
+
 	collMu     sync.Mutex
 	collectors map[string]*collector
 

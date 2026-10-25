@@ -237,7 +237,11 @@ func (s *session) SendText(ctx context.Context, p api.SendTextParams) (api.SendR
 	if err := validText(p.Text); err != nil {
 		return api.SendResult{}, err
 	}
-	t, err := s.resolveThread(p.ThreadID)
+	resolve := s.resolveSendTarget
+	if p.ReplyTo != "" {
+		resolve = func(_ context.Context, id string) (threadTarget, error) { return s.resolveThread(id) }
+	}
+	t, err := resolve(ctx, p.ThreadID)
 	if err != nil {
 		return api.SendResult{}, err
 	}

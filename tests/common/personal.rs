@@ -107,6 +107,8 @@ while read -r line; do
     *'"op":"list_threads"'*)
       [ -e "$ROOT/$PLAT.list_slow" ] && sleep 3
       ok '{"threads":[{"id":"t1","kind":"dm","name":"Alice","participants":[],"last_message_ts":1700000000,"last_message_preview":null,"unread":false,"encrypted":false}],"cursor":null}';;
+    *'"op":"search_users"'*)
+      ok '{"users":[{"id":"100001","name":"Alice","has_thread":true}]}';;
     *'"op":"fetch_messages"'*)
       ok '{"messages":[{"id":"m1","thread_id":"t1","ts":1700000000,"sender":{"id":"u2","name":"Alice","is_me":false},"text":"hello","attachments":[],"reply_to":null,"reactions":[],"edited":false,"unsent":false,"encrypted":false,"kind":"text"}],"has_more":false}';;
     *'"op":"send_text"'*)

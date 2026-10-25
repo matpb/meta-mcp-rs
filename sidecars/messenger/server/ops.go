@@ -22,6 +22,7 @@ const (
 	maxFilename  = 255
 	maxMime      = 255
 	defaultLimit = 50
+	maxQuery     = 200
 )
 
 // asyncHandler returns the handler for a session-bound op, or nil for an unknown op.
@@ -52,6 +53,8 @@ func (s *server) asyncHandler(op string) handler {
 		return s.markRead
 	case "set_typing":
 		return s.setTyping
+	case "search_users":
+		return s.searchUsers
 	}
 	return nil
 }
@@ -310,6 +313,35 @@ func (s *server) setTyping(ctx context.Context, req ipc.Request) ipc.Reply {
 		return failErr(req.ID, err)
 	}
 	return ok(req.ID, struct{}{})
+}
+
+func (s *server) searchUsers(ctx context.Context, req ipc.Request) ipc.Reply {
+	var p struct {
+		Query string `json:"query"`
+		Limit *int   `json:"limit"`
+	}
+	if !decodeParams(req.Params, &p) {
+		return badParam(req.ID, "params")
+	}
+	limit, good := rangeLimit(p.Limit, 10, 50)
+	switch {
+	case !textOK(p.Query, 1, maxQuery):
+		return badParam(req.ID, "query")
+	case !good:
+		return badParam(req.ID, "limit")
+	}
+	sess := s.session()
+	if sess == nil {
+		return noSession(req.ID)
+	}
+	res, err := sess.SearchUsers(ctx, api.SearchUsersParams{Query: p.Query, Limit: limit})
+	if err != nil {
+		return failErr(req.ID, err)
+	}
+	if res.Users == nil {
+		res.Users = []api.Person{}
+	}
+	return ok(req.ID, res)
 }
 
 // rangeLimit applies the default for an absent limit and checks 1..max.

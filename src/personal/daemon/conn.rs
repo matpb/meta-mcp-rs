@@ -345,6 +345,7 @@ mod tests {
             "subscribe",
             "wait_for_message",
             "list_threads",
+            "search_users",
             "fetch_messages",
             "download_attachment",
             "mark_read",

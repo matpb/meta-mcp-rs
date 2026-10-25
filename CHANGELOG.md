@@ -77,10 +77,11 @@ download, file and send paths, and the setup wizard as built.
 
 ### Changed
 
+- Messenger personal `send_text` and `send_media` accept a numeric id that is not in the thread list when Facebook's user search returns it as a person the account can message (a person from a `messenger_personal_search_users` call in the last hour, otherwise a fresh search with the id as the query). The sidecar registers the thread as an encrypted DM and creates it the way mautrix-meta's `ResolveIdentifier` does before anything goes out, so a new chat is never sent as plaintext; the encrypted client must be connected (`not_connected` otherwise, nothing created). Any other id is `thread_not_found` ("this id is not a person you can message"), and non-numeric ids, groups, `reply_to` on an unknown thread, and reactions, read marks and typing on unknown threads stay `thread_not_found` with no network call.
 - WhatsApp personal `send_text` and `send_media` accept any phone-number id that WhatsApp confirms as registered (the chat is created on first use; the owner's own number skips the check). Unregistered numbers, unknown groups and LIDs, and reactions, read marks and typing on unknown chats stay `thread_not_found`.
 - `inbox_list` and `inbox_wait` accept `messenger_personal` and `whatsapp_personal` as `platform`, and the
   unknown-platform error names them. Read-only mode now removes 21 tools instead of 11 (the 10 personal write tools
-  join the 11 business ones) and keeps 17.
+  join the 11 business ones) and keeps 18.
 - Personal mode is compiled on Unix only (`#[cfg(unix)]`). On another system the crate is meant to build without it
   (not tried on Windows): the server has the 20 business tools and `meta-mcp personal` prints `personal mode needs a
   Unix system`. Only Linux was exercised. The daemon reads its own user id from a socket pair, no longer from `/proc`.
@@ -143,13 +144,13 @@ download, file and send paths, and the setup wizard as built.
   cookie login, and an embedded `whatsmeow` client for end-to-end encrypted chats (new messages only; the secure-history
   PIN restore is deliberately not implemented). The WhatsApp sidecar, `meta-whatsapp-sidecar` (`sidecars/whatsapp`):
   `whatsmeow` as a linked device with its own message store, QR and pair-code linking, the optional full-history request,
-  the passkey step, and no new chats (each sidecar sends only into a conversation it already holds). Both speak version 1 of one JSON-lines sidecar protocol. Licences: mautrix-meta is
+  the passkey step, and new chats only for a first send to one person the platform confirms (reactions, read marks and typing need an existing conversation). Both speak version 1 of one JSON-lines sidecar protocol. Licences: mautrix-meta is
   AGPL-3.0 (so the combined Messenger sidecar binary is AGPL-3.0), `whatsmeow` is MPL-2.0, and both sidecars link
   `go.mau.fi/libsignal` (GPL-3.0).
 - The `meta-mcp personal` command group: `daemon [--socket PATH]`, `login messenger [--cookies-file PATH]`, `login whatsapp [--pair-code PHONE] [--full-history] [--device-name NAME]`, `status [--json]`,
   `logout PLATFORM`, `restart PLATFORM`, `install [--dry-run]` and `uninstall [--dry-run]`. `install` writes the
   systemd user units `meta-mcp-personal.socket` and `meta-mcp-personal.service`.
-- Eighteen MCP tools, 38 in all: `personal_status`, `personal_wait_for_message`, and for each platform the list tool
+- Nineteen MCP tools, 39 in all: `personal_status`, `personal_wait_for_message`, `messenger_personal_search_users`, and for each platform the list tool
   (`messenger_personal_list_threads`, `whatsapp_personal_list_chats`), the read tool (`messenger_personal_read_thread`,
   `whatsapp_personal_read_chat`), `*_personal_send_text`, `*_personal_send_media`, `*_personal_react`,
   `*_personal_mark_read`, `*_personal_typing`, and the download tool (`messenger_personal_download_attachment`,
@@ -164,6 +165,7 @@ download, file and send paths, and the setup wizard as built.
   `META_MCP_PERSONAL_HTTP`, `META_MCP_PERSONAL_SEND_INTERVAL_MS`, `META_MCP_PERSONAL_SEND_BURST`,
   `META_MCP_PERSONAL_STABLE_MS`, `META_MCP_PERSONAL_PING_MS` and `META_MCP_PERSONAL_PING_TIMEOUT_MS`.
 - `include_personal` on `inbox_list` and `inbox_wait`.
+- `messenger_personal_search_users` (read-only, kept in read-only mode) and the Messenger sidecar op `search_users`: they search the Messenger account for people it can message, by name, and return `{"users":[{"id","name","has_thread"}]}` (`query` 1 to 200 characters, `limit` 1 to 50, default 10). One `SearchUserTask`, the request mautrix-meta's `SearchUsers` sends; only Facebook people the account can message, never the account itself. An id from the result is a valid `thread_id` for `messenger_personal_send_text` and `messenger_personal_send_media`.
 - `scripts/build-all.sh`: builds `meta-mcp` and both sidecars into `dist/`.
 - Documentation: the guide's Part 10 (install, Messenger and WhatsApp login, use, operations, troubleshooting), the personal
   tools in `docs/TOOLS.md`, the personal mode and its sequence diagrams in `docs/ARCHITECTURE.md`, a Personal mode section

@@ -273,7 +273,7 @@ be called): `inbox_mark_processed`, `messenger_send_text`, `messenger_send_attac
 `messenger_personal_send_text`, `whatsapp_personal_send_text`, `messenger_personal_send_media`,
 `whatsapp_personal_send_media`, `messenger_personal_react`, `whatsapp_personal_react`,
 `messenger_personal_mark_read`, `whatsapp_personal_mark_read`, `messenger_personal_typing` and
-`whatsapp_personal_typing` (21 tools in all; 17 remain). It does not hide data: the read tools still
+`whatsapp_personal_typing` (21 tools in all; 18 remain). It does not hide data: the read tools still
 return conversations and inbox events, and the download tools remain because they only
 write inside the files directory. In read-only mode the two business download tools refuse `overwrite=true`, so they
 can only create new files, and the personal download tools always save under a name that ends in a random suffix.
@@ -326,8 +326,9 @@ precaution whose effect is unproven. None of it brings the risk to zero, and no 
   The reason is notification routing (marking a companion available may change when your phone buzzes), not a known
   ban trigger, and whether staying unavailable makes the Linked devices screen show the device as stale for
   WhatsApp's 30-day inactivity rule is **UNVERIFIED**.
-- **No new chats, no bulk operations.** No operation creates a group or a broadcast, or edits or unsends a message,
-  and each sidecar sends only into a conversation it already holds (next section). Nothing stops a client from
+- **New chats only by a first send, no bulk operations.** No operation creates a group or a broadcast, or edits or
+  unsends a message. A sidecar opens a new chat only for a send to one person the platform confirms, and reactions,
+  read marks and typing need an existing conversation (next section). Nothing stops a client from
   calling a send tool many times, which is why approval and read-only mode matter.
 - **A human can approve each send, if your client is set to ask.** The personal send tools are annotated as not read-only and
   open-world, and their descriptions say they reach real people as you and to confirm intent first. meta-mcp has no
@@ -347,7 +348,7 @@ precaution whose effect is unproven. None of it brings the risk to zero, and no 
   sidecar that misses two pings in a row (one every 30 seconds) is killed and restarted with the same backoff.
 - **Read-only mode**, in two layers (below).
 
-### The no-new-chats rule
+### The new-chat rule
 
 The rule is enforced by the sidecars, not by the daemon, which checks only the shape of an id.
 
@@ -357,10 +358,17 @@ The rule is enforced by the sidecars, not by the daemon, which checks only the s
   marks and typing are `thread_not_found`. First contact with a number that has not messaged you is the pattern
   WhatsApp flags most, so the tool descriptions still ask for a confirmation before every send. WhatsApp's own pages list "you can't start chats or calls
   with new contacts" among the restrictions and name contacts who "have contacted you first" as the best practice.
-- **Messenger** sends, reacts, marks read and shows typing only in a thread that is in the sidecar's thread list. Any
-  other id, the id of a contact you have no conversation with included, is `thread_not_found`: it might be an
-  encrypted chat that is not listed yet, and a send must never fall back to plaintext. Reading is looser: for an
-  unlisted numeric id the sidecar still asks Messenger for the messages, and the answer depends on Messenger.
+- **Messenger** `send_text` and `send_media` accept a thread from the sidecar's thread list or a numeric id that
+  Facebook's user search returns as a person the account can message (the sidecar uses a person from a
+  `messenger_personal_search_users` call in the last hour, otherwise it searches with the id as the query before
+  every first send). It then registers and creates an encrypted DM before anything goes out and sends through the
+  encrypted path, so a new chat is never sent as plaintext; with the encrypted client down the answer is
+  `not_connected` and nothing is created. An id that is not a messageable person, a non-numeric id, a group, a
+  `reply_to` on an unknown thread, and any unknown thread for reactions, read marks and typing are
+  `thread_not_found`. First contact with someone who has not messaged you is the pattern Meta's anti-spam watches
+  most, so the tool descriptions still ask for a confirmation before every send and every send is still audited.
+  The id check relies on Facebook's search answer. Reading is looser: for an unlisted numeric id the sidecar still
+  asks Messenger for the messages, and the answer depends on Messenger.
 
 ### Read-only mode in personal mode
 

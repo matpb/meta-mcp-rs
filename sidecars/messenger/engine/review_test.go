@@ -158,7 +158,7 @@ func TestReviewUnknownThreadFallsBackToPlaintext(t *testing.T) {
 	s.processTable(&table.LSTable{LSDeleteThenInsertContact: []*table.LSDeleteThenInsertContact{{Id: 333, Name: "Bob"}}}, modeInitial)
 	fc.mu.Lock()
 	fc.connected = true
-	fc.exec = replyWith("mid.$x")
+	fc.exec = func(context.Context, ...socket.Task) (*table.LSTable, error) { return &table.LSTable{}, nil }
 	fc.mu.Unlock()
 	for _, id := range []string{"333", "+333", "0333"} {
 		if _, err := s.resolveThread(id); err == nil || api.AsError(err).Code != api.CodeThreadNotFound {
@@ -167,10 +167,7 @@ func TestReviewUnknownThreadFallsBackToPlaintext(t *testing.T) {
 		_, err := s.SendText(t.Context(), api.SendTextParams{ThreadID: id, Text: "secret that was meant for the E2EE chat"})
 		wantCode(t, err, api.CodeThreadNotFound)
 	}
-	fc.mu.Lock()
-	n := len(fc.tasks)
-	fc.mu.Unlock()
-	if n > 0 {
+	if n := countTasks[*socket.SendMessageTask](fc); n > 0 {
 		t.Errorf("SendText went through the plaintext SendMessageTask (%d tasks) for an id the registry does not know", n)
 	}
 }

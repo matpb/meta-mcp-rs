@@ -20,6 +20,7 @@ use crate::personal::protocol::{
 use crate::personal::{PersonalPlatform, validate};
 
 const LIST_TIMEOUT: Duration = Duration::from_secs(60);
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(90);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 const WAIT_MAX_MS: u64 = 300_000;
@@ -119,6 +120,7 @@ impl Daemon {
             | "logout"
             | "restart"
             | "list_threads"
+            | "search_users"
             | "fetch_messages"
             | "download_attachment"
             | "send_text"
@@ -136,6 +138,18 @@ impl Daemon {
             "logout" => self.logout(&rt).await,
             "restart" => self.restart_platform(&rt).await,
             "list_threads" => Self::proxy_read(&rt, "list_threads", p, LIST_TIMEOUT).await,
+            "search_users" => {
+                if rt.platform != PersonalPlatform::Messenger {
+                    return Err(OpError::bad_params(
+                        "search_users is only available for messenger",
+                    ));
+                }
+                str_param(&p, "query")
+                    .and_then(validate::search_query)
+                    .and_then(|()| validate::search_limit(p.get("limit")))
+                    .map_err(OpError::bad_params)?;
+                Self::proxy_read(&rt, "search_users", p, SEARCH_TIMEOUT).await
+            }
             "fetch_messages" => {
                 str_param(&p, "thread_id")
                     .and_then(validate::thread_id)

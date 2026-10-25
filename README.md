@@ -79,15 +79,16 @@ assistant reads goes wherever the assistant runs.
 > and that the account "might also be temporarily or permanently banned", that the wording reaches back ("now or in
 > the past"), and that a banned account cannot reach its chat history or backups while the ban lasts. Facebook's
 > terms forbid automated access, and users of the Messenger library report checkpoints and "suspect automated
-> behaviour" locks. The design offers no way to start a new chat, create a group or send a broadcast (the kind of
-> behaviour WhatsApp's own pages warn about), keeps one connection set per account, and adds a read-only mode and an
+> behaviour" locks. The design offers no way to create a group or send a broadcast (the kind of
+> behaviour WhatsApp's own pages warn about), opens a new chat only for a send to one person that the platform confirms
+> (first contact is the pattern both platforms flag most), keeps one connection set per account, and adds a read-only mode and an
 > audit log of sends, but **the risk is not zero** and no source shows how much any of that helps.
 > The account at risk is your phone number or your Facebook identity: use one you can afford to lose. Details:
 > [SECURITY.md](SECURITY.md#unofficial-clients-the-risk-to-the-account) and the
 > [guide, Part 10.0](docs/GUIDE.md#100-what-this-is-and-is-not).
 
 - **What the assistant can do.** List and read conversations, wait for the next incoming message, send text and
-  files, react, mark read, show typing, and save attachments. 18 tools in all
+  files, react, mark read, show typing, search Messenger for people to message, and save attachments. 19 tools in all
   ([docs/TOOLS.md](docs/TOOLS.md#personal-tools)); the messages also land in the local inbox as the platforms
   `messenger_personal` and `whatsapp_personal`.
 - **What it needs.** Rust 1.89 or newer, Go 1.26 or newer, and a Unix system. Personal mode is compiled on Unix only
@@ -95,8 +96,10 @@ assistant reads goes wherever the assistant runs.
   `personal mode needs a Unix system`. Only Linux was exercised: `meta-mcp personal install` writes systemd user
   units, and socket activation is Linux only. Without systemd, run `meta-mcp personal daemon` under your own
   supervisor.
-- **What it does not do.** Start new chats (each sidecar sends only into a conversation it already holds), manage
-  groups, or send polls. Encrypted Messenger history from before the device was registered is not available.
+- **What it does not do.** Create groups, send to groups it has not seen, broadcast, edit or unsend, or send polls.
+  A first message to a WhatsApp number works once WhatsApp confirms the number is registered (see
+  [SECURITY.md](SECURITY.md#unofficial-clients-the-risk-to-the-account): first contact is the pattern WhatsApp flags
+  most). Encrypted Messenger history from before the device was registered is not available.
 - **Pacing.** The daemon paces writes per platform with a token bucket: new messages one per 2 seconds with a burst
   of 3, reactions, read marks and typing one per second with a burst of 5. A call without a token is refused with
   `rate_limited` and a `retry_after_ms` value. It is a courtesy limiter, not a promise about what the platforms
@@ -109,12 +112,16 @@ From the repository root:
 ```bash
 scripts/build-all.sh                       # meta-mcp and both sidecars, into dist/
 install -m 0755 dist/meta-mcp dist/meta-messenger-sidecar dist/meta-whatsapp-sidecar ~/.local/bin/
-meta-mcp personal install                  # the daemon and its socket, as systemd user units
+mkdir -p ~/.local/share/meta-mcp/files     # where attachments are saved and sent from (optional)
+META_MCP_FILES_DIR=~/.local/share/meta-mcp/files meta-mcp personal install   # daemon + socket as systemd user units
 meta-mcp personal login whatsapp           # QR code in the terminal (or --pair-code YOUR_NUMBER)
 meta-mcp personal login messenger --cookies-file cookies.json
 meta-mcp personal status
-claude mcp add meta-mcp -- meta-mcp
+claude mcp add meta-mcp --env META_MCP_FILES_DIR=$HOME/.local/share/meta-mcp/files -- meta-mcp
 ```
+
+`personal install` copies `META_MCP_FILES_DIR` into the unit, so set it before installing (or run `install` again
+with it); the MCP server needs the same value to read and send files.
 
 The cookies, the QR flow, the passkey step some WhatsApp accounts need, operations and troubleshooting are in the
 [guide, Part 10](docs/GUIDE.md#part-10-personal-mode-your-own-messenger-and-whatsapp). Session files live in
@@ -179,7 +186,7 @@ systemd or your process manager. Personal mode needs none of these routes: it ha
 
 ## Tools
 
-38 tools: 20 for business mode and 18 for personal mode. Full parameters, results and examples are in
+39 tools: 20 for business mode and 19 for personal mode. Full parameters, results and examples are in
 [docs/TOOLS.md](docs/TOOLS.md). "Read-only mode" says whether the tool stays available when
 `META_MCP_READ_ONLY=true`. The personal tools exist on Unix systems and are served over stdio; `meta-mcp http`
 lists only the 20 business tools unless `META_MCP_PERSONAL_HTTP=1` is set.
@@ -209,6 +216,7 @@ lists only the 20 business tools unless `META_MCP_PERSONAL_HTTP=1` is set.
 | `personal_status` | Shows both personal accounts: login, connection, sending state, versions | kept |
 | `messenger_personal_list_threads` | Lists your own Messenger conversations | kept |
 | `messenger_personal_read_thread` | Reads the messages of one of them | kept |
+| `messenger_personal_search_users` | Searches for people your Messenger account can message, by name | kept |
 | `messenger_personal_send_text` | Sends a text message from your Messenger account | removed |
 | `messenger_personal_send_media` | Sends an image, video, audio clip or file from your Messenger account (encrypted chats: images only, no captions) | removed |
 | `messenger_personal_react` | Reacts to a message, or removes your reaction with an empty emoji (removal is not verified in encrypted threads) | removed |
@@ -311,8 +319,9 @@ the account: see [Personal mode](#personal-mode).
 
 **Will personal mode get my account banned?** Nobody can promise it will not. WhatsApp states that linking an
 account to an unofficial app can lead to a temporary or permanent ban, retroactively, and the Messenger
-library's users report checkpoints and automated-behaviour locks. The design offers no way to start a new chat,
-create a group or send a broadcast, the kind of behaviour WhatsApp's pages warn about, and adds a read-only mode and a
+library's users report checkpoints and automated-behaviour locks. The design offers no way to create a group or
+send a broadcast, the kind of behaviour WhatsApp's pages warn about, opens a new chat only for a send to one person
+that the platform confirms, and adds a read-only mode and a
 client that can ask you before each send, and none of that removes the risk or is shown to lower it. Use an account
 you can afford to lose, and read
 [SECURITY.md](SECURITY.md#unofficial-clients-the-risk-to-the-account).
