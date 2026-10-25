@@ -6,11 +6,12 @@ use std::process::ExitCode;
 use clap::{ArgGroup, Args, Parser, Subcommand};
 
 use crate::config::Config;
+#[cfg(unix)]
 use crate::personal::PersonalPlatform;
 use crate::setup::oauth::RedirectMode;
 use crate::{mcp, server, setup};
 
-/// MCP server for the Meta Graph API (Facebook Messenger and WhatsApp Cloud API).
+/// MCP server for Facebook Messenger and WhatsApp: the Meta Graph API (Pages and business numbers) and, on Unix, personal accounts through local sidecars.
 #[derive(Debug, Parser)]
 #[command(name = "meta-mcp", version)]
 pub struct Cli {
@@ -181,6 +182,7 @@ pub enum TokenCommand {
     },
 }
 
+#[cfg(unix)]
 /// The personal platforms a command can name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum PersonalPlatformArg {
@@ -188,6 +190,7 @@ pub enum PersonalPlatformArg {
     Whatsapp,
 }
 
+#[cfg(unix)]
 impl PersonalPlatformArg {
     fn platform(self) -> PersonalPlatform {
         match self {
@@ -197,17 +200,15 @@ impl PersonalPlatformArg {
     }
 }
 
+#[cfg(unix)]
 /// A personal-account login flow.
 #[derive(Debug, Clone, Subcommand)]
 pub enum LoginCommand {
     /// Log in to Messenger with the cookies of a browser session
     Messenger {
         /// File holding a cURL command, a JSON object of cookies or a JSON array of {name, value}
-        #[arg(long, value_name = "PATH", conflicts_with = "cookies_json")]
+        #[arg(long, value_name = "PATH")]
         cookies_file: Option<PathBuf>,
-        /// The same input as a string (visible in the process list: prefer --cookies-file)
-        #[arg(long, value_name = "JSON")]
-        cookies_json: Option<String>,
     },
     /// Link this machine to WhatsApp as a companion device (QR code, or a code typed on the phone)
     Whatsapp {
@@ -223,6 +224,7 @@ pub enum LoginCommand {
     },
 }
 
+#[cfg(unix)]
 /// A personal-account command.
 #[derive(Debug, Clone, Subcommand)]
 pub enum PersonalCommand {
@@ -265,11 +267,20 @@ pub enum PersonalCommand {
     },
 }
 
+#[cfg(unix)]
 /// Options of `meta-mcp personal`.
 #[derive(Debug, Clone, Args)]
 pub struct PersonalArgs {
     #[command(subcommand)]
     pub command: PersonalCommand,
+}
+
+/// Options of `meta-mcp personal` on a system without personal mode: the words are ignored.
+#[cfg(not(unix))]
+#[derive(Debug, Clone, Args)]
+pub struct PersonalArgs {
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+    pub rest: Vec<String>,
 }
 
 /// Options of `meta-mcp token`.
@@ -321,16 +332,22 @@ pub async fn run() -> ExitCode {
     execute(cli.command.unwrap_or(Command::Stdio)).await
 }
 
+#[cfg(not(unix))]
+async fn run_personal(_args: PersonalArgs) -> ExitCode {
+    eprintln!("personal mode needs a Unix system");
+    ExitCode::from(2)
+}
+
+#[cfg(unix)]
 async fn run_personal(args: PersonalArgs) -> ExitCode {
     use crate::personal::cli as pcli;
     match args.command {
         PersonalCommand::Daemon { socket } => {
             crate::personal::daemon::run(crate::personal::daemon::DaemonOptions { socket }).await
         }
-        PersonalCommand::Login(LoginCommand::Messenger {
-            cookies_file,
-            cookies_json,
-        }) => pcli::login_messenger(cookies_file, cookies_json).await,
+        PersonalCommand::Login(LoginCommand::Messenger { cookies_file }) => {
+            pcli::login_messenger(cookies_file).await
+        }
         PersonalCommand::Login(LoginCommand::Whatsapp {
             pair_code,
             full_history,
@@ -390,6 +407,7 @@ mod tests {
         Cli::try_parse_from(std::iter::once("meta-mcp").chain(args.iter().copied()))
     }
 
+    #[cfg(unix)]
     #[test]
     fn personal_daemon_parses_with_an_optional_socket() {
         assert!(matches!(

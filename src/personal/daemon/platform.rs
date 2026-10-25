@@ -10,9 +10,11 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 
+use super::pace::{Pace, PaceClass, PaceConfig};
 use super::ring::MessageRing;
 use super::{Cancel, Daemon, OpError};
 use crate::personal::PersonalPlatform;
+use crate::personal::link::LinkError;
 use crate::personal::protocol::{Account, CODE_INTERNAL, Event, HelloResult, Library};
 use crate::personal::sidecar::{self, READY_TIMEOUT, Sidecar, SpawnError};
 use crate::personal::state::StateStore;
@@ -21,6 +23,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const RESTART_STOP: Duration = Duration::from_secs(15);
 const RECONNECT_STOP: Duration = Duration::from_secs(5);
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+/// Shortest reconnect delay after the sidecar asked to wait.
+const UNRESPONSIVE: &str = "sidecar_unresponsive";
+pub(super) const WAIT_FLOOR: Duration = Duration::from_secs(300);
 
 pub(super) type Barrier = oneshot::Sender<()>;
 
@@ -41,6 +46,8 @@ pub(super) struct Inner {
     pub accept_state: bool,
     pub connection: &'static str,
     pub reason: Option<String>,
+    /// A page the owner must open to resolve the account (checkpoint, challenge, consent).
+    pub reason_url: Option<String>,
     pub sending_blocked: bool,
     pub blocked_reason: Option<String>,
     pub last_event_at: Option<i64>,
@@ -49,6 +56,12 @@ pub(super) struct Inner {
     pub reconnect_at: Option<Instant>,
     pub last_error: Option<String>,
     pub backoff_idx: usize,
+    /// The sidecar said `none` or `relogin`: no reconnecting until `restart` or a login.
+    pub halted: bool,
+    /// The sidecar said `wait`: the next reconnect delay is at least `WAIT_FLOOR`.
+    pub wait_floor: bool,
+    /// When the current connection was first reported up.
+    pub connected_since: Option<Instant>,
     pub reconnect: Option<ReconnectLoop>,
     pub reconnect_serial: u64,
     pub connect_sent: bool,
@@ -59,6 +72,7 @@ pub(super) struct PlatformRt {
     pub platform: PersonalPlatform,
     pub store: StateStore,
     inner: Mutex<Inner>,
+    pace: Mutex<Pace>,
     /// Serialises spawning, stopping and replacing the sidecar.
     pub lifecycle: AsyncMutex<()>,
     /// Orders state writes and deletes against logout.
@@ -105,10 +119,11 @@ fn clean_outbox(data_dir: &Path) {
 }
 
 impl PlatformRt {
-    pub fn new(platform: PersonalPlatform, home: &Path) -> Arc<Self> {
+    pub fn new(platform: PersonalPlatform, home: &Path, pace: PaceConfig) -> Arc<Self> {
         Arc::new(Self {
             platform,
             store: StateStore::new(home, platform),
+            pace: Mutex::new(Pace::new(pace, Instant::now())),
             inner: Mutex::new(Inner {
                 sidecar: None,
                 generation: 0,
@@ -119,6 +134,7 @@ impl PlatformRt {
                 accept_state: false,
                 connection: "stopped",
                 reason: None,
+                reason_url: None,
                 sending_blocked: false,
                 blocked_reason: None,
                 last_event_at: None,
@@ -127,6 +143,9 @@ impl PlatformRt {
                 reconnect_at: None,
                 last_error: None,
                 backoff_idx: 0,
+                halted: false,
+                wait_floor: false,
+                connected_since: None,
                 reconnect: None,
                 reconnect_serial: 0,
                 connect_sent: false,
@@ -141,6 +160,14 @@ impl PlatformRt {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Takes a write token; the error says how long to wait.
+    pub fn take_token(&self, class: PaceClass) -> Result<(), Duration> {
+        self.pace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take(class, Instant::now())
     }
 
     /// The refusal for a platform whose account may not send until `restart`.
@@ -178,6 +205,7 @@ impl PlatformRt {
             "account": g.account.as_ref().map(|a| json!({"id": a.id, "name": a.name})),
             "connection": g.connection,
             "reason": g.reason,
+            "reason_url": g.reason_url,
             "sending_blocked": g.sending_blocked,
             "blocked_reason": g.blocked_reason,
             "last_event_at": g.last_event_at,
@@ -185,6 +213,7 @@ impl PlatformRt {
             "sidecar_version": g.sidecar_version,
             "library": g.library.as_ref().map(|l| json!({"name": l.name, "version": l.version})),
             "reconnect_in_s": reconnect_in,
+            "reconnect_halted": g.halted,
             "last_error": g.last_error,
         })
     }
@@ -230,6 +259,16 @@ impl Daemon {
         rt: &Arc<PlatformRt>,
         state: Option<Value>,
     ) -> Result<HelloResult, StartError> {
+        self.start_sidecar_with(rt, state, true).await
+    }
+
+    /// Like `start_sidecar_locked`; `connect: false` stops after `hello` (used to log out).
+    pub(super) async fn start_sidecar_with(
+        self: &Arc<Self>,
+        rt: &Arc<PlatformRt>,
+        state: Option<Value>,
+        connect: bool,
+    ) -> Result<HelloResult, StartError> {
         let platform = rt.platform;
         if self.cancel.is_cancelled() {
             return Err(StartError::fatal(OpError::new(
@@ -270,6 +309,7 @@ impl Daemon {
             g.barrier = Some(barrier_tx);
             g.connection = "starting";
             g.reason = None;
+            g.reason_url = None;
             g.connect_sent = false;
             g.logged_in = false;
             g.account = None;
@@ -343,6 +383,7 @@ impl Daemon {
                 }
             }
         }
+        tokio::spawn(Arc::clone(self).heartbeat(Arc::clone(rt), epoch, Arc::clone(&sc)));
         tracing::info!(
             platform = platform.as_str(),
             sidecar_version = %hello.sidecar_version,
@@ -351,6 +392,7 @@ impl Daemon {
             "sidecar ready"
         );
         if hello.logged_in
+            && connect
             && let Err(e) = self.connect_sidecar(rt, epoch).await
         {
             tracing::warn!(platform = platform.as_str(), code = %e.code, "connect failed");
@@ -419,6 +461,56 @@ impl Daemon {
         }
     }
 
+    /// Pings the sidecar; two misses in a row kill it so the crash path respawns it.
+    async fn heartbeat(self: Arc<Self>, rt: Arc<PlatformRt>, epoch: u64, sc: Arc<Sidecar>) {
+        let mut misses = 0u32;
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(self.live.interval) => {}
+                () = sc.closed() => return,
+                () = self.cancel.cancelled() => return,
+            }
+            if rt.inner().generation != epoch {
+                return;
+            }
+            let ping = sc
+                .link()
+                .request_with_timeout("ping", Value::Null, self.live.timeout)
+                .await;
+            match ping {
+                Ok(_) | Err(LinkError::Remote { .. }) => misses = 0,
+                Err(LinkError::Closed | LinkError::Protocol(_) | LinkError::Io(_)) => return,
+                Err(LinkError::Timeout(_)) => misses += 1,
+            }
+            if misses < 2 {
+                continue;
+            }
+            {
+                let mut g = rt.inner();
+                if g.generation != epoch {
+                    return;
+                }
+                g.last_error = Some(UNRESPONSIVE.to_owned());
+            }
+            tracing::warn!(
+                platform = rt.platform.as_str(),
+                "sidecar missed two pings, killing it"
+            );
+            sc.kill().await;
+            return;
+        }
+    }
+
+    /// A connection that stayed up for the stable period earns a fresh backoff.
+    pub(super) fn note_connection_ended(&self, g: &mut Inner) {
+        if g.connected_since
+            .take()
+            .is_some_and(|since| since.elapsed() >= self.stable)
+        {
+            g.backoff_idx = 0;
+        }
+    }
+
     /// Takes the sidecar out of service and asks it to exit. The caller holds the lifecycle lock.
     pub(super) async fn stop_sidecar_locked(&self, rt: &Arc<PlatformRt>, timeout: Duration) {
         // Events already queued are handled before the generation changes and drops the rest.
@@ -429,6 +521,7 @@ impl Daemon {
             g.barrier = None;
             g.connection = "stopped";
             g.reason = None;
+            g.reason_url = None;
             g.connect_sent = false;
             g.sidecar.take()
         };
@@ -494,12 +587,19 @@ impl Daemon {
             if g.generation != epoch {
                 return;
             }
+            self.note_connection_ended(&mut g);
             g.generation += 1;
             g.barrier = None;
             g.connection = "disconnected";
-            g.reason = Some("sidecar_exited".to_owned());
+            let unresponsive = g.last_error.as_deref() == Some(UNRESPONSIVE);
+            let why = if unresponsive {
+                UNRESPONSIVE
+            } else {
+                "sidecar_exited"
+            };
+            g.reason = Some(why.to_owned());
             g.connect_sent = false;
-            g.last_error = Some("sidecar_exited".to_owned());
+            g.last_error = Some(why.to_owned());
             g.sidecar.take()
         };
         tracing::warn!(
@@ -519,7 +619,7 @@ impl Daemon {
         }
         let (serial, cancel) = {
             let mut g = rt.inner();
-            if g.reconnect.is_some() || !g.want_online || g.sending_blocked {
+            if g.reconnect.is_some() || !g.want_online || g.sending_blocked || g.halted {
                 return;
             }
             g.reconnect_serial += 1;
@@ -555,8 +655,12 @@ impl Daemon {
                 }
                 let i = g.backoff_idx.min(self.backoff.len() - 1);
                 g.backoff_idx += 1;
-                g.reconnect_at = Some(Instant::now() + self.backoff[i]);
-                self.backoff[i]
+                let mut delay = self.backoff[i];
+                if std::mem::take(&mut g.wait_floor) {
+                    delay = delay.max(WAIT_FLOOR);
+                }
+                g.reconnect_at = Some(Instant::now() + delay);
+                delay
             };
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -566,7 +670,7 @@ impl Daemon {
             {
                 let mut g = rt.inner();
                 g.reconnect_at = None;
-                if cancel.is_cancelled() || !g.want_online || g.sending_blocked {
+                if cancel.is_cancelled() || !g.want_online || g.sending_blocked || g.halted {
                     break;
                 }
             }
@@ -578,7 +682,7 @@ impl Daemon {
                 }
             }
             let g = rt.inner();
-            if cancel.is_cancelled() || !g.want_online || g.sending_blocked {
+            if cancel.is_cancelled() || !g.want_online || g.sending_blocked || g.halted {
                 break;
             }
         }
@@ -598,7 +702,7 @@ impl Daemon {
         let _life = rt.lifecycle.lock().await;
         let stale = {
             let g = rt.inner();
-            !g.want_online || g.sending_blocked
+            !g.want_online || g.sending_blocked || g.halted
         };
         if cancel.is_cancelled() || self.cancel.is_cancelled() || stale {
             return Err(OpError::new(CODE_INTERNAL, "cancelled"));
@@ -626,6 +730,9 @@ impl Daemon {
             let mut g = rt.inner();
             g.sending_blocked = false;
             g.blocked_reason = None;
+            g.halted = false;
+            g.wait_floor = false;
+            g.connected_since = None;
             g.backoff_idx = 0;
             g.reconnect_at = None;
             g.last_error = None;

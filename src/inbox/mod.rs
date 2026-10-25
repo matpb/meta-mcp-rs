@@ -224,6 +224,8 @@ pub struct ListFilter {
     pub unprocessed_only: bool,
     pub account_id: Option<String>,
     pub limit: Option<usize>,
+    /// Leave out the personal Messenger and WhatsApp rows.
+    pub exclude_personal: bool,
 }
 
 /// Counters for status and health output.
@@ -429,6 +431,9 @@ impl Inbox {
         if let Some(p) = f.platform {
             sql.push_str(" AND platform = ?");
             args.push(Sql::Text(p.as_str().into()));
+        }
+        if f.exclude_personal {
+            sql.push_str(" AND platform NOT IN ('messenger_personal', 'whatsapp_personal')");
         }
         if !f.kinds.is_empty() {
             sql.push_str(&format!(" AND kind IN ({})", placeholders(f.kinds.len())));

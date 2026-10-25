@@ -6,7 +6,7 @@ rust-version = "1.89"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/matpb/meta-mcp-rs"
-description = "MCP server for the Meta Graph API: read and send Facebook Messenger (Page inbox) and WhatsApp Cloud API messages, with guided OAuth setup"
+description = "MCP server for Facebook Messenger and WhatsApp: the Meta Graph API (Page inbox, WhatsApp Cloud API, guided OAuth setup) and personal accounts through local sidecars"
 keywords = ["mcp", "mcp-server", "messenger", "whatsapp", "meta"]
 categories = ["command-line-utilities", "web-programming", "api-bindings"]
 
@@ -46,6 +46,7 @@ futures-util = "0.3"
 open = "5"
 rpassword = "7"
 qrcode = { version = "0.14", default-features = false }
+libc = "0.2"
 
 [dev-dependencies]
 wiremock = "0.6"

@@ -1,4 +1,5 @@
 //! Integration tests for `meta-mcp personal daemon`, driven against a fake bash sidecar.
+#![cfg(unix)]
 
 mod common;
 #[path = "common/personal.rs"]
@@ -651,7 +652,7 @@ async fn invalid_and_unavailable_sends_are_refused_before_the_sidecar() {
 
     let cases = [
         json!({"platform": "messenger", "thread_id": "t1", "text": ""}),
-        json!({"platform": "messenger", "thread_id": "t1", "text": "tab\there"}),
+        json!({"platform": "messenger", "thread_id": "t1", "text": "pay \u{202e}gpj.exe"}),
         json!({"platform": "messenger", "thread_id": "t1", "text": "a".repeat(4001)}),
         json!({"platform": "messenger", "thread_id": "bad id", "text": "x"}),
         json!({"platform": "messenger", "thread_id": "t1", "text": "x", "reply_to": "no spaces allowed"}),
@@ -965,7 +966,7 @@ async fn logout_clears_state() {
     assert!(env.state_path("messenger").is_file());
 
     let out = ok(&client, "logout", json!({"platform": "messenger"})).await;
-    assert_eq!(out, json!({"state_cleared": true}));
+    assert_eq!(out, json!({"state_cleared": true, "data_wiped": true}));
     assert_eq!(env.request_count("messenger", "logout"), 1);
     assert!(!env.state_path("messenger").exists());
     let st = ok(&client, "status", Value::Null).await;
@@ -1004,7 +1005,7 @@ async fn logout_clears_state() {
 
     // Logging out a platform that never ran still clears and reports no remote error.
     let none = ok(&client, "logout", json!({"platform": "whatsapp"})).await;
-    assert_eq!(none, json!({"state_cleared": true}));
+    assert_eq!(none, json!({"state_cleared": true, "data_wiped": true}));
     // A null state from the sidecar deletes the file.
     env.emit(
         "messenger",
@@ -1046,7 +1047,10 @@ async fn logged_out_event_clears_the_session() {
 async fn reconnect_after_sidecar_crash_with_backoff() {
     let env = TestEnv::new();
     env.preseed_session("messenger");
-    let _daemon = env.start_with(&[("META_MCP_PERSONAL_BACKOFF_MS", "1500,3000")]);
+    let _daemon = env.start_with(&[
+        ("META_MCP_PERSONAL_BACKOFF_MS", "1500,3000"),
+        ("META_MCP_PERSONAL_STABLE_MS", "300"),
+    ]);
     let client = env.connect().await;
     wait_status(&client, "connected", LONG, |st| {
         st["platforms"]["messenger"]["connection"] == "connected"
@@ -1079,7 +1083,9 @@ async fn reconnect_after_sidecar_crash_with_backoff() {
         json!({"session": "seeded-messenger"})
     );
 
-    // Connected reset the backoff: the next crash waits the first step again, not the second.
+    // A connection that stayed up past the stable period resets the backoff: the next crash waits
+    // the first step again, not the second.
+    tokio::time::sleep(Duration::from_millis(600)).await;
     env.kill_sidecar("messenger");
     let waiting = wait_status(&client, "second reconnect scheduled", LONG, |st| {
         !st["platforms"]["messenger"]["reconnect_in_s"].is_null()
@@ -2006,9 +2012,17 @@ async fn cli_login_messenger_with_cookies_json() {
     let cookies = format!(
         r#"{{"c_user":"100001","xs":"{COOKIE_SECRET}","datr":"datr-value-1","sb":"sb-1","junk":"drop-me"}}"#
     );
+    let file = env.root().join("cookies.json");
+    std::fs::write(&file, &cookies).expect("cookies file");
     let run = env
         .cli(
-            &["personal", "login", "messenger", "--cookies-json", &cookies],
+            &[
+                "personal",
+                "login",
+                "messenger",
+                "--cookies-file",
+                file.to_str().expect("utf8"),
+            ],
             "",
         )
         .await;
@@ -2088,9 +2102,17 @@ async fn cli_login_messenger_rejects_incomplete_input() {
     let env = TestEnv::new();
     let secret = "XSVALUE-should-never-print-123";
     let json = format!(r#"{{"c_user":"1","xs":"{secret}"}}"#);
+    let incomplete = env.root().join("incomplete.json");
+    std::fs::write(&incomplete, &json).expect("cookies file");
     let run = env
         .cli(
-            &["personal", "login", "messenger", "--cookies-json", &json],
+            &[
+                "personal",
+                "login",
+                "messenger",
+                "--cookies-file",
+                incomplete.to_str().expect("utf8"),
+            ],
             "",
         )
         .await;
@@ -2411,6 +2433,19 @@ async fn cli_install_dry_run_prints_units() {
         ),
         "Environment=\"META_MCP_READ_ONLY=1\"".to_owned(),
         "NoNewPrivileges=yes".to_owned(),
+        "ProtectSystem=strict".to_owned(),
+        "ProtectHome=read-only".to_owned(),
+        "PrivateTmp=yes".to_owned(),
+        "LimitCORE=0".to_owned(),
+        "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6".to_owned(),
+        "RestrictNamespaces=yes".to_owned(),
+        "SystemCallArchitectures=native".to_owned(),
+        format!(
+            "ReadWritePaths={} {} {}",
+            env.home().display(),
+            env.root().display(),
+            env.files_dir().display()
+        ),
         "WantedBy=default.target".to_owned(),
         "systemctl --user daemon-reload".to_owned(),
         "systemctl --user enable --now meta-mcp-personal.socket meta-mcp-personal.service"
@@ -2558,6 +2593,7 @@ async fn a_reconnect_sleep_does_not_kill_a_login_started_meanwhile() {
     })
     .await;
     ok(&client, "logout", json!({"platform": "messenger"})).await;
+    let shutdowns = env.request_count("messenger", "shutdown");
     ok(
         &client,
         "login_start",
@@ -2573,7 +2609,7 @@ async fn a_reconnect_sleep_does_not_kill_a_login_started_meanwhile() {
     );
     assert_eq!(
         env.request_count("messenger", "shutdown"),
-        0,
+        shutdowns,
         "the login sidecar was left alone"
     );
     let st = ok(&client, "status", Value::Null).await;
@@ -2666,4 +2702,1400 @@ async fn sidecar_error_codes_are_sanitised_for_the_client_and_the_audit() {
     let last = env.audit_lines().pop().expect("audit line");
     assert_eq!(last["outcome"], "failed");
     assert_eq!(last["error_code"], "weird_code_");
+}
+
+const FLIP: &str = r#"
+import os, sys, time
+files, secret, deadline = sys.argv[1], sys.argv[2], time.time() + float(sys.argv[3])
+target = os.path.join(files, "x.txt")
+master = os.path.join(files, ".master")
+with open(master, "w") as f:
+    f.write("benign")
+while time.time() < deadline:
+    for name, make in ((".tmp-link", lambda t: os.symlink(secret, t)), (".tmp-reg", lambda t: os.link(master, t))):
+        tmp = os.path.join(files, name)
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        make(tmp)
+        os.rename(tmp, target)
+"#;
+
+#[tokio::test]
+async fn send_media_survives_a_symlink_swap_race_without_leaking() {
+    let env = TestEnv::with_files();
+    let (_daemon, client) = env.start_logged_in("whatsapp").await;
+    let secret = env.root().join("secret.txt");
+    std::fs::write(&secret, "TOP-SECRET-OUTSIDE-THE-JAIL").expect("secret");
+    let script = env.root().join("flip.py");
+    std::fs::write(&script, FLIP).expect("script");
+    std::fs::write(env.files_dir().join("x.txt"), "benign").expect("x");
+    let mut flipper = std::process::Command::new("python3")
+        .arg("-I")
+        .arg(&script)
+        .arg(env.files_dir())
+        .arg(&secret)
+        .arg("30")
+        .spawn()
+        .expect("python flipper");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (mut sent, mut leaked) = (0, None);
+    for attempt in 1..=600 {
+        let reply = call(
+            &client,
+            "send_media",
+            json!({"platform": "whatsapp", "thread_id": "t1", "path": "x.txt"}),
+        )
+        .await;
+        if reply.is_ok() {
+            sent += 1;
+            let copy = std::fs::read_to_string(env.fake_dir().join("whatsapp.media.copy"))
+                .unwrap_or_default();
+            if copy.contains("TOP-SECRET-OUTSIDE-THE-JAIL") {
+                leaked = Some(attempt);
+                break;
+            }
+        }
+    }
+    let _ = flipper.kill();
+    let _ = flipper.wait();
+    assert_eq!(leaked, None, "a file outside the jail reached the sidecar");
+    assert!(
+        sent > 0,
+        "the benign file was never sent, the race did not run"
+    );
+}
+
+#[tokio::test]
+async fn a_static_symlink_out_of_the_jail_is_refused() {
+    let env = TestEnv::with_files();
+    let (_daemon, client) = env.start_logged_in("whatsapp").await;
+    let secret = env.root().join("secret.txt");
+    std::fs::write(&secret, "TOP-SECRET-OUTSIDE-THE-JAIL").expect("secret");
+    std::os::unix::fs::symlink(&secret, env.files_dir().join("x.txt")).expect("ln");
+    for _ in 0..20 {
+        let e = err(
+            &client,
+            "send_media",
+            json!({"platform": "whatsapp", "thread_id": "t1", "path": "x.txt"}),
+        )
+        .await;
+        assert_eq!(e.code, "file_refused");
+    }
+    assert_eq!(env.request_count("whatsapp", "send_media"), 0);
+}
+
+#[tokio::test]
+async fn send_media_refuses_a_fifo_without_blocking() {
+    let env = TestEnv::with_files();
+    let (_daemon, client) = env.start_logged_in("whatsapp").await;
+    let fifo = env.files_dir().join("pipe.bin");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo")
+            .success()
+    );
+    let e = tokio::time::timeout(
+        Duration::from_secs(5),
+        err(
+            &client,
+            "send_media",
+            json!({"platform": "whatsapp", "thread_id": "t1", "path": "pipe.bin"}),
+        ),
+    )
+    .await
+    .expect("a FIFO must not block the daemon");
+    assert_eq!(e.code, "file_refused");
+    assert!(e.message.contains("regular"), "{e}");
+}
+
+/// Stops the whatsapp sidecar of a connected daemon and waits until the daemon knows.
+async fn lose_sidecar(env: &TestEnv, client: &DaemonClient) {
+    env.kill_sidecar("whatsapp");
+    wait_status(client, "sidecar gone", LONG, |st| {
+        st["platforms"]["whatsapp"]["sidecar_running"] == false
+    })
+    .await;
+}
+
+async fn connected_whatsapp_with_dead_sidecar() -> (TestEnv, RunningDaemon, DaemonClient) {
+    let env = TestEnv::new();
+    env.preseed_session("whatsapp");
+    let daemon = env.start_with(&[("META_MCP_PERSONAL_BACKOFF_MS", "600000")]);
+    let client = env.connect().await;
+    wait_status(&client, "connected", LONG, |st| {
+        st["platforms"]["whatsapp"]["connection"] == "connected"
+    })
+    .await;
+    lose_sidecar(&env, &client).await;
+    (env, daemon, client)
+}
+
+#[tokio::test]
+async fn logout_with_the_sidecar_down_starts_one_to_log_out_remotely() {
+    let (env, _daemon, client) = connected_whatsapp_with_dead_sidecar().await;
+    let data = env.personal_dir().join("whatsapp/data");
+    std::fs::write(data.join("messages.db"), "chat history").expect("db");
+    let out = ok(&client, "logout", json!({"platform": "whatsapp"})).await;
+    assert_eq!(out, json!({"state_cleared": true, "data_wiped": true}));
+    assert_eq!(env.request_count("whatsapp", "logout"), 1);
+    assert!(!env.fake_dir().join("whatsapp.logged_in").exists());
+    assert!(!env.state_path("whatsapp").exists());
+    assert_eq!(std::fs::read_dir(&data).expect("data").count(), 0);
+    let st = ok(&client, "status", Value::Null).await;
+    assert_eq!(st["platforms"]["whatsapp"]["sidecar_running"], false);
+    assert_eq!(st["platforms"]["whatsapp"]["logged_in"], false);
+}
+
+#[tokio::test]
+async fn login_start_after_a_logout_starts_a_fresh_sidecar_without_state() {
+    let (env, _daemon, client) = connected_whatsapp_with_dead_sidecar().await;
+    ok(&client, "logout", json!({"platform": "whatsapp"})).await;
+    ok(
+        &client,
+        "login_start",
+        json!({"platform": "whatsapp", "method": "qr"}),
+    )
+    .await;
+    let st = ok(&client, "status", Value::Null).await;
+    assert_eq!(st["platforms"]["whatsapp"]["logged_in"], false, "{st}");
+    let hello = env.last_request("whatsapp", "hello").expect("hello");
+    assert!(hello["params"]["state"].is_null(), "{hello}");
+}
+
+#[tokio::test]
+async fn cli_logout_with_the_sidecar_down_reports_the_device_unlinked() {
+    let (env, _daemon, _client) = connected_whatsapp_with_dead_sidecar().await;
+    let run = env.cli(&["personal", "logout", "whatsapp"], "").await;
+    assert_eq!(run.code, 0, "{run:?}");
+    assert!(run.stdout.contains("Logged out of WhatsApp."), "{run:?}");
+    assert!(run.stdout.contains("stored session: cleared"), "{run:?}");
+    assert!(
+        run.stdout.contains("service: the device was unlinked"),
+        "{run:?}"
+    );
+    assert!(!env.fake_dir().join("whatsapp.logged_in").exists());
+}
+
+#[tokio::test]
+async fn a_failed_remote_logout_still_wipes_stops_and_stops_ingesting() {
+    let env = TestEnv::new();
+    let (_daemon, client) = env.start_logged_in("whatsapp").await;
+    let data = env.personal_dir().join("whatsapp/data");
+    for name in ["session.db", "messages.db", "e2ee.db", "threads.json"] {
+        std::fs::write(data.join(name), "secret material").expect("file");
+    }
+    env.knob("whatsapp", "logout_fail", true);
+    let out = ok(&client, "logout", json!({"platform": "whatsapp"})).await;
+    assert_eq!(out["state_cleared"], true, "{out}");
+    assert_eq!(out["data_wiped"], true, "{out}");
+    assert!(
+        out["remote_error"]
+            .as_str()
+            .is_some_and(|e| e.starts_with("io: ")),
+        "{out}"
+    );
+    assert!(!env.state_path("whatsapp").exists());
+    assert_eq!(std::fs::read_dir(&data).expect("data").count(), 0);
+    let st = ok(&client, "status", Value::Null).await;
+    let w = &st["platforms"]["whatsapp"];
+    assert_eq!(w["logged_in"], false);
+    assert_eq!(w["sidecar_running"], false, "{w}");
+    env.emit(
+        "whatsapp",
+        &message_event("after.logout.1", "t1", "in", "late"),
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(rows(&env, Platform::WhatsAppPersonal).is_empty());
+}
+
+#[tokio::test]
+async fn logout_without_a_startable_sidecar_reports_it_and_still_wipes() {
+    let (env, _daemon, client) = connected_whatsapp_with_dead_sidecar().await;
+    std::fs::remove_file(env.sidecar_dir().join("meta-whatsapp-sidecar")).expect("remove binary");
+    let data = env.personal_dir().join("whatsapp/data");
+    std::fs::write(data.join("session.db"), "keys").expect("db");
+    let out = ok(&client, "logout", json!({"platform": "whatsapp"})).await;
+    assert_eq!(out["state_cleared"], true, "{out}");
+    assert_eq!(out["data_wiped"], true, "{out}");
+    assert!(
+        out["remote_error"]
+            .as_str()
+            .is_some_and(|e| e.starts_with("sidecar_unavailable: ")),
+        "{out}"
+    );
+    assert!(!env.state_path("whatsapp").exists());
+    assert_eq!(std::fs::read_dir(&data).expect("data").count(), 0);
+}
+
+#[tokio::test]
+async fn cli_logout_reports_a_state_file_it_could_not_delete() {
+    let env = TestEnv::new();
+    let (_daemon, _client) = env.start_logged_in("messenger").await;
+    let dir = env.personal_dir().join("messenger");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+    let run = env.cli(&["personal", "logout", "messenger"], "").await;
+    let still_there = env.state_path("messenger").exists();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod back");
+    assert!(still_there, "the delete should have failed");
+    assert_eq!(run.code, 1, "{run:?}");
+    assert!(
+        run.stdout.contains("Logout of Messenger is incomplete"),
+        "{run:?}"
+    );
+    assert!(
+        run.stdout.contains("stored session: NOT cleared"),
+        "{run:?}"
+    );
+    assert!(!run.stdout.contains("session: cleared"), "{run:?}");
+}
+
+#[tokio::test]
+async fn a_send_whose_daemon_connection_drops_warns_it_may_have_gone_out() {
+    let env = TestEnv::new();
+    let (daemon, _client) = env.start_logged_in("messenger").await;
+    env.knob("messenger", "send_slow", true);
+    let socket = env.socket();
+    let call = tokio::spawn(common::blocking(move || {
+        let home = common::TempHome::new();
+        let mut s = common::Session::start(
+            &home,
+            OFFLINE,
+            &[("META_MCP_PERSONAL_SOCKET", socket.to_str().expect("utf8"))],
+        );
+        let reply = s.call_tool(
+            "messenger_personal_send_text",
+            json!({"thread_id": "t1", "text": "important message"}),
+        );
+        (is_error(&reply), common::tool_text(&reply))
+    }));
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-KILL", &daemon.pid().to_string()])
+            .status()
+            .expect("kill")
+            .success()
+    );
+    let (is_err, text) = call.await.expect("join");
+    assert!(is_err, "{text}");
+    assert!(
+        text.contains("send_unknown")
+            && text
+                .contains("the message may have been sent: read the thread before sending again"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn a_read_whose_daemon_connection_drops_stays_a_plain_error() {
+    let env = TestEnv::new();
+    let (daemon, _client) = env.start_logged_in("messenger").await;
+    env.knob("messenger", "list_slow", true);
+    let socket = env.socket();
+    let call = tokio::spawn(common::blocking(move || {
+        let home = common::TempHome::new();
+        let mut s = common::Session::start(
+            &home,
+            OFFLINE,
+            &[("META_MCP_PERSONAL_SOCKET", socket.to_str().expect("utf8"))],
+        );
+        common::tool_text(&s.call_tool("messenger_personal_list_threads", json!({})))
+    }));
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", &daemon.pid().to_string()])
+        .status();
+    let text = call.await.expect("join");
+    assert!(!text.contains("may have been sent"), "{text}");
+    assert!(
+        text.contains("connection to the personal daemon was lost"),
+        "{text}"
+    );
+}
+
+fn personal_row(id: &str, platform: Platform, text: &str) -> meta_mcp::inbox::Event {
+    let mut e = meta_mcp::inbox::Event::new(id, platform, EventKind::Message);
+    e.text = Some(text.into());
+    e.recipient = "chat1".into();
+    e.sender = "u2".into();
+    e.received_at = meta_mcp::inbox::now_secs();
+    e.ts = e.received_at;
+    e
+}
+
+#[test]
+fn inbox_list_leaves_personal_conversations_out_unless_asked() {
+    let home = common::TempHome::new();
+    let inbox = meta_mcp::inbox::Inbox::open(&home.inbox_db()).expect("inbox");
+    inbox
+        .insert(&[
+            personal_row(
+                "whatsapp_personal:chat1:m1",
+                Platform::WhatsAppPersonal,
+                "PRIVATE family chat",
+            ),
+            personal_row(
+                "messenger_personal:chat1:m2",
+                Platform::MessengerPersonal,
+                "PRIVATE friend chat",
+            ),
+            personal_row("whatsapp:chat1:m3", Platform::WhatsApp, "business hello"),
+        ])
+        .expect("insert");
+    let mut s = common::Session::start(&home, OFFLINE, &[]);
+    let plain = common::tool_text(&s.call_tool("inbox_list", json!({})));
+    assert!(plain.contains("business hello"), "{plain}");
+    assert!(!plain.contains("PRIVATE"), "{plain}");
+    let named =
+        common::tool_text(&s.call_tool("inbox_list", json!({"platform": "whatsapp_personal"})));
+    assert!(
+        named.contains("PRIVATE family chat") && !named.contains("PRIVATE friend"),
+        "{named}"
+    );
+    let flagged = common::tool_text(&s.call_tool("inbox_list", json!({"include_personal": true})));
+    assert!(
+        flagged.contains("PRIVATE family chat") && flagged.contains("PRIVATE friend chat"),
+        "{flagged}"
+    );
+    assert!(flagged.contains("business hello"), "{flagged}");
+}
+
+#[test]
+fn inbox_wait_ignores_personal_arrivals_unless_asked() {
+    let home = common::TempHome::new();
+    let mut s = common::Session::start(&home, OFFLINE, &[]);
+    let db = home.inbox_db();
+    let insert_later = |id: &'static str| {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            let inbox = meta_mcp::inbox::Inbox::open(&db).expect("inbox");
+            inbox
+                .insert(&[personal_row(
+                    id,
+                    Platform::WhatsAppPersonal,
+                    "PRIVATE arrival",
+                )])
+                .expect("insert");
+        })
+    };
+    let writer = insert_later("whatsapp_personal:chat1:w1");
+    let plain = common::tool_text(&s.call_tool("inbox_wait", json!({"timeout_seconds": 2})));
+    writer.join().expect("writer");
+    assert!(!plain.contains("PRIVATE"), "{plain}");
+    let writer = insert_later("whatsapp_personal:chat1:w2");
+    let flagged = common::tool_text(&s.call_tool(
+        "inbox_wait",
+        json!({"timeout_seconds": 3, "include_personal": true}),
+    ));
+    writer.join().expect("writer");
+    assert!(flagged.contains("PRIVATE arrival"), "{flagged}");
+}
+
+#[tokio::test]
+async fn text_sends_are_paced_by_a_token_bucket_and_the_refusal_is_audited() {
+    let env = TestEnv::new();
+    env.preseed_session("whatsapp");
+    let _daemon = env.start_with(&[
+        ("META_MCP_PERSONAL_SEND_INTERVAL_MS", "60000"),
+        ("META_MCP_PERSONAL_SEND_BURST", "2"),
+    ]);
+    let client = env.connect().await;
+    wait_status(&client, "connected", LONG, |st| {
+        st["platforms"]["whatsapp"]["connection"] == "connected"
+    })
+    .await;
+    let send = |thread: &str| json!({"platform": "whatsapp", "thread_id": thread, "text": "hi"});
+    ok(&client, "send_text", send("a@s.whatsapp.net")).await;
+    ok(&client, "send_text", send("b@s.whatsapp.net")).await;
+    let paced = err(&client, "send_text", send("c@s.whatsapp.net")).await;
+    assert_eq!(paced.code, "rate_limited", "{paced}");
+    let wait_ms: u64 = paced
+        .message
+        .split("retry_after_ms=")
+        .nth(1)
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no retry_after_ms in {paced}"));
+    assert!((50_000..=60_000).contains(&wait_ms), "{wait_ms}");
+    assert_eq!(env.request_count("whatsapp", "send_text"), 2);
+    let lines = env.audit_lines();
+    let last = lines.last().expect("audit line");
+    assert_eq!(last["outcome"], "refused");
+    assert_eq!(last["error_code"], "rate_limited");
+    let attempts = lines.iter().filter(|l| l["outcome"] == "attempt").count();
+    assert_eq!(attempts, 2, "the refused send wrote no attempt line");
+    let media = err(
+        &client,
+        "send_media",
+        json!({"platform": "whatsapp", "thread_id": "c", "path": "x.png"}),
+    )
+    .await;
+    assert_eq!(
+        media.code, "no_files_dir",
+        "a config error takes no token: {media}"
+    );
+}
+
+#[tokio::test]
+async fn reactions_read_marks_and_typing_share_a_looser_separate_bucket() {
+    let env = TestEnv::new();
+    env.preseed_session("whatsapp");
+    let _daemon = env.start_with(&[
+        ("META_MCP_PERSONAL_SEND_INTERVAL_MS", "60000"),
+        ("META_MCP_PERSONAL_SEND_BURST", "1"),
+    ]);
+    let client = env.connect().await;
+    wait_status(&client, "connected", LONG, |st| {
+        st["platforms"]["whatsapp"]["connection"] == "connected"
+    })
+    .await;
+    ok(
+        &client,
+        "send_text",
+        json!({"platform": "whatsapp", "thread_id": "a", "text": "hi"}),
+    )
+    .await;
+    assert_eq!(
+        err(
+            &client,
+            "send_text",
+            json!({"platform": "whatsapp", "thread_id": "a", "text": "hi"})
+        )
+        .await
+        .code,
+        "rate_limited"
+    );
+    let mut passed = 0;
+    let mut limited = None;
+    for _ in 0..8 {
+        let reply = call(
+            &client,
+            "mark_read",
+            json!({"platform": "whatsapp", "thread_id": "a"}),
+        )
+        .await;
+        match reply {
+            Ok(_) => passed += 1,
+            Err(e) => {
+                limited = Some(e);
+                break;
+            }
+        }
+    }
+    assert_eq!(passed, 5, "burst of five");
+    assert_eq!(limited.expect("the sixth is paced").code, "rate_limited");
+    let reaction = call(
+        &client,
+        "send_reaction",
+        json!({"platform": "whatsapp", "thread_id": "a", "message_id": "m1", "emoji": "\u{1F44D}"}),
+    )
+    .await;
+    assert_eq!(
+        reaction.expect_err("shares the light bucket").code,
+        "rate_limited"
+    );
+}
+
+#[tokio::test]
+async fn writes_are_refused_once_sigterm_arrived() {
+    let env = TestEnv::new();
+    let (daemon, client) = env.start_logged_in("messenger").await;
+    env.knob("messenger", "send_slow", true);
+    let slow = {
+        let c = env.connect().await;
+        tokio::spawn(async move {
+            c.request(
+                "send_text",
+                json!({"platform": "messenger", "thread_id": "t1", "text": "in flight"}),
+                REQUEST_TIMEOUT,
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-TERM", &daemon.pid().to_string()])
+            .status()
+            .expect("kill")
+            .success()
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let refused = err(
+        &client,
+        "send_text",
+        json!({"platform": "messenger", "thread_id": "t1", "text": "too late"}),
+    )
+    .await;
+    assert_eq!(refused.code, "shutting_down", "{refused}");
+    slow.await
+        .expect("join")
+        .expect("the in-flight send still completes");
+    let outcomes: Vec<String> = env
+        .audit_lines()
+        .iter()
+        .map(|l| l["outcome"].as_str().unwrap_or("?").to_owned())
+        .collect();
+    assert_eq!(outcomes, ["attempt", "refused", "sent"]);
+}
+
+#[tokio::test]
+async fn a_fatal_with_action_none_or_relogin_stops_the_reconnect_loop_until_restart() {
+    for action in ["none", "relogin"] {
+        let env = TestEnv::new();
+        let (_daemon, client) = env.start_logged_in("messenger").await;
+        assert_eq!(env.request_count("messenger", "hello"), 1);
+        env.emit(
+            "messenger",
+            &format!(
+                r#"{{"event":"connection","data":{{"state":"fatal","reason":"permanent_error","action":"{action}"}}}}"#
+            ),
+        );
+        let st = wait_status(&client, "fatal shown", LONG, |st| {
+            st["platforms"]["messenger"]["connection"] == "fatal"
+        })
+        .await;
+        assert_eq!(st["platforms"]["messenger"]["reason"], "permanent_error");
+        assert_eq!(st["platforms"]["messenger"]["reconnect_halted"], true);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(
+            env.request_count("messenger", "hello"),
+            1,
+            "{action}: the daemon restarted a sidecar that asked not to be"
+        );
+        let st = ok(&client, "status", Value::Null).await;
+        assert!(st["platforms"]["messenger"]["reconnect_in_s"].is_null());
+
+        // The sidecar exiting afterwards must not start the loop either.
+        env.kill_sidecar("messenger");
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(
+            env.request_count("messenger", "hello"),
+            1,
+            "{action}: halted"
+        );
+
+        ok(&client, "restart", json!({"platform": "messenger"})).await;
+        wait_status(&client, "connected again", LONG, |st| {
+            st["platforms"]["messenger"]["connection"] == "connected"
+                && st["platforms"]["messenger"]["reconnect_halted"] == false
+        })
+        .await;
+        assert_eq!(env.request_count("messenger", "hello"), 2);
+    }
+}
+
+#[tokio::test]
+async fn a_fatal_with_action_wait_reconnects_no_sooner_than_five_minutes() {
+    let env = TestEnv::new();
+    let (_daemon, client) = env.start_logged_in("messenger").await;
+    env.emit(
+        "messenger",
+        r#"{"event":"connection","data":{"state":"fatal","reason":"rate_limited_by_service","action":"wait"}}"#,
+    );
+    let st = wait_status(&client, "wait scheduled", LONG, |st| {
+        !st["platforms"]["messenger"]["reconnect_in_s"].is_null()
+    })
+    .await;
+    let secs = st["platforms"]["messenger"]["reconnect_in_s"]
+        .as_i64()
+        .expect("seconds");
+    assert!((295..=300).contains(&secs), "{secs}");
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(env.request_count("messenger", "hello"), 1);
+}
+
+#[tokio::test]
+async fn a_crash_loop_escalates_the_backoff_but_a_stable_connection_resets_it() {
+    // Flapping: each connection dies right away, so the delays keep growing.
+    let env = TestEnv::new();
+    env.preseed_session("messenger");
+    let _daemon = env.start_with(&[("META_MCP_PERSONAL_BACKOFF_MS", "300,1500,6000")]);
+    let client = env.connect().await;
+    wait_status(&client, "connected", LONG, |st| {
+        st["platforms"]["messenger"]["connection"] == "connected"
+    })
+    .await;
+    let mut gaps = Vec::new();
+    for round in 0..3 {
+        let t0 = std::time::Instant::now();
+        env.kill_sidecar("messenger");
+        wait_until("next hello", LONG, || {
+            env.request_count("messenger", "hello") >= round + 2
+        })
+        .await;
+        gaps.push(t0.elapsed());
+        wait_status(&client, "connected again", LONG, |st| {
+            st["platforms"]["messenger"]["connection"] == "connected"
+        })
+        .await;
+    }
+    assert!(
+        gaps[1] > Duration::from_millis(1200),
+        "no escalation: {gaps:?}"
+    );
+    assert!(gaps[2] > gaps[1], "no escalation: {gaps:?}");
+
+    // Stable: the connection outlives META_MCP_PERSONAL_STABLE_MS, so every delay starts over.
+    let env = TestEnv::new();
+    env.preseed_session("messenger");
+    let _daemon = env.start_with(&[
+        ("META_MCP_PERSONAL_BACKOFF_MS", "300,4000"),
+        ("META_MCP_PERSONAL_STABLE_MS", "400"),
+    ]);
+    let client = env.connect().await;
+    wait_status(&client, "connected", LONG, |st| {
+        st["platforms"]["messenger"]["connection"] == "connected"
+    })
+    .await;
+    for round in 0..3 {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let t0 = std::time::Instant::now();
+        env.kill_sidecar("messenger");
+        wait_until("next hello", LONG, || {
+            env.request_count("messenger", "hello") >= round + 2
+        })
+        .await;
+        assert!(
+            t0.elapsed() < Duration::from_millis(3000),
+            "round {round}: {:?}",
+            t0.elapsed()
+        );
+        wait_status(&client, "connected again", LONG, |st| {
+            st["platforms"]["messenger"]["connection"] == "connected"
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn an_absurd_backoff_value_is_clamped_instead_of_panicking() {
+    let env = TestEnv::new();
+    env.preseed_session("messenger");
+    let _daemon = env.start_with(&[("META_MCP_PERSONAL_BACKOFF_MS", "18446744073709551615")]);
+    let client = env.connect().await;
+    wait_status(&client, "connected", LONG, |st| {
+        st["platforms"]["messenger"]["connection"] == "connected"
+    })
+    .await;
+    env.kill_sidecar("messenger");
+    let st = wait_status(&client, "reconnect scheduled", LONG, |st| {
+        !st["platforms"]["messenger"]["reconnect_in_s"].is_null()
+    })
+    .await;
+    assert!(
+        st["platforms"]["messenger"]["reconnect_in_s"]
+            .as_i64()
+            .expect("secs")
+            <= 86_400
+    );
+    assert!(!env.daemon_log().contains("panicked"));
+}
+
+#[tokio::test]
+async fn a_frozen_sidecar_is_pinged_killed_and_respawned() {
+    let env = TestEnv::new();
+    env.preseed_session("messenger");
+    let _daemon = env.start_with(&[
+        ("META_MCP_PERSONAL_PING_MS", "300"),
+        ("META_MCP_PERSONAL_PING_TIMEOUT_MS", "300"),
+        ("META_MCP_PERSONAL_BACKOFF_MS", "200"),
+    ]);
+    let client = env.connect().await;
+    wait_status(&client, "connected", LONG, |st| {
+        st["platforms"]["messenger"]["connection"] == "connected"
+    })
+    .await;
+    wait_until("a first ping", LONG, || {
+        env.request_count("messenger", "ping") >= 1
+    })
+    .await;
+    let pid = env.sidecar_pid("messenger").expect("pid");
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-STOP", &pid.to_string()])
+            .status()
+            .expect("stop")
+            .success()
+    );
+    let pending = {
+        let c = env.connect().await;
+        tokio::spawn(async move {
+            c.request(
+                "list_threads",
+                json!({"platform": "messenger"}),
+                Duration::from_secs(60),
+            )
+            .await
+        })
+    };
+    wait_until("a second hello", LONG, || {
+        env.request_count("messenger", "hello") >= 2
+    })
+    .await;
+    let failed = pending
+        .await
+        .expect("join")
+        .expect_err("the request on the frozen sidecar fails");
+    assert_eq!(failed.code, "sidecar_unavailable", "{failed}");
+    wait_status(&client, "connected again", LONG, |st| {
+        st["platforms"]["messenger"]["connection"] == "connected"
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_healthy_sidecar_is_pinged_without_being_restarted() {
+    let env = TestEnv::new();
+    env.preseed_session("messenger");
+    let _daemon = env.start_with(&[
+        ("META_MCP_PERSONAL_PING_MS", "200"),
+        ("META_MCP_PERSONAL_PING_TIMEOUT_MS", "5000"),
+    ]);
+    let client = env.connect().await;
+    wait_status(&client, "connected", LONG, |st| {
+        st["platforms"]["messenger"]["connection"] == "connected"
+    })
+    .await;
+    wait_until("several pings", LONG, || {
+        env.request_count("messenger", "ping") >= 4
+    })
+    .await;
+    assert_eq!(env.request_count("messenger", "hello"), 1);
+}
+
+#[tokio::test]
+async fn the_cookies_json_flag_is_gone_so_cookies_never_reach_argv() {
+    let env = TestEnv::new();
+    let help = env
+        .cli(&["personal", "login", "messenger", "--help"], "")
+        .await;
+    assert_eq!(help.code, 0, "{help:?}");
+    assert!(help.stdout.contains("--cookies-file"), "{help:?}");
+    assert!(!help.stdout.contains("cookies-json"), "{help:?}");
+    let run = env
+        .cli(
+            &[
+                "personal",
+                "login",
+                "messenger",
+                "--cookies-json",
+                "{\"xs\":\"SECRET-NEVER-ARGV\"}",
+            ],
+            "",
+        )
+        .await;
+    assert_eq!(run.code, 2, "{run:?}");
+    assert!(!run.stdout.contains("Logged in"), "{run:?}");
+}
+
+/// Runs the daemon as systemd would start it, with fd 3 set up by `fd3` (a sh redirection).
+fn daemon_with_fd3(env: &TestEnv, fd3: &str) -> CliRun {
+    let script = format!(
+        "export LISTEN_PID=$$ LISTEN_FDS=1; exec \"$0\" personal daemon --socket \"$1\" {fd3}"
+    );
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.args(["-c", &script, common::BIN])
+        .arg(env.socket())
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("META_MCP_HOME", env.home())
+        .env("META_MCP_INBOX_DB", env.inbox_db())
+        .env("META_MCP_SIDECAR_DIR", env.sidecar_dir());
+    run_command(cmd, "")
+}
+
+#[test]
+fn a_systemd_fd_that_is_not_a_socket_is_refused_cleanly() {
+    let env = TestEnv::new();
+    for (what, fd3) in [
+        ("a regular file", "3</dev/null"),
+        ("a pipe", "3<&0"),
+        ("a closed descriptor", "3<&-"),
+    ] {
+        let run = daemon_with_fd3(&env, fd3);
+        assert_eq!(run.code, 1, "{what}: {run:?}");
+        assert!(run.stderr.contains("fd 3"), "{what}: {run:?}");
+        assert!(!run.stderr.contains("IO Safety"), "{what}: {run:?}");
+        assert!(!env.socket().exists(), "{what}: nothing was bound");
+    }
+}
+
+const ACTIVATE: &str = r#"
+import os, socket, sys
+path, binary = sys.argv[1], sys.argv[2]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+if len(sys.argv) < 4:
+    s.bind(path)
+    s.listen(16)
+if s.fileno() != 3:
+    os.dup2(s.fileno(), 3, inheritable=True)
+else:
+    os.set_inheritable(3, True)
+os.environ["LISTEN_FDS"] = "1"
+os.environ["LISTEN_PID"] = str(os.getpid())
+os.execv(binary, [binary, "personal", "daemon"])
+"#;
+
+#[tokio::test]
+async fn a_socket_passed_by_systemd_on_fd_3_is_served() {
+    let env = TestEnv::new();
+    let script = env.root().join("activate.py");
+    std::fs::write(&script, ACTIVATE).expect("script");
+    let mut cmd = std::process::Command::new("python3");
+    cmd.arg("-I")
+        .arg(&script)
+        .arg(env.socket())
+        .arg(common::BIN)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("META_MCP_HOME", env.home())
+        .env("META_MCP_INBOX_DB", env.inbox_db())
+        .env("META_MCP_SIDECAR_DIR", env.sidecar_dir())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = cmd.spawn().expect("spawn");
+    wait_until("the activation socket", LONG, || {
+        std::os::unix::net::UnixStream::connect(env.socket()).is_ok()
+    })
+    .await;
+    let client = env.connect().await;
+    let st = ok(&client, "status", Value::Null).await;
+    assert_eq!(st["daemon"]["pid"], child.id());
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn a_systemd_socket_that_cannot_accept_ends_the_daemon_instead_of_spinning() {
+    let env = TestEnv::new();
+    let script = env.root().join("activate.py");
+    std::fs::write(&script, ACTIVATE).expect("script");
+    let mut cmd = std::process::Command::new("python3");
+    cmd.arg("-I")
+        .arg(&script)
+        .arg(env.socket())
+        .arg(common::BIN)
+        .arg("nolisten")
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("META_MCP_HOME", env.home())
+        .env("META_MCP_INBOX_DB", env.inbox_db())
+        .env("META_MCP_SIDECAR_DIR", env.sidecar_dir());
+    let run = run_command(cmd, "");
+    assert_eq!(run.code, 1, "{run:?}");
+    assert!(
+        run.stderr.contains("listening socket is unusable"),
+        "{run:?}"
+    );
+}
+
+fn rss_kib(pid: u32) -> u64 {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .expect("status")
+        .lines()
+        .find_map(|l| l.strip_prefix("VmRSS:"))
+        .and_then(|v| v.split_whitespace().next()?.parse().ok())
+        .expect("VmRSS")
+}
+
+#[tokio::test]
+async fn a_client_that_never_reads_is_cut_off_without_growing_the_daemon() {
+    use std::io::Write;
+    let env = TestEnv::new();
+    let (daemon, client) = env.start_logged_in("messenger").await;
+    let before = rss_kib(daemon.pid());
+    let mut raw = std::os::unix::net::UnixStream::connect(env.socket()).expect("connect");
+    let mut sent = 0u64;
+    let mut cut_off = false;
+    for id in 1..=100_000u64 {
+        if raw
+            .write_all(format!("{{\"id\":{id},\"op\":\"status\"}}\n").as_bytes())
+            .is_err()
+        {
+            cut_off = true;
+            break;
+        }
+        sent += 1;
+    }
+    assert!(
+        cut_off,
+        "the daemon kept a non-reading client after {sent} requests"
+    );
+    let grown = rss_kib(daemon.pid()).saturating_sub(before);
+    assert!(grown < 30 * 1024, "the daemon grew by {grown} KiB");
+    let started = std::time::Instant::now();
+    ok(&client, "status", Value::Null).await;
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[tokio::test]
+async fn a_subscriber_that_falls_behind_the_byte_capped_ring_is_told_and_dropped() {
+    use std::io::{BufRead, BufReader, Write};
+    let env = TestEnv::new();
+    let (_daemon, client) = env.start_logged_in("messenger").await;
+    let mut raw = std::os::unix::net::UnixStream::connect(env.socket()).expect("connect");
+    raw.set_read_timeout(Some(Duration::from_secs(20)))
+        .expect("timeout");
+    raw.write_all(b"{\"id\":1,\"op\":\"subscribe\"}\n")
+        .expect("subscribe");
+    let mut reader = BufReader::new(raw.try_clone().expect("clone"));
+    let mut first = String::new();
+    reader.read_line(&mut first).expect("subscribe reply");
+    assert!(first.contains("\"ok\":true"), "{first}");
+
+    let chunk = "a".repeat(1024 * 1024);
+    let total = 24;
+    for i in 0..total {
+        env.emit(
+            "messenger",
+            &json!({"event": "error", "data": {"code": format!("big{i}"), "message": chunk}})
+                .to_string(),
+        );
+    }
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    ok(&client, "status", Value::Null).await;
+
+    let (mut frames, mut lagged) = (0, false);
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                if line.contains("lagged: resubscribe") {
+                    lagged = true;
+                    break;
+                }
+                frames += 1;
+            }
+        }
+    }
+    assert!(lagged, "no lagged notice after {frames} frames");
+    assert!(
+        frames < total,
+        "the stalled subscriber got every event ({frames})"
+    );
+}
+
+#[tokio::test]
+async fn logged_out_keeps_the_state_when_the_owner_must_resolve_the_account() {
+    for reason in [
+        "checkpoint_required",
+        "challenge_required",
+        "consent_required",
+        "account_suspended",
+    ] {
+        let env = TestEnv::new();
+        let (_daemon, client) = env.start_logged_in("messenger").await;
+        env.emit(
+            "messenger",
+            &format!(
+                r#"{{"event":"logged_out","data":{{"reason":"{reason}","url":"https://www.facebook.com/checkpoint/1/"}}}}"#
+            ),
+        );
+        let st = wait_status(&client, "logged out", LONG, |st| {
+            st["platforms"]["messenger"]["logged_in"] == false
+        })
+        .await;
+        let m = &st["platforms"]["messenger"];
+        assert_eq!(m["reason"], reason);
+        assert_eq!(m["reason_url"], "https://www.facebook.com/checkpoint/1/");
+        assert!(
+            env.state_path("messenger").is_file(),
+            "{reason}: the state was deleted"
+        );
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(
+            env.request_count("messenger", "hello"),
+            1,
+            "{reason}: no reconnect"
+        );
+        let run = env.cli(&["personal", "status"], "").await;
+        assert!(
+            run.stdout
+                .contains("https://www.facebook.com/checkpoint/1/")
+                && run.stdout.contains(reason),
+            "{run:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn logged_out_drops_the_state_for_reasons_that_end_the_session() {
+    for reason in [
+        "device_removed",
+        "token_invalidated",
+        "banned",
+        "logged_out_by_user",
+    ] {
+        let env = TestEnv::new();
+        let (_daemon, client) = env.start_logged_in("whatsapp").await;
+        env.emit(
+            "whatsapp",
+            &format!(r#"{{"event":"logged_out","data":{{"reason":"{reason}"}}}}"#),
+        );
+        wait_status(&client, "logged out", LONG, |st| {
+            st["platforms"]["whatsapp"]["logged_in"] == false
+        })
+        .await;
+        wait_until("state deleted", LONG, || {
+            !env.state_path("whatsapp").exists()
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn an_unknown_logged_out_reason_follows_the_sidecars_state_updated() {
+    let env = TestEnv::new();
+    let (_daemon, client) = env.start_logged_in("messenger").await;
+    env.emit(
+        "messenger",
+        r#"{"event":"logged_out","data":{"reason":"something_new","url":"javascript:alert(1)"}}"#,
+    );
+    let st = wait_status(&client, "logged out", LONG, |st| {
+        st["platforms"]["messenger"]["logged_in"] == false
+    })
+    .await;
+    assert!(
+        st["platforms"]["messenger"]["reason_url"].is_null(),
+        "only http(s) urls are kept"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        env.state_path("messenger").is_file(),
+        "no null state, no delete"
+    );
+    env.emit(
+        "messenger",
+        r#"{"event":"state_updated","data":{"state":null}}"#,
+    );
+    wait_until("state deleted by the sidecar", LONG, || {
+        !env.state_path("messenger").exists()
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn cli_login_whatsapp_says_so_when_no_qr_code_was_ever_shown() {
+    for event in [
+        r#"{"event":"connection","data":{"state":"disconnected","reason":"qr_timeout","action":"retry"}}"#,
+        r#"{"event":"connection","data":{"state":"fatal","reason":"network_down"}}"#,
+    ] {
+        let env = TestEnv::new();
+        env.knob("whatsapp", "qr_only", true);
+        env.knob("whatsapp", "no_qr", true);
+        let _daemon = env.start();
+        let cmd = env.cli_command(&["personal", "login", "whatsapp"]);
+        let running = tokio::task::spawn_blocking(move || run_command(cmd, ""));
+        wait_until("login_start", LONG, || {
+            env.request_count("whatsapp", "login_start") == 1
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        env.emit("whatsapp", event);
+        let run = running.await.expect("join");
+        assert_eq!(run.code, 1, "{run:?}");
+        assert!(
+            run.stderr.contains(
+                "no QR code was shown: the sidecar could not reach WhatsApp; check the network and run the command again"
+            ),
+            "{run:?}"
+        );
+        assert!(!run.stderr.contains("QR codes expired"), "{run:?}");
+    }
+}
+
+#[tokio::test]
+async fn inline_pictures_come_from_the_daemons_files_path_not_the_sidecars_report() {
+    let env = TestEnv::with_files();
+    let (_daemon, _client) = env.start_logged_in("messenger").await;
+    let real = common::png_image();
+    std::fs::write(env.fake_dir().join("messenger.download_src"), &real).expect("png source");
+    let mut decoy = real.clone();
+    decoy.extend_from_slice(b"decoy-trailer");
+    let decoy_path = env.files_dir().join("decoy.png");
+    std::fs::write(&decoy_path, &decoy).expect("decoy");
+    std::fs::write(
+        env.fake_dir().join("messenger.download_path"),
+        decoy_path.to_str().expect("utf8"),
+    )
+    .expect("lie");
+    let (socket, files) = (env.socket(), env.files_dir());
+    let picture = common::blocking(move || {
+        let home = common::TempHome::new();
+        let mut s = common::Session::start(
+            &home,
+            OFFLINE,
+            &[
+                ("META_MCP_PERSONAL_SOCKET", socket.to_str().expect("utf8")),
+                ("META_MCP_FILES_DIR", files.to_str().expect("utf8")),
+            ],
+        );
+        s.call_tool(
+            "messenger_personal_download_attachment",
+            json!({"thread_id": "t1", "message_id": "m1", "attachment_id": "a1", "inline": true}),
+        )
+    })
+    .await;
+    let content = picture["result"]["content"].as_array().expect("content");
+    assert_eq!(content.len(), 2, "{picture}");
+    let data = content[1]["data"].as_str().expect("image data");
+    let bytes =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data).expect("base64");
+    assert_eq!(bytes, real, "the sidecar-reported path was read instead");
+}
+
+/// Splits the dry-run output into the two unit texts.
+fn dry_run_units(stdout: &str) -> (String, String) {
+    let section = |name: &str| -> String {
+        let start = stdout
+            .find(&format!("/{name}\n"))
+            .unwrap_or_else(|| panic!("{name} in {stdout}"));
+        let body = &stdout[start..];
+        let body = &body[body.find('\n').expect("header") + 1..];
+        let end = body.find("\n# ").unwrap_or(body.len());
+        body[..end].to_owned()
+    };
+    (
+        section("meta-mcp-personal.socket"),
+        section("meta-mcp-personal.service"),
+    )
+}
+
+#[tokio::test]
+async fn the_generated_units_pass_systemd_analyze_verify_when_it_is_available() {
+    if std::process::Command::new("systemd-analyze")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("systemd-analyze is not installed: skipping the real verification");
+        return;
+    }
+    let env = TestEnv::with_files();
+    let run = env.cli(&["personal", "install", "--dry-run"], "").await;
+    assert_eq!(run.code, 0, "{run:?}");
+    let (socket, service) = dry_run_units(&run.stdout);
+    let dir = env.root().join("units");
+    std::fs::create_dir_all(&dir).expect("units dir");
+    let socket_path = dir.join("meta-mcp-personal.socket");
+    let service_path = dir.join("meta-mcp-personal.service");
+    std::fs::write(&socket_path, socket).expect("socket unit");
+    std::fs::write(&service_path, service).expect("service unit");
+    let out = std::process::Command::new("systemd-analyze")
+        .args(["verify", "--user"])
+        .arg(&socket_path)
+        .arg(&service_path)
+        .output()
+        .expect("systemd-analyze");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "verify failed:\n{text}");
+    assert!(
+        !text.contains("Unknown key")
+            && !text.contains("Unknown section")
+            && !text.contains("Failed to parse"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn install_refuses_a_files_dir_that_does_not_exist() {
+    let env = TestEnv::new();
+    let mut cmd = env.cli_command(&["personal", "install"]);
+    cmd.env("META_MCP_FILES_DIR", env.root().join("no-such-files"));
+    let run = env.cli_with(cmd, "").await;
+    assert_eq!(run.code, 1, "{run:?}");
+    assert!(run.stderr.contains("does not exist"), "{run:?}");
+    assert!(!env.xdg_dir().exists(), "nothing was written");
+}
+
+#[tokio::test]
+async fn install_pins_the_default_inbox_so_the_sandbox_can_write_it() {
+    let env = TestEnv::new();
+    let mut cmd = env.cli_command(&["personal", "install", "--dry-run"]);
+    cmd.env_remove("META_MCP_INBOX_DB")
+        .env("XDG_DATA_HOME", env.root().join("data"));
+    let run = env.cli_with(cmd, "").await;
+    assert_eq!(run.code, 0, "{run:?}");
+    let inbox_dir = env.root().join("data/meta-mcp");
+    assert!(
+        run.stdout.contains(&format!(
+            "Environment=\"META_MCP_INBOX_DB={}/inbox.db\"",
+            inbox_dir.display()
+        )),
+        "{run:?}"
+    );
+    let rw = run
+        .stdout
+        .lines()
+        .find(|l| l.starts_with("ReadWritePaths="))
+        .expect("ReadWritePaths line");
+    assert!(rw.contains(&inbox_dir.display().to_string()), "{rw}");
+}
+
+/// The audit outcomes once the send had time to finish (or `wait` ran out), after a short settle.
+async fn audit_outcomes_after(env: &TestEnv, wait: Duration) -> Vec<String> {
+    let deadline = std::time::Instant::now() + wait;
+    while env.audit_lines().len() < 2 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    env.audit_lines()
+        .iter()
+        .map(|l| l["outcome"].as_str().unwrap_or("?").to_owned())
+        .collect()
+}
+
+const SEND_LINE: &[u8] =
+    b"{\"id\":1,\"op\":\"send_text\",\"params\":{\"platform\":\"messenger\",\"thread_id\":\"t1\",\"text\":\"bye\"}}\n";
+
+#[tokio::test]
+async fn a_client_dropped_mid_send_leaves_attempt_then_sent_in_the_audit() {
+    let env = TestEnv::new();
+    let (_daemon, _c) = env.start_logged_in("messenger").await;
+    env.knob("messenger", "send_slow", true);
+    let leaving = Arc::new(env.connect().await);
+    let task = {
+        let c = Arc::clone(&leaving);
+        tokio::spawn(async move {
+            let _ = c
+                .request(
+                    "send_text",
+                    json!({"platform": "messenger", "thread_id": "t1", "text": "bye"}),
+                    Duration::from_secs(20),
+                )
+                .await;
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    task.abort();
+    drop(leaving);
+    assert_eq!(
+        audit_outcomes_after(&env, Duration::from_secs(6)).await,
+        ["attempt", "sent"]
+    );
+    assert_eq!(env.request_count("messenger", "send_text"), 1);
+}
+
+#[tokio::test]
+async fn a_raw_close_or_half_close_mid_send_keeps_the_audit_whole() {
+    use std::io::Write;
+    for how in [std::net::Shutdown::Both, std::net::Shutdown::Write] {
+        let env = TestEnv::new();
+        let (_daemon, _c) = env.start_logged_in("messenger").await;
+        env.knob("messenger", "send_slow", true);
+        let mut raw = std::os::unix::net::UnixStream::connect(env.socket()).expect("connect");
+        raw.write_all(SEND_LINE).expect("send");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        raw.shutdown(how).ok();
+        assert_eq!(
+            audit_outcomes_after(&env, Duration::from_secs(6)).await,
+            ["attempt", "sent"],
+            "{how:?}"
+        );
+        drop(raw);
+    }
+}
+
+#[tokio::test]
+async fn crash_leftovers_in_the_outbox_are_swept_when_the_sidecar_starts() {
+    let env = TestEnv::new();
+    let outbox = env.personal_dir().join("messenger/data/outbox");
+    std::fs::create_dir_all(&outbox).expect("outbox");
+    std::fs::write(outbox.join("deadbeefdeadbeef.pdf"), "leftover").expect("leftover");
+    let (_daemon, _client) = env.start_logged_in("messenger").await;
+    let left: Vec<_> = std::fs::read_dir(&outbox)
+        .expect("dir")
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[tokio::test]
+async fn the_attempt_line_is_fsynced_before_the_send_reaches_the_sidecar() {
+    let tracer = std::process::Command::new("strace").arg("-V").output();
+    if tracer.is_err() {
+        eprintln!("strace is not installed: skipping the fsync ordering check");
+        return;
+    }
+    let env = TestEnv::new();
+    env.preseed_session("messenger");
+    let strace_log = env.root().join("strace.log");
+    let mut child = std::process::Command::new("strace")
+        .args(["-f", "-e", "trace=write,fsync,fdatasync", "-s", "300", "-o"])
+        .arg(&strace_log)
+        .arg(common::BIN)
+        .args(["personal", "daemon", "--socket"])
+        .arg(env.socket())
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("META_MCP_HOME", env.home())
+        .env("META_MCP_INBOX_DB", env.inbox_db())
+        .env("META_MCP_SIDECAR_DIR", env.sidecar_dir())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("strace daemon");
+    let started = std::time::Instant::now();
+    while std::os::unix::net::UnixStream::connect(env.socket()).is_err() {
+        if started.elapsed() > Duration::from_secs(10) || child.try_wait().expect("wait").is_some()
+        {
+            eprintln!("strace could not trace the daemon here: skipping");
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let client = env.connect().await;
+    wait_status(&client, "connected", LONG, |st| {
+        st["platforms"]["messenger"]["connection"] == "connected"
+    })
+    .await;
+    ok(
+        &client,
+        "send_text",
+        json!({"platform": "messenger", "thread_id": "t1", "text": "hello strace"}),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let _ = child.kill();
+    let _ = child.wait();
+    let log = std::fs::read_to_string(&strace_log).expect("strace log");
+    let lines: Vec<&str> = log.lines().collect();
+    let has = |l: &str, key: &str, val: &str| {
+        l.contains(&format!("\"{key}\":\"{val}\""))
+            || l.contains(&format!("\\\"{key}\\\":\\\"{val}\\\""))
+    };
+    let sent_to_sidecar = lines
+        .iter()
+        .position(|l| has(l, "op", "send_text"))
+        .expect("the send_text write to the sidecar pipe");
+    let attempt = lines
+        .iter()
+        .position(|l| has(l, "outcome", "attempt"))
+        .expect("the attempt audit write");
+    let fsync = lines
+        .iter()
+        .enumerate()
+        .skip(attempt)
+        .find(|(_, l)| l.contains("fsync(") || l.contains("fdatasync("))
+        .map(|(i, _)| i)
+        .expect("an fsync after the attempt write");
+    assert!(
+        attempt < fsync && fsync < sent_to_sidecar,
+        "attempt write {attempt}, fsync {fsync}, sidecar write {sent_to_sidecar}"
+    );
 }

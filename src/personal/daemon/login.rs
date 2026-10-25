@@ -14,6 +14,7 @@ const LOGIN_START_TIMEOUT: Duration = Duration::from_secs(60);
 const LOGIN_FINISH_TIMEOUT: Duration = Duration::from_secs(120);
 const LOGIN_CANCEL_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGOUT_TIMEOUT: Duration = Duration::from_secs(60);
+const LOGOUT_STOP: Duration = Duration::from_secs(15);
 
 impl Daemon {
     /// Spawns the sidecar when absent (hello without state), allows state writes, proxies.
@@ -33,7 +34,9 @@ impl Daemon {
             let _life = rt.lifecycle.lock().await;
             {
                 let _io = rt.state_io.lock().await;
-                rt.inner().accept_state = true;
+                let mut g = rt.inner();
+                g.accept_state = true;
+                g.halted = false;
             }
             match rt.current() {
                 Some((sc, _)) => sc,
@@ -88,7 +91,8 @@ impl Daemon {
         }
     }
 
-    /// Asks the sidecar to log out, then always clears state, flags and the ring.
+    /// Logs out remotely (starting a sidecar for it when a stored session exists), stops the
+    /// sidecar, then always clears the state file and wipes the sidecar's data folder.
     pub(super) async fn logout(self: &Arc<Self>, rt: &Arc<PlatformRt>) -> Result<Value, OpError> {
         self.stop_reconnect(rt);
         {
@@ -98,25 +102,44 @@ impl Daemon {
             g.want_online = false;
         }
         let _life = rt.lifecycle.lock().await;
-        let remote = match rt.current() {
-            Some((sc, _)) => sc
+        let mut remote_error: Option<OpError> = None;
+        let mut sidecar = rt.current().map(|(sc, _)| sc);
+        if sidecar.is_none()
+            && let Some(state) = rt.store.load()
+        {
+            match self.start_sidecar_with(rt, Some(state), false).await {
+                Ok(_) => sidecar = rt.current().map(|(sc, _)| sc),
+                Err(e) => remote_error = Some(e.error),
+            }
+            rt.inner().want_online = false;
+        }
+        if let Some(sc) = sidecar
+            && let Err(e) = sc
                 .link()
                 .request_with_timeout("logout", Value::Null, LOGOUT_TIMEOUT)
                 .await
-                .err()
-                .map(OpError::from),
-            None => None,
-        };
-        self.flush_events(rt).await;
+        {
+            remote_error = Some(OpError::from(e));
+        }
+        self.stop_sidecar_locked(rt, LOGOUT_STOP).await;
         let cleared = self.mark_logged_out(rt, Some("logout".to_owned())).await;
+        let store = rt.store.clone();
+        let wiped = matches!(
+            tokio::task::spawn_blocking(move || store.wipe_data()).await,
+            Ok(Ok(()))
+        );
         {
             let mut g = rt.inner();
             g.sending_blocked = false;
             g.blocked_reason = None;
+            if !wiped {
+                tracing::error!(platform = rt.platform.as_str(), "data wipe failed");
+                g.last_error = Some("data_wipe_failed".to_owned());
+            }
         }
-        let mut out = json!({"state_cleared": cleared});
-        if let Some(e) = remote {
-            out["remote_error"] = json!({"code": e.code, "message": e.message});
+        let mut out = json!({"state_cleared": cleared, "data_wiped": wiped});
+        if let Some(e) = remote_error {
+            out["remote_error"] = json!(format!("{}: {}", e.code, e.message));
         }
         Ok(out)
     }

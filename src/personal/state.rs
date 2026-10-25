@@ -104,6 +104,29 @@ impl StateStore {
         sync_dir(&self.dir)
     }
 
+    /// Empties the sidecar's `data/` folder (databases, thread cache, locks, outbox) and keeps the folder.
+    pub fn wipe_data(&self) -> io::Result<()> {
+        let entries = match std::fs::read_dir(self.data_dir()) {
+            Ok(e) => e,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let mut first_error = None;
+        for entry in entries {
+            let result = entry.and_then(|e| {
+                if e.file_type()?.is_dir() {
+                    std::fs::remove_dir_all(e.path())
+                } else {
+                    std::fs::remove_file(e.path())
+                }
+            });
+            if let Err(e) = result {
+                first_error.get_or_insert(e);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
     /// Removes the state file and its leftovers (temp and damaged copies); missing ones are fine.
     pub fn delete(&self) -> io::Result<()> {
         for name in [STATE_FILE, TMP_FILE, CORRUPT_FILE] {
@@ -193,6 +216,24 @@ mod tests {
         assert!(store.dir().join(CORRUPT_FILE).exists());
         store.delete().expect("delete");
         assert!(!store.dir().join(CORRUPT_FILE).exists());
+    }
+
+    #[test]
+    fn wipe_data_empties_the_folder_but_keeps_it() {
+        let (_home, store) = store();
+        store.wipe_data().expect("nothing to wipe");
+        store.ensure_dirs().expect("dirs");
+        let data = store.data_dir();
+        std::fs::write(data.join("session.db"), b"keys").expect("db");
+        std::fs::create_dir_all(data.join("outbox/sub")).expect("outbox");
+        std::fs::write(data.join("outbox/sub/f.bin"), b"x").expect("file");
+        std::os::unix::fs::symlink("/etc/passwd", data.join("link")).expect("link");
+        store.save(&json!({"v": 1})).expect("save");
+        store.wipe_data().expect("wipe");
+        assert!(data.is_dir());
+        assert_eq!(std::fs::read_dir(&data).expect("dir").count(), 0);
+        assert!(store.exists(), "state.json is not part of the data folder");
+        assert!(Path::new("/etc/passwd").exists());
     }
 
     #[test]

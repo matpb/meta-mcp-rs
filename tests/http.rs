@@ -213,17 +213,46 @@ async fn accepts_with_key() {
         .expect("send");
     assert_eq!(via_header.status(), 200);
 
-    let listed = post_mcp(&s, &rpc("tools/list", 2, json!({})), Some(KEY), None, None).await;
+    assert_eq!(listed_tools(&s).await, meta_mcp::mcp::BUSINESS_TOOL_NAMES);
+}
+
+/// Sorted tool names a `tools/list` over HTTP returns.
+async fn listed_tools(s: &Server) -> Vec<String> {
+    let listed = post_mcp(s, &rpc("tools/list", 2, json!({})), Some(KEY), None, None).await;
     assert_eq!(listed.status(), 200);
     let body: Value = listed.json().await.expect("json");
-    let mut names: Vec<&str> = body["result"]["tools"]
+    let mut names: Vec<String> = body["result"]["tools"]
         .as_array()
         .unwrap_or_else(|| panic!("tools in {body}"))
         .iter()
-        .map(|t| t["name"].as_str().expect("name"))
+        .map(|t| t["name"].as_str().expect("name").to_owned())
         .collect();
     names.sort_unstable();
-    assert_eq!(names, meta_mcp::mcp::ALL_TOOL_NAMES);
+    names
+}
+
+#[tokio::test]
+async fn personal_tools_are_absent_over_http_by_default() {
+    let s = Server::with_key(&[], &[]);
+    let names = listed_tools(&s).await;
+    assert!(!names.iter().any(|n| n.contains("personal")), "{names:?}");
+    let read_only = Server::with_key(&[], &[("META_MCP_READ_ONLY", "true")]);
+    assert_eq!(
+        listed_tools(&read_only).await,
+        meta_mcp::mcp::BUSINESS_READ_ONLY_TOOL_NAMES
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn personal_tools_are_served_over_http_only_with_the_explicit_opt_in() {
+    let s = Server::with_key(&[], &[("META_MCP_PERSONAL_HTTP", "1")]);
+    assert_eq!(listed_tools(&s).await, meta_mcp::mcp::ALL_TOOL_NAMES);
+    let not_one = Server::with_key(&[], &[("META_MCP_PERSONAL_HTTP", "true")]);
+    assert_eq!(
+        listed_tools(&not_one).await,
+        meta_mcp::mcp::BUSINESS_TOOL_NAMES
+    );
 }
 
 #[tokio::test]

@@ -12,6 +12,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use super::ops::{opt_str_param, str_param};
+use super::pace::PaceClass;
 use super::platform::{PlatformRt, private_dir};
 use super::{Daemon, OpError, reply_code, sanitize_code};
 use crate::config::secret::random_hex;
@@ -20,7 +21,8 @@ use crate::messenger::media::{kind_for_mime, mime_for_name};
 use crate::personal::audit::{AuditEntry, Kind, NewEntry, Outcome};
 use crate::personal::link::LinkError;
 use crate::personal::protocol::{
-    CODE_AUDIT_FAILED, CODE_FILE_REFUSED, CODE_NO_FILES_DIR, CODE_READ_ONLY, CODE_SEND_UNKNOWN,
+    CODE_AUDIT_FAILED, CODE_FILE_REFUSED, CODE_NO_FILES_DIR, CODE_RATE_LIMITED, CODE_READ_ONLY,
+    CODE_SEND_UNKNOWN, CODE_SHUTTING_DOWN,
 };
 use crate::personal::sidecar::Sidecar;
 use crate::personal::validate;
@@ -120,9 +122,14 @@ impl<'a> Pipeline<'a> {
         OpError::bad_params(message)
     }
 
-    /// Steps 1 and 2: read-only mode, then a blocked account.
+    /// Steps 1 and 2: shutdown, read-only mode, then a blocked account.
     async fn gate(&self) -> Result<(), OpError> {
-        let refusal = if self.d.cfg.read_only {
+        let refusal = if self.d.cancel.is_cancelled() {
+            Some(OpError::new(
+                CODE_SHUTTING_DOWN,
+                "the daemon is shutting down and takes no new writes",
+            ))
+        } else if self.d.cfg.read_only {
             Some(OpError::new(
                 CODE_READ_ONLY,
                 "the daemon runs read-only (META_MCP_READ_ONLY)",
@@ -140,6 +147,25 @@ impl<'a> Pipeline<'a> {
         match Daemon::online(self.rt) {
             Ok(sc) => Ok(sc),
             Err(e) => Err(self.refused(e).await),
+        }
+    }
+
+    /// Takes a write token for this platform, or refuses with `rate_limited` and the wait.
+    async fn pace(&self, class: PaceClass) -> Result<(), OpError> {
+        match self.rt.take_token(class) {
+            Ok(()) => Ok(()),
+            Err(wait) => {
+                let ms = wait.as_millis().max(1);
+                Err(self
+                    .refused(OpError::new(
+                        CODE_RATE_LIMITED,
+                        format!(
+                            "writes to {} are paced: retry_after_ms={ms}",
+                            self.rt.platform.as_str()
+                        ),
+                    ))
+                    .await)
+            }
         }
     }
 
@@ -258,6 +284,52 @@ fn refused_file(message: impl Into<String>) -> OpError {
     OpError::new(CODE_FILE_REFUSED, message)
 }
 
+/// The path the open handle really points at, for the jail re-check after the open.
+#[cfg(target_os = "linux")]
+fn handle_path(file: &File, _resolved: &Path) -> std::io::Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+/// Without /proc: the canonical path counts only when it is still the same inode as the handle.
+#[cfg(not(target_os = "linux"))]
+fn handle_path(file: &File, resolved: &Path) -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let real = std::fs::canonicalize(resolved)?;
+    let (a, b) = (file.metadata()?, std::fs::metadata(&real)?);
+    if (a.dev(), a.ino()) == (b.dev(), b.ino()) {
+        Ok(real)
+    } else {
+        Err(std::io::Error::other("the file was replaced"))
+    }
+}
+
+/// Opens the resolved file without blocking or following a final symlink, then checks the handle
+/// itself: a regular file whose real path is inside the jail (inbound rule included).
+fn open_checked(
+    jail: &FileJail,
+    resolved: &Path,
+    allow_inbound: bool,
+) -> Result<(File, u64), OpError> {
+    let swapped = || refused_file("the file changed while it was being checked");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(resolved)
+        .map_err(|e| refused_file(format!("cannot read the file: {e}")))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| refused_file(format!("cannot read the file: {e}")))?;
+    if !meta.is_file() {
+        return Err(refused_file("only regular files can be sent"));
+    }
+    let real = handle_path(&file, resolved).map_err(|_| swapped())?;
+    if !real.starts_with(jail.root()) || (jail.is_inbound(&real) && !allow_inbound) {
+        return Err(swapped());
+    }
+    Ok((file, meta.len()))
+}
+
 /// Resolves, checks and copies the file into the platform's private outbox, hashing on the way.
 fn prepare_media(
     jail: &FileJail,
@@ -280,12 +352,7 @@ fn prepare_media(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let mut source =
-        File::open(&resolved).map_err(|e| refused_file(format!("cannot read the file: {e}")))?;
-    let size = source
-        .metadata()
-        .map_err(|e| refused_file(format!("cannot read the file: {e}")))?
-        .len();
+    let (mut source, size) = open_checked(jail, &resolved, allow_inbound)?;
     if size > max_bytes {
         return Err(refused_file(format!(
             "the file is {size} bytes, over the {max_bytes} byte limit (META_MCP_MAX_FILE_BYTES)"
@@ -369,6 +436,7 @@ impl Daemon {
         pl.thread = Some(thread.clone());
         pl.body = text.clone();
         let sc = pl.online().await?;
+        pl.pace(PaceClass::Send).await?;
         let attempt = pl.attempt().await?;
         let mut params = json!({"thread_id": thread, "text": text});
         if let Some(r) = reply_to {
@@ -405,6 +473,7 @@ impl Daemon {
         pl.thread = Some(thread.clone());
         pl.body = emoji.clone();
         let sc = pl.online().await?;
+        pl.pace(PaceClass::Light).await?;
         let attempt = pl.attempt().await?;
         let params = json!({"thread_id": thread, "message_id": message, "emoji": emoji});
         let (_, done) = pl
@@ -457,6 +526,7 @@ impl Daemon {
             let e = OpError::new(CODE_NO_FILES_DIR, "set META_MCP_FILES_DIR to send files");
             return Err(pl.refused(e).await);
         };
+        pl.pace(PaceClass::Send).await?;
         let max = self.cfg.max_file_bytes;
         let data_dir = std::path::absolute(rt.store.data_dir())
             .map_err(|_| OpError::new(CODE_AUDIT_FAILED, "cannot resolve the data folder"))?;
@@ -524,6 +594,7 @@ impl Daemon {
         })()
         .map_err(OpError::bad_params)?;
         let sc = pl.online().await?;
+        pl.pace(PaceClass::Light).await?;
         let mut params = json!({"thread_id": checked.0});
         if let Some(ts) = checked.1 {
             params["up_to_ts_ms"] = json!(ts);
@@ -549,6 +620,7 @@ impl Daemon {
             .and_then(Value::as_bool)
             .ok_or_else(|| OpError::bad_params("on (boolean) is required"))?;
         let sc = pl.online().await?;
+        pl.pace(PaceClass::Light).await?;
         Ok(sc
             .link()
             .request_with_timeout(

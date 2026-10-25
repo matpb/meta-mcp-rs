@@ -1212,6 +1212,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac",
+ "libc",
  "open",
  "qrcode",
  "rand",

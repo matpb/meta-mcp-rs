@@ -1,4 +1,5 @@
-//! MCP server for the Meta Graph API: Facebook Messenger (Page inbox) and WhatsApp Cloud API.
+//! MCP server for Facebook Messenger and WhatsApp: business mode on the Meta Graph API, and personal
+//! accounts through local sidecars (Unix only).
 
 // `GraphError::Api` keeps Meta's whole error object inline; boxing it would change the variant shape.
 #![allow(clippy::result_large_err)]
@@ -10,6 +11,7 @@ pub mod graph;
 pub mod inbox;
 pub mod mcp;
 pub mod messenger;
+#[cfg(unix)]
 pub mod personal;
 pub mod server;
 pub mod setup;

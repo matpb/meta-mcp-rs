@@ -21,15 +21,53 @@ pub enum ListenError {
     Io(#[from] io::Error),
 }
 
+/// True when an `accept` error means the listener itself is unusable (not a socket, not listening).
+pub fn accept_error_is_fatal(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::ENOTSOCK | libc::EINVAL | libc::EBADF)
+    )
+}
+
 /// True when `LISTEN_FDS` is `1` and `LISTEN_PID` is this process.
 pub fn systemd_passed_one_fd(fds: Option<&str>, pid: Option<&str>) -> bool {
     fds == Some("1") && pid.and_then(|p| p.parse::<u32>().ok()) == Some(std::process::id())
 }
 
+/// True when fd 3 is open and is a socket; adopting anything else would close or misuse it.
+#[cfg(target_os = "linux")]
+fn fd3_is_socket() -> io::Result<bool> {
+    Ok(std::fs::metadata("/proc/self/fd/3")?
+        .file_type()
+        .is_socket())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn fd3_is_socket() -> io::Result<bool> {
+    Err(io::Error::other(
+        "socket activation through LISTEN_FDS is only supported on Linux",
+    ))
+}
+
 #[allow(unsafe_code)]
-fn take_fd3() -> std::os::unix::net::UnixListener {
-    // SAFETY: LISTEN_PID and LISTEN_FDS=1 say systemd handed this process fd 3 and nothing else owns it.
-    unsafe { std::os::unix::net::UnixListener::from_raw_fd(3) }
+fn take_fd3() -> io::Result<std::os::unix::net::UnixListener> {
+    match fd3_is_socket() {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(io::Error::other(
+                "LISTEN_FDS names fd 3 but it is not a socket",
+            ));
+        }
+        Err(e) => {
+            return Err(io::Error::new(
+                e.kind(),
+                format!("LISTEN_FDS names fd 3 but it cannot be inspected: {e}"),
+            ));
+        }
+    }
+    // SAFETY: LISTEN_PID and LISTEN_FDS=1 say systemd handed this process fd 3, and it is an open socket
+    // that nothing else owns.
+    Ok(unsafe { std::os::unix::net::UnixListener::from_raw_fd(3) })
 }
 
 /// Duplicates the inherited listener (std sets close-on-exec on the copy), so no sidecar inherits it.
@@ -46,7 +84,7 @@ pub fn acquire(socket: &Path) -> Result<Listener, ListenError> {
     let pid = std::env::var("LISTEN_PID").ok();
     if systemd_passed_one_fd(fds.as_deref(), pid.as_deref()) {
         return Ok(Listener {
-            listener: adopt(take_fd3())?,
+            listener: adopt(take_fd3()?)?,
             bound_path: None,
         });
     }
@@ -57,6 +95,7 @@ pub fn acquire(socket: &Path) -> Result<Listener, ListenError> {
             .create(parent)?;
     }
     remove_stale(socket)?;
+    // The parent was just made 0700, so no other user can reach the socket before the chmod below.
     let listener = UnixListener::bind(socket)?;
     std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
     Ok(Listener {
@@ -85,6 +124,17 @@ fn remove_stale(path: &Path) -> Result<(), ListenError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accept_errors_that_mean_a_dead_listener_are_fatal() {
+        for code in [libc::ENOTSOCK, libc::EINVAL, libc::EBADF] {
+            assert!(accept_error_is_fatal(&io::Error::from_raw_os_error(code)));
+        }
+        for code in [libc::EMFILE, libc::ECONNABORTED, libc::EINTR] {
+            assert!(!accept_error_is_fatal(&io::Error::from_raw_os_error(code)));
+        }
+        assert!(!accept_error_is_fatal(&io::Error::other("x")));
+    }
 
     #[test]
     fn systemd_fd_needs_one_fd_and_our_pid() {

@@ -20,6 +20,9 @@ const PASSED_ENV: [(&str, bool); 5] = [
     ("META_MCP_LOG", false),
 ];
 
+/// Sandbox lines of the service; the folders it writes are added as `ReadWritePaths=`.
+const HARDENING: &str = "NoNewPrivileges=yes\nProtectSystem=strict\nProtectHome=read-only\nPrivateTmp=yes\nLimitCORE=0\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nRestrictNamespaces=yes\nSystemCallArchitectures=native\n";
+
 /// The two unit files as text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Units {
@@ -49,6 +52,42 @@ fn exec_word(v: &str) -> String {
     format!("\"{body}\"")
 }
 
+/// A path word for `ReadWritePaths=`: quoted when it holds characters systemd would split on.
+fn path_word(v: &str) -> String {
+    let plain = !v.is_empty()
+        && v.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+:,@=".contains(c));
+    if plain {
+        return v.to_owned();
+    }
+    let body = v
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%");
+    format!("\"{body}\"")
+}
+
+/// The folders the daemon writes: the home, the inbox database's folder and the files folder.
+fn writable_paths(env: &[(String, String)]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (key, value) in env {
+        let path = match key.as_str() {
+            "META_MCP_HOME" | "META_MCP_FILES_DIR" => Some(value.clone()),
+            "META_MCP_INBOX_DB" => Path::new(value)
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|p| p.display().to_string()),
+            _ => None,
+        };
+        if let Some(path) = path
+            && !out.contains(&path)
+        {
+            out.push(path);
+        }
+    }
+    out
+}
+
 fn listen_value(v: &str) -> String {
     v.replace('%', "%%")
 }
@@ -67,8 +106,14 @@ pub fn render_units(exe: &Path, listen: Option<&str>, env: &[(String, String)]) 
         service.push_str(&format!("Environment=\"{k}={}\"\n", escape_value(v)));
     }
     service.push_str(
-        "Restart=on-failure\nRestartSec=5\nRestartPreventExitStatus=2\nUMask=0077\nNoNewPrivileges=yes\nTimeoutStopSec=20\n\n[Install]\nWantedBy=default.target\n",
+        "Restart=on-failure\nRestartSec=5\nRestartPreventExitStatus=2\nUMask=0077\nTimeoutStopSec=20\n",
     );
+    service.push_str(HARDENING);
+    let paths: Vec<String> = writable_paths(env).iter().map(|p| path_word(p)).collect();
+    if !paths.is_empty() {
+        service.push_str(&format!("ReadWritePaths={}\n", paths.join(" ")));
+    }
+    service.push_str("\n[Install]\nWantedBy=default.target\n");
     Units { socket, service }
 }
 
@@ -101,6 +146,15 @@ fn service_env(get: &dyn Fn(&str) -> Option<String>) -> Result<Vec<(String, Stri
             env.push((name.to_owned(), if is_path { absolute(&v) } else { v }));
         }
     }
+    if get("META_MCP_INBOX_DB").is_none() {
+        // The default inbox lives outside the home, so the sandbox needs it named.
+        let dirs = directories::ProjectDirs::from("", "", "meta-mcp")
+            .ok_or("cannot determine the default inbox folder: set META_MCP_INBOX_DB")?;
+        env.push((
+            "META_MCP_INBOX_DB".to_owned(),
+            dirs.data_dir().join("inbox.db").display().to_string(),
+        ));
+    }
     for (k, v) in &env {
         if v.chars().any(char::is_control) {
             return Err(format!(
@@ -118,6 +172,10 @@ fn non_empty_env(name: &str) -> Option<String> {
 struct Plan {
     dir: PathBuf,
     units: Units,
+    /// Folders the sandboxed service must find already there: the home and the inbox folder.
+    create: Vec<PathBuf>,
+    /// The files folder, which the user must have made.
+    must_exist: Vec<PathBuf>,
 }
 
 fn plan() -> Result<Plan, String> {
@@ -138,9 +196,21 @@ fn plan() -> Result<Plan, String> {
         std::env::var_os("HOME").map(PathBuf::from),
     )
     .ok_or("cannot find the systemd user unit directory: set XDG_CONFIG_HOME or HOME")?;
+    let value = |name: &str| env.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
+    let home = value("META_MCP_HOME").map(PathBuf::from);
+    let inbox_dir = value("META_MCP_INBOX_DB")
+        .and_then(|v| Path::new(v).parent())
+        .map(Path::to_path_buf);
+    let create = home.into_iter().chain(inbox_dir).collect();
+    let must_exist = value("META_MCP_FILES_DIR")
+        .map(PathBuf::from)
+        .into_iter()
+        .collect();
     Ok(Plan {
         dir,
         units: render_units(&exe, listen.as_deref(), &env),
+        create,
+        must_exist,
     })
 }
 
@@ -224,6 +294,26 @@ pub fn install(dry_run: bool) -> ExitCode {
         println!("systemctl --user daemon-reload");
         println!("systemctl --user enable --now {SOCKET_UNIT} {SERVICE_UNIT}");
         return ExitCode::SUCCESS;
+    }
+    for dir in &plan.must_exist {
+        if !dir.is_dir() {
+            eprintln!(
+                "error: {} does not exist: create it first, the service may only write where it already is",
+                dir.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+    for dir in &plan.create {
+        use std::os::unix::fs::DirBuilderExt;
+        if let Err(e) = std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+        {
+            eprintln!("error: cannot create {}: {e}", dir.display());
+            return ExitCode::FAILURE;
+        }
     }
     let written = std::fs::create_dir_all(&plan.dir)
         .and_then(|()| write_unit(&plan.dir, SOCKET_UNIT, &plan.units.socket))
@@ -357,7 +447,31 @@ mod tests {
         );
         assert!(s.contains("Environment=\"META_MCP_READ_ONLY=1\"\n"));
         assert!(s.contains("Environment=\"META_MCP_LOG=meta_mcp=debug\"\n"));
-        assert!(!s.contains("META_MCP_INBOX_DB") && !s.contains("META_MCP_SIDECAR_DIR"));
+        let rw = s
+            .lines()
+            .find(|l| l.starts_with("ReadWritePaths="))
+            .expect("rw line");
+        assert!(
+            rw.starts_with("ReadWritePaths=/home/u/.config/meta-mcp "),
+            "{rw}"
+        );
+        assert!(
+            rw.contains(" \"/srv/my files\"") && rw.contains("meta-mcp"),
+            "{rw}"
+        );
+        assert!(!s.contains("META_MCP_SIDECAR_DIR"));
+        let inbox = pairs
+            .iter()
+            .find(|(k, _)| k == "META_MCP_INBOX_DB")
+            .expect("pinned inbox");
+        assert!(
+            inbox.1.starts_with('/') && inbox.1.ends_with("inbox.db"),
+            "{inbox:?}"
+        );
+        assert!(
+            s.contains(&format!("Environment=\"META_MCP_INBOX_DB={}\"\n", inbox.1)),
+            "{s}"
+        );
         for line in [
             "Type=simple",
             "Restart=on-failure",
@@ -365,11 +479,54 @@ mod tests {
             "RestartPreventExitStatus=2",
             "UMask=0077",
             "NoNewPrivileges=yes",
+            "ProtectSystem=strict",
+            "ProtectHome=read-only",
+            "PrivateTmp=yes",
+            "LimitCORE=0",
+            "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+            "RestrictNamespaces=yes",
+            "SystemCallArchitectures=native",
             "TimeoutStopSec=20",
             "WantedBy=default.target",
         ] {
             assert!(s.contains(&format!("{line}\n")), "{line}");
         }
+    }
+
+    #[test]
+    fn writable_paths_are_the_home_the_inbox_folder_and_the_files_folder() {
+        let env = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).into(), (*v).into()))
+                .collect()
+        };
+        let all = env(&[
+            ("META_MCP_HOME", "/h"),
+            ("META_MCP_INBOX_DB", "/data/in/inbox.db"),
+            ("META_MCP_FILES_DIR", "/srv/files"),
+            ("META_MCP_READ_ONLY", "1"),
+        ]);
+        assert_eq!(writable_paths(&all), ["/h", "/data/in", "/srv/files"]);
+        let same = env(&[
+            ("META_MCP_HOME", "/h"),
+            ("META_MCP_INBOX_DB", "/h/inbox.db"),
+        ]);
+        assert_eq!(writable_paths(&same), ["/h"]);
+        let u = render_units(Path::new("/x"), None, &same);
+        assert!(u.service.contains("ReadWritePaths=/h\n"), "{}", u.service);
+        let odd = env(&[("META_MCP_HOME", "/my \"h\"%1")]);
+        let u = render_units(Path::new("/x"), None, &odd);
+        assert!(
+            u.service.contains("ReadWritePaths=\"/my \\\"h\\\"%%1\"\n"),
+            "{}",
+            u.service
+        );
+        assert!(
+            !render_units(Path::new("/x"), None, &[])
+                .service
+                .contains("ReadWritePaths")
+        );
     }
 
     #[test]

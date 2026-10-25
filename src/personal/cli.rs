@@ -18,7 +18,7 @@ pub use install::{install, uninstall};
 pub use login::{WhatsAppLogin, login_messenger, login_whatsapp};
 
 const STATUS_TIMEOUT: Duration = Duration::from_secs(15);
-const LOGOUT_TIMEOUT: Duration = Duration::from_secs(75);
+const LOGOUT_TIMEOUT: Duration = Duration::from_secs(130);
 const RESTART_TIMEOUT: Duration = Duration::from_secs(90);
 const MIN_TOKEN_RUN: usize = 20;
 const MIN_SECRET_LEN: usize = 8;
@@ -129,6 +129,12 @@ fn platform_block(key: &str, p: &Value) -> String {
         "  connection: {}{reason}\n",
         clean(text(p, "connection").unwrap_or("unknown"))
     ));
+    if let Some(url) = text(p, "reason_url") {
+        out.push_str(&format!(
+            "  resolve it in a browser, then run meta-mcp personal restart {key}: {}\n",
+            clean(url)
+        ));
+    }
     if p["sending_blocked"].as_bool().unwrap_or(false) {
         out.push_str(&format!(
             "  sending: BLOCKED ({}), run meta-mcp personal restart {key}\n",
@@ -160,7 +166,11 @@ fn platform_block(key: &str, p: &Value) -> String {
     } else {
         out.push_str("  sidecar: not running\n");
     }
-    if let Some(s) = p["reconnect_in_s"].as_i64() {
+    if p["reconnect_halted"].as_bool().unwrap_or(false) {
+        out.push_str(&format!(
+            "  reconnect: stopped (the account needs attention), run meta-mcp personal restart {key}\n"
+        ));
+    } else if let Some(s) = p["reconnect_in_s"].as_i64() {
         out.push_str(&format!("  reconnect: in {s}s\n"));
     }
     if let Some(e) = text(p, "last_error") {
@@ -217,6 +227,44 @@ pub async fn status(as_json: bool) -> ExitCode {
     }
 }
 
+/// The logout report as text and whether everything worked (state cleared, data wiped, remote ok).
+fn logout_report(platform: PersonalPlatform, v: &Value) -> (String, bool) {
+    let cleared = v["state_cleared"].as_bool().unwrap_or(false);
+    let wiped = v["data_wiped"].as_bool().unwrap_or(false);
+    let remote = text(v, "remote_error");
+    let ok = cleared && wiped && remote.is_none();
+    let name = pretty(platform);
+    let mut out = if ok {
+        format!("Logged out of {name}.\n")
+    } else {
+        format!("Logout of {name} is incomplete:\n")
+    };
+    out.push_str(&format!(
+        "  stored session: {}\n",
+        if cleared {
+            "cleared"
+        } else {
+            "NOT cleared (delete personal/<platform>/state.json under the meta-mcp home by hand)"
+        }
+    ));
+    out.push_str(&format!(
+        "  local data (databases, thread cache): {}\n",
+        if wiped {
+            "wiped"
+        } else {
+            "NOT fully wiped (empty personal/<platform>/data under the meta-mcp home by hand)"
+        }
+    ));
+    match remote {
+        None => out.push_str("  service: the device was unlinked\n"),
+        Some(e) => out.push_str(&format!(
+            "  service: could not be told to forget this device ({}): remove it from the account's linked devices or active sessions by hand\n",
+            scrub(e, &[])
+        )),
+    }
+    (out, ok)
+}
+
 pub async fn logout(platform: PersonalPlatform) -> ExitCode {
     let client = match connect().await {
         Ok(c) => c,
@@ -225,18 +273,13 @@ pub async fn logout(platform: PersonalPlatform) -> ExitCode {
     let params = json!({"platform": platform.as_str()});
     match client.request("logout", params, LOGOUT_TIMEOUT).await {
         Ok(v) => {
-            println!(
-                "Logged out of {}: the stored session is cleared.",
-                pretty(platform)
-            );
-            if let Some(remote) = v.get("remote_error").filter(|r| r.is_object()) {
-                println!(
-                    "The service could not be told to forget this device ({}: {}): remove it from the account's linked devices or active sessions by hand.",
-                    clean(text(remote, "code").unwrap_or("error")),
-                    scrub(text(remote, "message").unwrap_or(""), &[])
-                );
+            let (report, ok) = logout_report(platform, &v);
+            print!("{report}");
+            if ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
             }
-            ExitCode::SUCCESS
         }
         Err(e) => {
             eprintln!("error: {}", describe(&e, &[]));
@@ -282,6 +325,37 @@ mod tests {
             "{out}"
         );
         assert_eq!(scrub(&"é ".repeat(400), &[]).chars().count(), 300);
+    }
+
+    #[test]
+    fn logout_report_says_exactly_what_happened() {
+        let p = PersonalPlatform::WhatsApp;
+        let (all, ok) = logout_report(p, &json!({"state_cleared": true, "data_wiped": true}));
+        assert!(ok && all.starts_with("Logged out of WhatsApp.\n"), "{all}");
+        assert!(
+            all.contains("stored session: cleared")
+                && all.contains("data (databases, thread cache): wiped")
+        );
+        let (bad, ok) = logout_report(
+            p,
+            &json!({"state_cleared": false, "data_wiped": false, "remote_error": "sidecar_unavailable: gone"}),
+        );
+        assert!(
+            !ok && bad.starts_with("Logout of WhatsApp is incomplete:"),
+            "{bad}"
+        );
+        for want in [
+            "NOT cleared",
+            "NOT fully wiped",
+            "sidecar_unavailable: gone",
+            "by hand",
+        ] {
+            assert!(bad.contains(want), "missing {want:?} in {bad}");
+        }
+        assert!(
+            !logout_report(p, &json!({"state_cleared": true})).1,
+            "a missing field is a failure"
+        );
     }
 
     #[test]

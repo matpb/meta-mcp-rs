@@ -73,6 +73,12 @@ pub fn default_socket_path() -> PathBuf {
     personal_dir(&home).join("personal.sock")
 }
 
+/// The uid this process runs as, read from the peer credentials of a socket pair with itself.
+pub(crate) async fn own_uid() -> std::io::Result<u32> {
+    let (a, _b) = tokio::net::UnixStream::pair()?;
+    Ok(a.peer_cred()?.uid())
+}
+
 /// `<home>/personal`, where state, audit log and sidecar data live.
 pub fn personal_dir(home: &Path) -> PathBuf {
     home.join("personal")

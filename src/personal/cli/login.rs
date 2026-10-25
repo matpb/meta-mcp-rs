@@ -20,6 +20,7 @@ const CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
 const WHATSAPP_BUDGET: Duration = Duration::from_secs(300);
 const MAX_INPUT_BYTES: usize = 256 * 1024;
 const EXIT_USAGE: u8 = 2;
+const NO_QR_SHOWN: &str = "no QR code was shown: the sidecar could not reach WhatsApp; check the network and run the command again";
 
 /// Options of `personal login whatsapp`.
 #[derive(Debug, Clone)]
@@ -111,19 +112,16 @@ fn cookie_failure(e: &CookieError) -> ExitCode {
     ExitCode::from(EXIT_USAGE)
 }
 
-pub async fn login_messenger(
-    cookies_file: Option<PathBuf>,
-    cookies_json: Option<String>,
-) -> ExitCode {
-    let preset = match (cookies_file, cookies_json) {
-        (Some(path), _) => match std::fs::read_to_string(&path) {
+pub async fn login_messenger(cookies_file: Option<PathBuf>) -> ExitCode {
+    let preset = match cookies_file {
+        Some(path) => match std::fs::read_to_string(&path) {
             Ok(text) => Some(text),
             Err(e) => {
                 eprintln!("error: cannot read {}: {e}", path.display());
                 return ExitCode::from(EXIT_USAGE);
             }
         },
-        (None, json) => json,
+        None => None,
     };
     let preset = match preset.map(|t| parse_cookies(&t)).transpose() {
         Ok(p) => p,
@@ -375,6 +373,10 @@ impl Flow<'_> {
                 let state = ev.data.get("state").and_then(Value::as_str);
                 let reason = ev.data.get("reason").and_then(Value::as_str);
                 match (state, reason) {
+                    (Some("disconnected"), Some("qr_timeout")) if self.qr_count == 0 => {
+                        eprintln!("{NO_QR_SHOWN}");
+                        Some(ExitCode::FAILURE)
+                    }
                     (Some("disconnected"), Some("qr_timeout")) => {
                         eprintln!("The QR codes expired: run the command again.");
                         Some(ExitCode::FAILURE)
@@ -384,6 +386,9 @@ impl Flow<'_> {
                             "The connection failed: {}",
                             clean(r.unwrap_or("unknown reason"))
                         );
+                        if self.qr_count == 0 {
+                            eprintln!("{NO_QR_SHOWN}");
+                        }
                         Some(ExitCode::FAILURE)
                     }
                     _ => None,

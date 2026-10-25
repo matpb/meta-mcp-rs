@@ -127,7 +127,7 @@ pub fn build_http_router(cfg: Config, with_webhook: bool) -> anyhow::Result<Rout
     }
     let allowed = Arc::new(host_guard::build_allowlist(&cfg.http.host, &extra_hosts));
     let api_keys = Arc::new(cfg.http.api_keys.clone());
-    let mcp = MetaMcp::new(cfg)?;
+    let mcp = MetaMcp::new_http(cfg)?;
     let inbox = mcp.inbox.clone();
 
     let mut mcp_config = StreamableHttpServerConfig::default();

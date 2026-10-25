@@ -13,6 +13,23 @@ use crate::inbox::{self, EventKind};
 use crate::personal::PersonalPlatform;
 use crate::personal::protocol::{Account, Event};
 
+/// `logged_out` reasons that end the session for good: the stored state is deleted.
+const STATE_DROPPING_REASONS: [&str; 4] = [
+    "device_removed",
+    "token_invalidated",
+    "banned",
+    "logged_out_by_user",
+];
+
+/// A page the owner must open to resolve the account: kept to `http(s)`, one line, 2048 bytes.
+fn clean_url(raw: Option<&str>) -> Option<String> {
+    let url = raw?.trim();
+    let ok = url.len() <= 2048
+        && (url.starts_with("https://") || url.starts_with("http://"))
+        && url.chars().all(|c| c.is_ascii_graphic());
+    ok.then(|| url.to_owned())
+}
+
 /// `fatal` reasons after which the account may not send until `restart`.
 const BLOCKING_REASONS: [&str; 6] = [
     "temporary_ban",
@@ -104,7 +121,8 @@ impl Daemon {
         });
     }
 
-    /// The session ended: forget it, delete the state and stop reconnecting.
+    /// The session ended: forget it and stop reconnecting. The stored state goes only for reasons
+    /// that end it; otherwise a `state_updated` null from the sidecar removes it.
     async fn on_logged_out(self: &Arc<Self>, rt: &Arc<PlatformRt>, data: &Value) {
         let reason = data
             .get("reason")
@@ -112,14 +130,26 @@ impl Daemon {
             .map_or_else(|| "logged_out".to_owned(), short);
         tracing::warn!(platform = rt.platform.as_str(), %reason, "logged out by the service");
         self.stop_reconnect(rt);
-        let _ = self.mark_logged_out(rt, Some(reason)).await;
+        let url = clean_url(data.get("url").and_then(Value::as_str));
+        let drop_state = STATE_DROPPING_REASONS.contains(&reason.as_str());
+        let _ = self.end_session(rt, Some(reason), url, drop_state).await;
     }
 
-    /// Clears the session in memory and on disk; state writes stay refused until `login_start`.
+    /// Clears the session in memory and deletes the state file; writes stay refused until `login_start`.
     pub(super) async fn mark_logged_out(
         &self,
         rt: &Arc<PlatformRt>,
         reason: Option<String>,
+    ) -> bool {
+        self.end_session(rt, reason, None, true).await
+    }
+
+    async fn end_session(
+        &self,
+        rt: &Arc<PlatformRt>,
+        reason: Option<String>,
+        url: Option<String>,
+        delete_state: bool,
     ) -> bool {
         let _io = rt.state_io.lock().await;
         {
@@ -136,7 +166,11 @@ impl Daemon {
                 "stopped"
             };
             g.reason = reason;
+            g.reason_url = url;
             g.ring.clear();
+        }
+        if !delete_state {
+            return true;
         }
         let store = rt.store.clone();
         if let Ok(Ok(())) = tokio::task::spawn_blocking(move || store.delete()).await {
@@ -151,6 +185,7 @@ impl Daemon {
     fn on_connection(self: &Arc<Self>, rt: &Arc<PlatformRt>, data: &Value) {
         let state = data.get("state").and_then(Value::as_str).unwrap_or("");
         let reason = data.get("reason").and_then(Value::as_str).map(short);
+        let action = data.get("action").and_then(Value::as_str);
         let mut start_loop = false;
         let mut stop_loop = false;
         {
@@ -164,9 +199,17 @@ impl Daemon {
             };
             g.connection = connection;
             g.reason.clone_from(&reason);
+            if matches!(connection, "connecting" | "connected") {
+                g.reason_url = None;
+            }
+            if connection == "connected" {
+                g.connected_since
+                    .get_or_insert_with(std::time::Instant::now);
+            } else {
+                self.note_connection_ended(&mut g);
+            }
             match connection {
                 "connected" => {
-                    g.backoff_idx = 0;
                     g.reconnect_at = None;
                     g.last_error = None;
                 }
@@ -183,7 +226,17 @@ impl Daemon {
                         stop_loop = true;
                     } else {
                         g.last_error = Some(reason.clone().unwrap_or_else(|| "fatal".to_owned()));
-                        start_loop = true;
+                        match action {
+                            Some("none" | "relogin") => {
+                                g.halted = true;
+                                stop_loop = true;
+                            }
+                            Some("wait") => {
+                                g.wait_floor = true;
+                                start_loop = true;
+                            }
+                            _ => start_loop = true,
+                        }
                     }
                 }
                 _ => {}
@@ -267,8 +320,7 @@ impl Daemon {
         data.insert("platform".to_owned(), json!(platform.as_str()));
         let frame = json!({"event": ev.event, "data": data});
         if let Ok(line) = crate::personal::link::encode_line(&frame) {
-            // No receivers just means no client subscribed.
-            let _ = self.events.send(Arc::new(line));
+            self.events.publish(Arc::new(line));
         }
     }
 }

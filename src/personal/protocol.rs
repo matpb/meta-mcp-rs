@@ -18,6 +18,8 @@ pub const CODE_TIMEOUT: &str = "timeout";
 pub const CODE_TOO_MANY_REQUESTS: &str = "too_many_requests";
 pub const CODE_TOO_MANY_WAITERS: &str = "too_many_waiters";
 pub const CODE_SEND_UNKNOWN: &str = "send_unknown";
+pub const CODE_RATE_LIMITED: &str = "rate_limited";
+pub const CODE_SHUTTING_DOWN: &str = "shutting_down";
 pub const CODE_INTERNAL: &str = "internal";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -14,6 +14,7 @@ use super::protocol::{CODE_TIMEOUT, Event};
 pub const CODE_NOT_RUNNING: &str = "daemon_not_running";
 pub const CODE_CONNECTION_LOST: &str = "connection_lost";
 pub const CODE_ALREADY_SUBSCRIBED: &str = "already_subscribed";
+pub const CODE_UNTRUSTED_DAEMON: &str = "untrusted_daemon";
 
 /// A failed daemon call: the daemon's own error code and message, or a local one.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,7 +62,18 @@ pub struct DaemonClient {
 }
 
 impl DaemonClient {
+    /// Connects and checks that the process behind the socket runs as this user.
     pub async fn connect(path: &Path) -> Result<Self, ClientError> {
+        let own = super::own_uid().await.map_err(|e| {
+            ClientError::new(
+                CODE_UNTRUSTED_DAEMON,
+                format!("cannot read our own uid: {e}"),
+            )
+        })?;
+        Self::connect_as(path, own).await
+    }
+
+    async fn connect_as(path: &Path, expected_uid: u32) -> Result<Self, ClientError> {
         let stream = UnixStream::connect(path).await.map_err(|e| {
             ClientError::new(
                 CODE_NOT_RUNNING,
@@ -71,6 +83,24 @@ impl DaemonClient {
                 ),
             )
         })?;
+        match stream.peer_cred() {
+            Ok(cred) if super::daemon::peer_allowed(cred.uid(), expected_uid) => {}
+            Ok(_) => {
+                return Err(ClientError::new(
+                    CODE_UNTRUSTED_DAEMON,
+                    format!(
+                        "the socket {} is served by another user: refusing to send anything to it",
+                        path.display()
+                    ),
+                ));
+            }
+            Err(e) => {
+                return Err(ClientError::new(
+                    CODE_UNTRUSTED_DAEMON,
+                    format!("cannot tell who serves {}: {e}", path.display()),
+                ));
+            }
+        }
         let (read_half, write_half) = stream.into_split();
         Ok(Self {
             link: Link::new(read_half, write_half),
@@ -125,6 +155,34 @@ mod tests {
         assert!(err.message.contains("personal mode not running"), "{err}");
         assert!(err.message.contains("meta-mcp personal daemon"), "{err}");
         assert!(err.message.contains(path.to_str().expect("utf8")), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_server_running_as_another_uid_is_refused_before_anything_is_sent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("s.sock");
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind");
+        let own = crate::personal::own_uid().await.expect("uid");
+        let seen = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = [0u8; 1];
+            tokio::time::timeout(
+                Duration::from_millis(300),
+                tokio::io::AsyncReadExt::read(&mut stream, &mut buf),
+            )
+            .await
+        });
+        let err = DaemonClient::connect_as(&path, own.wrapping_add(1))
+            .await
+            .err()
+            .expect("refused");
+        assert_eq!(err.code, CODE_UNTRUSTED_DAEMON);
+        assert!(err.message.contains("another user"), "{err}");
+        let read = seen.await.expect("join").expect("the server saw the close");
+        assert_eq!(read.expect("read"), 0, "nothing was sent");
+        let ours = dir.path().join("ours.sock");
+        let _listener = tokio::net::UnixListener::bind(&ours).expect("bind");
+        assert!(DaemonClient::connect_as(&ours, own).await.is_ok());
     }
 
     #[test]

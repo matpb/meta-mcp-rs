@@ -17,7 +17,7 @@ use crate::graph::GraphError;
 use crate::messenger::media::INLINE_MAX_BYTES;
 use crate::personal::PersonalPlatform;
 use crate::personal::client::{CODE_CONNECTION_LOST, CODE_NOT_RUNNING, ClientError, DaemonClient};
-use crate::personal::protocol::CODE_SEND_UNKNOWN;
+use crate::personal::protocol::{CODE_SEND_UNKNOWN, CODE_TIMEOUT};
 use crate::whatsapp::media::inline_image;
 
 /// Tool names that send or change data on a personal account; removed in read-only mode.
@@ -34,6 +34,8 @@ pub const WRITE_TOOLS: &[&str] = &[
     "whatsapp_personal_typing",
 ];
 
+const SEND_UNKNOWN_TEXT: &str =
+    "the message may have been sent: read the thread before sending again";
 const DEFAULT_LIST: i64 = 20;
 const MAX_LIST: i64 = 200;
 const DEFAULT_READ: i64 = 20;
@@ -280,6 +282,22 @@ impl MetaMcp {
             .map_err(personal_error)
     }
 
+    /// A write call: a lost connection or a timeout after the request left means the outcome is unknown.
+    async fn personal_send(
+        &self,
+        op: &str,
+        params: Value,
+        daemon_timeout: Duration,
+    ) -> Result<Value, GraphError> {
+        let client = self.personal_client().await?;
+        match client.request(op, params, daemon_timeout + SLACK).await {
+            Err(e) if e.code == CODE_CONNECTION_LOST || e.code == CODE_TIMEOUT => Err(
+                GraphError::Refused(format!("{CODE_SEND_UNKNOWN}: {SEND_UNKNOWN_TEXT}")),
+            ),
+            other => other.map_err(personal_error),
+        }
+    }
+
     async fn personal_list(
         &self,
         platform: PersonalPlatform,
@@ -335,7 +353,7 @@ impl MetaMcp {
     /// The downloaded file as `(base64, mime)` when this process can read it and it is a small picture.
     async fn inline_picture(&self, result: &Value) -> Result<(String, String), String> {
         let path = result
-            .get("path")
+            .get("files_path")
             .and_then(Value::as_str)
             .ok_or("the daemon returned no file path")?
             .to_owned();
@@ -474,7 +492,7 @@ impl MetaMcp {
     ) -> CallToolResult {
         let args = json!({"thread_id": p.thread_id, "text": p.text, "reply_to": p.reply_to});
         finish(
-            self.personal_call(
+            self.personal_send(
                 "send_text",
                 params(PersonalPlatform::Messenger, args),
                 SEND_OP,
@@ -498,7 +516,7 @@ impl MetaMcp {
     ) -> CallToolResult {
         let args = json!({"thread_id": p.chat_id, "text": p.text, "reply_to": p.reply_to});
         finish(
-            self.personal_call(
+            self.personal_send(
                 "send_text",
                 params(PersonalPlatform::WhatsApp, args),
                 SEND_OP,
@@ -525,7 +543,7 @@ impl MetaMcp {
             "kind": p.kind, "allow_inbound": p.allow_inbound,
         });
         finish(
-            self.personal_call(
+            self.personal_send(
                 "send_media",
                 params(PersonalPlatform::Messenger, args),
                 SEND_OP,
@@ -552,7 +570,7 @@ impl MetaMcp {
             "kind": p.kind, "allow_inbound": p.allow_inbound,
         });
         finish(
-            self.personal_call(
+            self.personal_send(
                 "send_media",
                 params(PersonalPlatform::WhatsApp, args),
                 SEND_OP,
@@ -577,7 +595,7 @@ impl MetaMcp {
     ) -> CallToolResult {
         let args = json!({"thread_id": p.thread_id, "message_id": p.message_id, "emoji": p.emoji});
         finish(
-            self.personal_call(
+            self.personal_send(
                 "send_reaction",
                 params(PersonalPlatform::Messenger, args),
                 REACT_OP,
@@ -602,7 +620,7 @@ impl MetaMcp {
     ) -> CallToolResult {
         let args = json!({"thread_id": p.chat_id, "message_id": p.message_id, "emoji": p.emoji});
         finish(
-            self.personal_call(
+            self.personal_send(
                 "send_reaction",
                 params(PersonalPlatform::WhatsApp, args),
                 REACT_OP,

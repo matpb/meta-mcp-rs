@@ -17,7 +17,7 @@ pub const COOKIE_SECRET: &str = "xs-cookie-SECRET-value-9f3a";
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Knob files in the fake's root (`<platform>.<knob>`): connect_fail, send_slow, send_unknown, send_fail, send_weird, hello_rotate,
-/// list_slow, passkey, qr_only (no login after the codes), logged_in (set by login), download_src (download bytes).
+/// list_slow, logout_fail, no_qr (login_start emits no QR), passkey, qr_only (no login after the codes), logged_in (set by login), download_src (download bytes), download_path (file holding the path the sidecar reports).
 const FAKE_SIDECAR: &str = r##"#!/bin/bash
 PATH=/usr/bin:/bin
 ROOT='FAKE_ROOT'
@@ -74,6 +74,8 @@ while read -r line; do
           ok '{}'
           if [ -e "$ROOT/$PLAT.passkey" ]; then
             emit '{"event":"passkey_request","data":{"public_key":{"challenge":"abc","rpId":"web.whatsapp.com"},"instructions":"Use a browser tab."}}'
+          elif [ -e "$ROOT/$PLAT.no_qr" ]; then
+            :
           else
             emit '{"event":"qr","data":{"code":"QR-CODE-ONE","expires_in_s":60}}'
             emit '{"event":"qr","data":{"code":"QR-CODE-TWO","expires_in_s":20}}'
@@ -98,6 +100,7 @@ while read -r line; do
       emit '{"event":"connection","data":{"state":"connected"}}';;
     *'"op":"disconnect"'*) ok '{}';;
     *'"op":"logout"'*)
+      if [ -e "$ROOT/$PLAT.logout_fail" ]; then fail io "could not delete the linked device"; continue; fi
       rm -f "$ROOT/$PLAT.logged_in"
       ok '{}'
       emit '{"event":"state_updated","data":{"state":null}}';;
@@ -125,7 +128,9 @@ while read -r line; do
       if [ -e "$ROOT/$PLAT.download_src" ]; then cp "$ROOT/$PLAT.download_src" "$dest"; else printf 'attachment-bytes' > "$dest"; fi
       chmod 600 "$dest"
       sum=$(sha256sum "$dest" | cut -d' ' -f1)
-      ok '{"path":"'"$dest"'","mime":"image/jpeg","bytes":16,"sha256":"'$sum'"}';;
+      reported=$dest
+      [ -e "$ROOT/$PLAT.download_path" ] && reported=$(cat "$ROOT/$PLAT.download_path")
+      ok '{"path":"'"$reported"'","mime":"image/jpeg","bytes":16,"sha256":"'$sum'"}';;
     *) fail bad_params "unknown op";;
   esac
 done
@@ -372,6 +377,8 @@ impl TestEnv {
             .env("META_MCP_INBOX_DB", self.inbox_db())
             .env("META_MCP_SIDECAR_DIR", self.sidecar_dir())
             .env("META_MCP_PERSONAL_BACKOFF_MS", "200,400")
+            .env("META_MCP_PERSONAL_SEND_INTERVAL_MS", "1")
+            .env("META_MCP_PERSONAL_SEND_BURST", "100000")
             .stdin(Stdio::null())
             .stdout(Stdio::null());
         // The size limit would also hit a log file and make the logger panic, so log nowhere then.
