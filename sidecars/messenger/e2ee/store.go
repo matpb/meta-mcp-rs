@@ -144,10 +144,19 @@ func Open(ctx context.Context, dataDir string, log zerolog.Logger) (*Store, erro
 	return &Store{db: db, container: container, threads: map[string]*threadState{}}, nil
 }
 
+// uriPath turns a native path into the slash form SQLite URIs expect (/C:/dir/file.db on Windows).
+func uriPath(p string) string {
+	p = filepath.ToSlash(p)
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	return p
+}
+
 var dsnEscaper = strings.NewReplacer("%", "%25", "?", "%3f", "#", "%23")
 
 func dsn(path string) string {
-	return "file:" + dsnEscaper.Replace(path) +
+	return "file:" + dsnEscaper.Replace(uriPath(path)) +
 		"?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)" +
 		"&_pragma=synchronous(FULL)&_txlock=immediate"
 }

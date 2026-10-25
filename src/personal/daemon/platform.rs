@@ -1,7 +1,5 @@
 //! Per-platform runtime: the sidecar process, its status, the event pump and the reconnect loop.
 
-use std::io;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -98,15 +96,6 @@ impl StartError {
             retryable: true,
         }
     }
-}
-
-/// Creates `path` with mode 0700 and resets the mode when it already exists.
-pub(super) fn private_dir(path: &Path) -> io::Result<()> {
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
 }
 
 /// Drops outbound media copies a crashed daemon left behind.

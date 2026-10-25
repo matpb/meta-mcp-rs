@@ -1,10 +1,11 @@
-//! `meta-mcp personal ...`: login flows, status, logout, restart and systemd install, all talking
-//! to the daemon over its socket.
+//! `meta-mcp personal ...`: login flows, status, logout, restart, install and uninstall, all
+//! talking to the daemon over its socket or pipe.
 
 mod cookies;
-mod install;
 mod login;
 mod qr;
+
+mod install;
 
 use std::process::ExitCode;
 use std::time::Duration;

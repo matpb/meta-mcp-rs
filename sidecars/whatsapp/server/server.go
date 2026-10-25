@@ -389,7 +389,7 @@ func (s *server) hello(req ipc.Request) (ipc.Reply, func()) {
 	if err != nil || !fi.IsDir() {
 		return fail(req.ID, api.CodeBadParams, "data_dir must be an existing directory"), nil
 	}
-	if fi.Mode().Perm() != 0o700 {
+	if dirModeLoose(fi) {
 		s.log.Info().Msg("data_dir mode is not 0700")
 	}
 	hasState := len(p.State) > 0 && string(p.State) != "null"

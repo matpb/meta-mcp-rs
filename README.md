@@ -91,11 +91,11 @@ assistant reads goes wherever the assistant runs.
   files, react, mark read, show typing, search Messenger for people to message, and save attachments. 19 tools in all
   ([docs/TOOLS.md](docs/TOOLS.md#personal-tools)); the messages also land in the local inbox as the platforms
   `messenger_personal` and `whatsapp_personal`.
-- **What it needs.** Rust 1.89 or newer, Go 1.26 or newer, and a Unix system. Personal mode is compiled on Unix only
-  (`#[cfg(unix)]`): elsewhere the crate builds without it, serves the 20 business tools, and `meta-mcp personal` says
-  `personal mode needs a Unix system`. Only Linux was exercised: `meta-mcp personal install` writes systemd user
-  units, and socket activation is Linux only. Without systemd, run `meta-mcp personal daemon` under your own
-  supervisor.
+- **What it needs.** Rust 1.89 or newer, Go 1.26 or newer, and Linux, macOS or Windows. On Windows, Rust needs the
+  MSVC toolchain (Visual Studio Build Tools with the C++ workload). `meta-mcp personal install` sets the daemon up
+  to start at login: systemd user units on Linux (with socket activation, which is Linux only), a launchd agent on
+  macOS, a logon task in Task Scheduler on Windows. Anywhere else, run `meta-mcp personal daemon` under your own
+  supervisor. The daemon listens on a Unix socket (Linux, macOS) or a named pipe (Windows), reachable by your user only.
 - **What it does not do.** Create groups, send to groups it has not seen, broadcast, edit or unsend, or send polls.
   A first message to a WhatsApp number works once WhatsApp confirms the number is registered (see
   [SECURITY.md](SECURITY.md#unofficial-clients-the-risk-to-the-account): first contact is the pattern WhatsApp flags
@@ -109,6 +109,8 @@ assistant reads goes wherever the assistant runs.
 
 From the repository root:
 
+On Linux:
+
 ```bash
 scripts/build-all.sh                       # meta-mcp and both sidecars, into dist/
 install -m 0755 dist/meta-mcp dist/meta-messenger-sidecar dist/meta-whatsapp-sidecar ~/.local/bin/
@@ -120,13 +122,36 @@ meta-mcp personal status
 claude mcp add meta-mcp --env META_MCP_FILES_DIR=$HOME/.local/share/meta-mcp/files -- meta-mcp
 ```
 
-`personal install` copies `META_MCP_FILES_DIR` into the unit, so set it before installing (or run `install` again
-with it); the MCP server needs the same value to read and send files.
+On macOS the build and the commands are the same, and `personal install` writes a launchd agent
+(`~/Library/LaunchAgents/dev.meta-mcp.personal.plist`) instead of systemd units. It needs a logged-in graphical
+session. Keep the files directory (for example `~/meta-mcp-files`) outside the home, which on macOS is
+`~/Library/Application Support/meta-mcp`.
+
+On Windows (PowerShell; Rust with the MSVC toolchain and Go installed):
+
+```powershell
+scripts\build-all.ps1                      # meta-mcp.exe and both sidecars, into dist\
+$bin = "$env:USERPROFILE\bin"; New-Item -ItemType Directory -Force $bin | Out-Null
+Copy-Item dist\meta-mcp.exe, dist\meta-messenger-sidecar.exe, dist\meta-whatsapp-sidecar.exe $bin   # add $bin to your PATH
+$files = "$env:LOCALAPPDATA\meta-mcp\files"; New-Item -ItemType Directory -Force $files | Out-Null
+setx META_MCP_FILES_DIR $files             # saved for the logon start; new shells see it
+$env:META_MCP_FILES_DIR = $files           # this shell
+meta-mcp personal install                  # logon task "meta-mcp personal", and the daemon starts now, with no window
+meta-mcp personal login whatsapp
+meta-mcp personal login messenger --cookies-file cookies.json
+meta-mcp personal status
+claude mcp add meta-mcp --env META_MCP_FILES_DIR=$files -- meta-mcp
+```
+
+`personal install` copies `META_MCP_FILES_DIR` into the unit (systemd) or the plist (launchd), so set it before
+installing (or run `install` again with it); the MCP server needs the same value to read and send files. A Windows
+logon task cannot carry variables: it starts the daemon with your saved user environment, which is what `setx` is
+for (`install` prints a note when a variable is set only in the current shell).
 
 The cookies, the QR flow, the passkey step some WhatsApp accounts need, operations and troubleshooting are in the
 [guide, Part 10](docs/GUIDE.md#part-10-personal-mode-your-own-messenger-and-whatsapp). Session files live in
-`META_MCP_HOME/personal/` (folders 0700, files 0600) and are as sensitive as passwords; the daemon listens on a
-Unix socket that only your user can open.
+`META_MCP_HOME/personal/` (folders 0700, files 0600; on Windows an owner-only ACL instead) and are as sensitive as
+passwords; the daemon listens on a Unix socket or, on Windows, a named pipe that only your user can open.
 
 ## Quick start
 
@@ -139,8 +164,8 @@ register as a developer, create an app with the Messenger use case, copy the App
 **Settings > Basic**, and register `http://localhost:8766/callback` as a redirect URI under **Facebook
 Login for Business > Settings** (the guide explains why, and what to do if Meta refuses it).
 
-1. **Install.** You need Rust 1.89 or newer and a C compiler. Personal mode is compiled on Unix systems only; on
-   other systems the crate is meant to build without it and serve the business tools (not tried on Windows).
+1. **Install.** You need Rust 1.89 or newer and a C compiler (on Windows, the MSVC toolchain). Business mode and
+   personal mode build on Linux, macOS and Windows.
 
    ```bash
    git clone https://github.com/matpb/meta-mcp-rs.git
@@ -188,7 +213,7 @@ systemd or your process manager. Personal mode needs none of these routes: it ha
 
 39 tools: 20 for business mode and 19 for personal mode. Full parameters, results and examples are in
 [docs/TOOLS.md](docs/TOOLS.md). "Read-only mode" says whether the tool stays available when
-`META_MCP_READ_ONLY=true`. The personal tools exist on Unix systems and are served over stdio; `meta-mcp http`
+`META_MCP_READ_ONLY=true`. The personal tools are served over stdio; `meta-mcp http`
 lists only the 20 business tools unless `META_MCP_PERSONAL_HTTP=1` is set.
 
 | Tool | What it does | Read-only mode |
@@ -267,8 +292,8 @@ writes the file; every variable below overrides it.
 | `META_MCP_WEBHOOK_LISTEN` | `127.0.0.1:8787` | Address the standalone webhook receiver binds |
 | `META_MCP_DOWNLOAD_HOSTS` | none | Extra exact host names (no wildcards, no ports) that downloads may fetch from and that may receive the token. The Graph API host is refused whatever this says. Leave unset in production |
 | `META_MCP_LOG` | `meta_mcp=info` | Log filter (tracing syntax); logs go to stderr |
-| `META_MCP_PERSONAL_SOCKET` | `$XDG_RUNTIME_DIR/meta-mcp/personal.sock`, else `META_MCP_HOME/personal/personal.sock` | Personal mode. The Unix socket of the personal daemon, used by the daemon, the MCP server and every `meta-mcp personal` command. Keep the path under about 100 bytes |
-| `META_MCP_SIDECAR_DIR` | the directory of the `meta-mcp` executable | Personal mode. Where `meta-messenger-sidecar` and `meta-whatsapp-sidecar` are |
+| `META_MCP_PERSONAL_SOCKET` | Linux: `$XDG_RUNTIME_DIR/meta-mcp/personal.sock`, else `META_MCP_HOME/personal/personal.sock` (macOS has no `XDG_RUNTIME_DIR`, so the second). Windows: `\\.\pipe\meta-mcp-personal-<USERNAME>` | Personal mode. The Unix socket (Windows: the named pipe, which must start with `\\.\pipe\`) of the personal daemon, used by the daemon, the MCP server and every `meta-mcp personal` command. Keep a socket path under about 100 bytes |
+| `META_MCP_SIDECAR_DIR` | the directory of the `meta-mcp` executable | Personal mode. Where `meta-messenger-sidecar` and `meta-whatsapp-sidecar` are (`.exe` files on Windows) |
 | `META_MCP_PERSONAL_HTTP` | unset | Personal mode. `1` serves the personal tools over `meta-mcp http` too; without it they are not registered there. Every API key holder then reaches your accounts |
 | `META_MCP_PERSONAL_SEND_INTERVAL_MS` | `2000` | Personal mode, daemon. Milliseconds between the tokens of the new-message bucket (`send_text`, `send_media`), per platform |
 | `META_MCP_PERSONAL_SEND_BURST` | `3` | Personal mode, daemon. Size of that bucket. Reactions, read marks and typing have a fixed bucket (one per second, burst 5) |
@@ -299,7 +324,7 @@ The access token is the Page, or the business number, so the defaults are conser
   `Origin` headers, binds to loopback by default and sends no CORS headers. TLS is your reverse proxy's job.
 - `META_MCP_READ_ONLY=true` removes the 21 tools that send or change state (11 business, 10 personal).
 - Personal mode keeps a copy of your logged-in session, so its files (`META_MCP_HOME/personal/`) are 0600 in 0700
-  folders and the daemon socket accepts only your own user. The sidecars start with an empty environment, the
+  folders (Windows: an owner-only ACL) and the daemon socket or pipe accepts only your own user. The sidecars start with an empty environment, the
   logs are scrubbed, and sends are written to an audit log (hashes and ids, never the text) before they are
   attempted. The daemon paces writes and refuses an excess with `rate_limited`. The HTTP transport does not register
   the personal tools unless you set `META_MCP_PERSONAL_HTTP=1`; with it, every holder of one of its API keys can

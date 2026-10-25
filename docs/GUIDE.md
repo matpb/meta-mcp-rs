@@ -65,7 +65,7 @@ Instagram scopes with `--instagram`.
 **personal mode** that reaches your own Messenger and WhatsApp accounts through unofficial clients (a
 re-implemented Messenger web client and a re-implemented WhatsApp linked device). It needs no Meta developer
 account, app or token, it is outside Facebook's and WhatsApp's terms for personal accounts, and it can get the
-account restricted or banned. It is compiled on Unix systems only. It is Part 10, and 10.0 comes first. The Meta account, app, token and webhook steps of
+account restricted or banned. It runs on Linux, macOS and Windows. It is Part 10, and 10.0 comes first. The Meta account, app, token and webhook steps of
 Parts 1 to 9 do not apply to it.
 
 ### 0.2 Three personas
@@ -2115,11 +2115,11 @@ lose. A separate number limits the damage to that number, but it is then not you
 4. Plan to open WhatsApp on your phone at least every 14 days (10.3).
 5. Treat the files meta-mcp keeps like passwords (10.5 and [SECURITY.md](../SECURITY.md#session-files)).
 
-**Platform and licence.** Personal mode needs a Unix system. The daemon speaks over a Unix socket and learns its own
-user id from the peer credential of a socket pair, and `personal install` writes systemd user units (socket
-activation is Linux only). Only Linux was exercised. The whole module is compiled only on Unix (`#[cfg(unix)]`): on
-another system the crate is meant to build without it (not tried on Windows), the server then has the 20 business
-tools, and `meta-mcp personal` prints `personal mode needs a Unix system` and exits 2. The
+**Platform and licence.** Personal mode runs on Linux, macOS and Windows. On Linux and macOS the daemon speaks over a
+Unix socket and learns its own user id from the peer credential of a socket pair; on Windows it speaks over a named
+pipe that only your user can open, and both ends compare the other side's user SID (10.1, step 7). `personal install`
+writes systemd user units on Linux (socket activation is Linux only), a launchd agent on macOS and a logon task on
+Windows. Everything else in this part is the same on the three systems, except where a step says otherwise. The
 Messenger sidecar links mautrix-meta, which is AGPL-3.0, so the sidecar documentation states that the combined
 `meta-messenger-sidecar` binary is AGPL-3.0 and that distributing it carries the AGPL source obligations. Both
 sidecars also link `go.mau.fi/libsignal` (the Messenger sidecar through mautrix-meta and `whatsmeow`), which is
@@ -2130,10 +2130,13 @@ The `meta-mcp` binary stays MIT. Not legal advice.
 
 1. **What you need.** Rust 1.89 or newer and a C compiler (Part 4.1); Go 1.26 or newer, because the sidecars' `go.mod`
    says `go 1.26.0` and their build script uses the local toolchain (`GOTOOLCHAIN=local`); `govulncheck` (for
-   example `go install golang.org/x/vuln/cmd/govulncheck@latest`) and `file`, which the build script runs; and,
-   for `personal install`, a systemd user session.
+   example `go install golang.org/x/vuln/cmd/govulncheck@latest`) and `file`, which the Linux and macOS build script
+   runs; and, for `personal install`, a systemd user session on Linux, a logged-in graphical session on macOS (the
+   launchd agent lives in the `gui/<uid>` domain), or an ordinary logged-in Windows user (no administrator rights).
+   On Windows the C compiler is the MSVC toolchain: install Rust with the `x86_64-pc-windows-msvc` target and Visual
+   Studio Build Tools with the C++ workload. `govulncheck` is optional there (the script skips the scan and says so).
 
-2. **Build all three programs.** From the repository root:
+2. **Build all three programs.** From the repository root, on Linux and macOS:
 
    ```bash
    scripts/build-all.sh
@@ -2144,22 +2147,47 @@ The `meta-mcp` binary stays MIT. Not legal advice.
    `meta-mcp`, `meta-messenger-sidecar` and `meta-whatsapp-sidecar` into `dist/` (`DIST=...` picks another folder).
    `cargo install --path .` installs only `meta-mcp`: it does not build the sidecars.
 
+   On Windows, in PowerShell (Windows PowerShell 5.1 or later):
+
+   ```powershell
+   scripts\build-all.ps1
+   ```
+
+   It does the same steps (`cargo build --release --locked`, then `go vet`, `go test`, a static `CGO_ENABLED=0` build
+   and, when `govulncheck` is installed, the two vulnerability scans for each sidecar; any failure stops it) and
+   copies `meta-mcp.exe`, `meta-messenger-sidecar.exe` and `meta-whatsapp-sidecar.exe` into `dist\` (`$env:DIST`
+   picks another folder).
+
 3. **Put the three files together.** meta-mcp finds the sidecars **next to its own executable** (the real file:
-   symlinks are followed), or in `META_MCP_SIDECAR_DIR` when that is set. The names must stay as they are.
+   symlinks are followed), or in `META_MCP_SIDECAR_DIR` when that is set. The names must stay as they are
+   (`meta-messenger-sidecar` and `meta-whatsapp-sidecar`; on Windows with `.exe`).
 
    ```bash
    install -m 0755 dist/meta-mcp dist/meta-messenger-sidecar dist/meta-whatsapp-sidecar ~/.local/bin/
    ```
 
-   Or keep them in `dist/` and export `META_MCP_SIDECAR_DIR` with its absolute path.
+   On Windows, copy the three `.exe` files into one folder and put that folder on your `PATH`:
 
-4. **Look before you install.** `--dry-run` prints the two units and the commands, and writes and runs nothing:
+   ```powershell
+   $bin = "$env:USERPROFILE\bin"; New-Item -ItemType Directory -Force $bin | Out-Null
+   Copy-Item dist\meta-mcp.exe, dist\meta-messenger-sidecar.exe, dist\meta-whatsapp-sidecar.exe $bin
+   ```
+
+   Or keep them in `dist/` and set `META_MCP_SIDECAR_DIR` to its absolute path.
+
+4. **Look before you install.** `--dry-run` prints what `install` would write (the two systemd units on Linux, the
+   launchd plist on macOS, the task XML on Windows) and the commands it would run, and writes and runs nothing:
 
    ```bash
    meta-mcp personal install --dry-run
    ```
 
-5. **Install and start the daemon** as systemd user units:
+5. **Install and start the daemon.** The command is the same everywhere; what it sets up depends on the system.
+   Set `META_MCP_FILES_DIR` before installing when you want attachments (create the folder first; on Linux and macOS
+   `install` refuses a configured folder that does not exist), and keep the three programs where they are afterwards:
+   the service remembers the path of the binary that ran `install`.
+
+   **Linux: systemd user units.**
 
    ```bash
    mkdir -p ~/.local/share/meta-mcp/files
@@ -2253,22 +2281,89 @@ The `meta-mcp` binary stays MIT. Not legal advice.
      meta-mcp-personal.socket`. The socket unit stays active when only the service is stopped, and the next client
      connection (any `meta-mcp personal` command or personal tool) starts the daemon again.
 
-6. **Without systemd.** Run the daemon yourself, under any supervisor, with the environment you want:
+   **macOS: a launchd agent.**
+
+   ```bash
+   mkdir -p ~/meta-mcp-files
+   META_MCP_FILES_DIR=~/meta-mcp-files meta-mcp personal install
+   meta-mcp personal status
+   ```
+
+   - **What it writes.** `~/Library/LaunchAgents/dev.meta-mcp.personal.plist` (label `dev.meta-mcp.personal`),
+     after creating the meta-mcp home, the inbox folder and `~/Library/Logs/meta-mcp/` as private folders. The agent
+     runs `meta-mcp personal daemon` with `RunAtLoad` (it starts at login), `Umask` 077, `ProcessType` `Background`
+     and the same environment the systemd unit carries (`META_MCP_HOME`, a pinned `META_MCP_INBOX_DB`, and, when
+     your shell sets them, `META_MCP_FILES_DIR`, `META_MCP_SIDECAR_DIR`, `META_MCP_READ_ONLY`, `META_MCP_LOG` and
+     `META_MCP_PERSONAL_SOCKET`; set them before you run `install`).
+   - **What it runs.** `launchctl bootstrap gui/<uid> <plist>` (after a `bootout` that is allowed to fail, because the
+     agent may not be loaded yet), then `launchctl kickstart gui/<uid>/dev.meta-mcp.personal`, and it prints each
+     command with its exit status. It needs a logged-in graphical session, because the agent lives in the user's `gui`
+     domain: over a plain SSH session without one, `bootstrap` fails.
+   - **No socket activation.** launchd does not hand the daemon a socket. The daemon binds its own, by default
+     `META_MCP_HOME/personal/personal.sock` (macOS has no `XDG_RUNTIME_DIR`), and the default home is
+     `~/Library/Application Support/meta-mcp`.
+   - **Restarts differ from systemd.** The agent has `KeepAlive` with `SuccessfulExit` false, so launchd restarts the
+     daemon after any failed exit, every 10 seconds (`ThrottleInterval`), and leaves it stopped after a clean stop.
+     A configuration error (exit status 2) is retried too, unlike `RestartPreventExitStatus=2` on Linux: read the
+     log when `status` says nothing listens.
+   - **The log** is `~/Library/Logs/meta-mcp/daemon.log` (stdout and stderr). Check the agent with
+     `launchctl print gui/$(id -u)/dev.meta-mcp.personal`.
+   - **To stop the daemon,** run `meta-mcp personal uninstall` (below), or `launchctl bootout
+     gui/$(id -u)/dev.meta-mcp.personal`, which stops it until the next login.
+
+   **Windows: a logon task.**
+
+   ```powershell
+   $files = "$env:LOCALAPPDATA\meta-mcp\files"; New-Item -ItemType Directory -Force $files | Out-Null
+   setx META_MCP_FILES_DIR $files
+   $env:META_MCP_FILES_DIR = $files
+   meta-mcp personal install
+   meta-mcp personal status
+   ```
+
+   - **What it writes.** A scheduled task named `meta-mcp personal`, registered with `schtasks /Create /XML` from a task
+     definition (see it with `--dry-run`): it runs `meta-mcp.exe personal daemon` at your logon, for this user only,
+     with a limited token (no administrator rights, no UAC prompt), no execution time limit (the default 72 hours would
+     kill the daemon), and a restart on failure three times, a minute apart. Unlike the other two systems, `install`
+     does not create the meta-mcp home or the inbox folder or check the files directory: the daemon creates
+     `personal/` itself (with the owner-only ACL) when it starts.
+   - **It starts the daemon at once.** A logon task does not run before the next logon, so `install` also starts
+     `meta-mcp.exe personal daemon` itself, with no window, unless a daemon already answers. The daemon inherits no
+     handle from your shell and leaves its job when Windows allows it, so closing the terminal or an SSH session that ran
+     `install` neither waits for it nor stops it. `install` then waits up to 10
+     seconds for the daemon and prints where the log is if none answers. The sidecars the daemon starts get no window
+     either. At a later logon a console window may flash briefly while the daemon detaches from it.
+   - **A task cannot carry environment variables.** At logon the daemon sees your saved user environment, not your
+     shell. Save `META_MCP_HOME`, `META_MCP_FILES_DIR`, `META_MCP_SIDECAR_DIR`, `META_MCP_INBOX_DB`, `META_MCP_READ_ONLY`,
+     `META_MCP_LOG` and `META_MCP_PERSONAL_SOCKET` with `setx NAME value` (or the Environment Variables dialog). The
+     start `install` does itself inherits your current shell, and `install` prints a note listing the variables that are
+     set only there.
+   - **The log.** A daemon without a console (started by the task or by `install`) detaches and writes to
+     `%LOCALAPPDATA%\meta-mcp\logs\daemon.log` without colour codes. A file over 10 MiB is renamed to `daemon.log.1`
+     when the daemon starts. A daemon you start from a terminal keeps logging to that terminal. Check the task with
+     `schtasks /Query /TN "meta-mcp personal" /V`.
+   - **To stop the daemon,** run `meta-mcp personal uninstall` (below). In a terminal, Ctrl-C or Ctrl-Break stops a daemon
+     you started there. Closing that console, logging off and shutting down stop it cleanly too.
+
+6. **Without a service manager.** Run the daemon yourself, under any supervisor, with the environment you want:
 
    ```bash
    meta-mcp personal daemon
    ```
 
-   It listens on the default socket (below) or on `--socket PATH`, runs until SIGTERM or SIGINT, and removes the
-   socket it bound when it stops. **There can be only one daemon per `META_MCP_HOME`:** it takes an exclusive lock on
-   `personal/daemon.lock`, and a second one exits with `another personal daemon already uses ...`.
+   It listens on the default socket or pipe (below) or on `--socket PATH`, and runs until SIGTERM or SIGINT (on Windows:
+   Ctrl-C, Ctrl-Break, closing the console, logoff or shutdown) or until a `shutdown` request arrives (that is how
+   `uninstall` stops it on Windows; read-only mode does not block it). It removes the socket it bound when it stops.
+   **There can be only one daemon per `META_MCP_HOME`:** it takes an exclusive lock on
+   `personal/daemon.lock`, and a second one exits with `another personal daemon already uses ...`. On Windows a second
+   daemon on the same pipe name also refuses to start.
 
 7. **Tell the assistant's `meta-mcp` where things are.** The assistant starts its own `meta-mcp` (stdio), which
    talks to the daemon over the socket. The two processes must agree on four things:
 
    | Setting | In the daemon | In the assistant's `meta-mcp` and in `meta-mcp personal ...` |
    |---|---|---|
-   | Socket | `ListenStream` of the socket unit (from `META_MCP_PERSONAL_SOCKET` at install time, else `%t/meta-mcp/personal.sock`), or `--socket PATH` | `META_MCP_PERSONAL_SOCKET`, else `$XDG_RUNTIME_DIR/meta-mcp/personal.sock`, else `META_MCP_HOME/personal/personal.sock` |
+   | Socket (Windows: pipe) | `ListenStream` of the socket unit (from `META_MCP_PERSONAL_SOCKET` at install time, else `%t/meta-mcp/personal.sock`), or `--socket PATH`. On macOS the daemon binds the default path itself. On Windows: `\\.\pipe\meta-mcp-personal-<USERNAME>`, or `--socket` | `META_MCP_PERSONAL_SOCKET`, else `$XDG_RUNTIME_DIR/meta-mcp/personal.sock`, else `META_MCP_HOME/personal/personal.sock`. On Windows: `\\.\pipe\meta-mcp-personal-<USERNAME>` |
    | Inbox | `META_MCP_INBOX_DB` | The same file, so `inbox_list` and `inbox_wait` see what the daemon stores |
    | Files directory | `META_MCP_FILES_DIR` (downloads and media sends need it) | The same directory (inline pictures are read by this process) |
    | Read-only | `META_MCP_READ_ONLY` | The same variable (Part 10.4) |
@@ -2280,9 +2375,14 @@ The `meta-mcp` binary stays MIT. Not legal advice.
      without whitespace.
    - **The path must be short.** A Unix socket path is limited by the operating system to about 100 bytes. A longer
      one stops the daemon with `error: cannot listen: path must be shorter than SUN_LEN`. Use a short
-     `META_MCP_PERSONAL_SOCKET`.
+     `META_MCP_PERSONAL_SOCKET`. (A Windows pipe name has no such limit.)
    - **A client started without `XDG_RUNTIME_DIR`** falls back to `META_MCP_HOME/personal/personal.sock`, which is
-     not where systemd put the socket. Set `META_MCP_PERSONAL_SOCKET` in that client's environment.
+     not where systemd put the socket. Set `META_MCP_PERSONAL_SOCKET` in that client's environment. On macOS this is
+     the normal case and the right one: the launchd agent binds that same default.
+   - **Windows pipe names.** The default is `\\.\pipe\meta-mcp-personal-<USERNAME>`, with the user name reduced to
+     letters, digits, `.`, `_` and `-` (anything else becomes `_`). `META_MCP_PERSONAL_SOCKET` replaces it and must
+     start with `\\.\pipe\`. The pipe accepts local clients of your own account only; the daemon refuses to start when
+     another process already holds the name.
    - **`meta-mcp http` leaves the personal tools out by default.** They are served over stdio. If you set
      `META_MCP_PERSONAL_HTTP=1` for the HTTP server, it registers them too (and logs a warning), so with a daemon under
      the same user whose socket the HTTP server finds, every holder of one of the server's API keys can read your chats
@@ -2290,7 +2390,8 @@ The `meta-mcp` binary stays MIT. Not legal advice.
      start the HTTP server read-only and give its keys only to people you would give the session files.
    - **The client checks the daemon.** Before a tool or a `meta-mcp personal` command sends anything, it compares the
      uid of the process behind the socket with its own and refuses a socket served by another user
-     (`untrusted_daemon`).
+     (`untrusted_daemon`). On Windows the same check compares user SIDs: the client reads the SID of the process serving
+     the pipe, and the daemon reads the SID of each connecting client and drops a mismatch.
 
 8. **Connect your assistant.** Personal mode is part of the normal MCP server, so the command is the one from Part 4.8:
 
@@ -2305,8 +2406,13 @@ The `meta-mcp` binary stays MIT. Not legal advice.
 
 9. **Update or remove.** After a new build, replace the three files; `meta-mcp personal restart messenger` or `whatsapp`
    starts a fresh sidecar from the file on disk (for a platform that has a stored session), and
-   `systemctl --user restart meta-mcp-personal.service` restarts the daemon. `meta-mcp personal uninstall` (`--dry-run` to preview) stops the daemon and removes the units; the
-   stored sessions, the state and the audit log stay under `META_MCP_HOME/personal/`.
+   `systemctl --user restart meta-mcp-personal.service` restarts the daemon (macOS:
+   `launchctl kickstart -k gui/$(id -u)/dev.meta-mcp.personal`). On Windows a running program cannot be overwritten:
+   run `meta-mcp personal uninstall`, copy the new files, then run `meta-mcp personal install` again.
+   `meta-mcp personal uninstall` (`--dry-run` to preview) stops the daemon and removes what `install` made: the
+   units on Linux, the plist after `launchctl bootout` on macOS, and on Windows the task, after it asked the daemon to
+   stop with a `shutdown` request and waited up to 20 seconds for it to go (it exits 1 if the daemon still answers).
+   The stored sessions, the state and the audit log stay under `META_MCP_HOME/personal/`.
 
 ### 10.2 Messenger login
 
@@ -2360,7 +2466,7 @@ applied.
 4. **Delete `cookies.json`** and **close the browser window without logging out.** Logging out of that Facebook
    session ends it, and the sidecar's cookies die with it.
 
-**What gets stored.** In `META_MCP_HOME/personal/messenger/` (folders 0700, files 0600):
+**What gets stored.** In `META_MCP_HOME/personal/messenger/` (folders 0700, files 0600; on Windows an owner-only ACL, 10.5):
 
 | File | Content |
 |---|---|
@@ -2480,7 +2586,7 @@ hands you the request and takes the answer back:
 Whether an already linked session is affected by the passkey gate is **UNVERIFIED** (third-party reports say the gate
 sits at the link handshake).
 
-**What gets stored.** In `META_MCP_HOME/personal/whatsapp/` (folders 0700, files 0600):
+**What gets stored.** In `META_MCP_HOME/personal/whatsapp/` (folders 0700, files 0600; on Windows an owner-only ACL, 10.5):
 
 | File | Content |
 |---|---|
@@ -2614,7 +2720,9 @@ needs the same `META_MCP_FILES_DIR`. A file under `inbound/` came from another p
 opens the file without following a final symlink, checks the open handle (a regular file whose real path is still
 inside the files directory and, without `allow_inbound`, outside `inbound/`; otherwise `file_refused`), and copies
 from that handle into a private outbox, so replacing the path with a symlink after the check cannot send a
-different file. It removes the copy after the send.
+different file. It removes the copy after the send. On Windows the daemon opens the file without following a
+reparse point (a symlink or junction), refuses one, and then checks that the final path of the open handle is inside
+the files directory.
 
 **Read-only mode.** `META_MCP_READ_ONLY=true` removes the 10 personal write tools from the MCP server (Part 8.3). The
 daemon checks the same variable for itself and refuses `send_text`, `send_media`, `send_reaction`, `mark_read` and
@@ -2789,8 +2897,18 @@ phone numbers. The sidecars' own log lines (info level, fixed) land in the same 
 only a fixed list of fields is written (it includes thread and message ids), and out of what stays the Messenger
 sidecar cuts URLs, cookies, tokens and plus-prefixed phone numbers, the WhatsApp sidecar user JIDs, phone numbers, QR
 payloads and pair codes ([SECURITY.md](../SECURITY.md#sidecars-logs-and-scrubbing) has the full lists). Under systemd that is
-`journalctl --user -u meta-mcp-personal.service -f`. The scrubbers are pattern based, so do not paste raw logs
+`journalctl --user -u meta-mcp-personal.service -f`; under launchd it is `~/Library/Logs/meta-mcp/daemon.log`
+(`tail -f` it); on Windows it is `%LOCALAPPDATA%\meta-mcp\logs\daemon.log` when the daemon has no console (started by the
+logon task or by `install`), otherwise the terminal it runs in. The scrubbers are pattern based, so do not paste raw logs
 anywhere public without reading them.
+
+**File protection on Windows.** Where Linux and macOS use mode 0700 folders and 0600 files, the daemon gives the folders it
+prepares under `personal/` (and its log folder) a protected ACL with one entry, full control for your user, and does
+the same for the files it writes itself (`state.json`, `audit.jsonl`, outbox copies), using the Win32 security API
+instead of `icacls`. Folders pass the entry to what is created inside them, so the sidecars' databases follow it too.
+Other users, including `Everyone`, get nothing.
+The business-mode `credentials.json` and the inbox database are not changed by this: on Windows they rely on the ACL of
+your profile folder (see [SECURITY.md](../SECURITY.md#personal-mode-on-windows)).
 
 **Backups.** `META_MCP_HOME/personal/` holds your sessions: treat it like a password store. Back it up only to
 encrypted storage, or not at all, since you can always log in again. Never copy `session.db` to another machine: two
@@ -2819,7 +2937,7 @@ Read the error text first: a personal tool error is `<code>: <message>`, and the
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `personal mode not running: start it with ... (socket PATH: ...)` | Nothing listens on the socket the client tried (the message gives its path), or the client looks somewhere else | Check `systemctl --user status meta-mcp-personal.socket meta-mcp-personal.service`. Run `meta-mcp personal install` or `meta-mcp personal daemon`. If the path is under `META_MCP_HOME/personal/`, the client had no `XDG_RUNTIME_DIR`: set `META_MCP_PERSONAL_SOCKET` for it (10.1, step 7) |
+| `personal mode not running: start it with ... (socket PATH: ...)` | Nothing listens on the socket the client tried (the message gives its path), or the client looks somewhere else | Check `systemctl --user status meta-mcp-personal.socket meta-mcp-personal.service` (macOS: `launchctl print gui/$(id -u)/dev.meta-mcp.personal` and the log `~/Library/Logs/meta-mcp/daemon.log`; Windows: `schtasks /Query /TN "meta-mcp personal" /V` and `%LOCALAPPDATA%\meta-mcp\logs\daemon.log`). Run `meta-mcp personal install` or `meta-mcp personal daemon`. On Linux, if the path is under `META_MCP_HOME/personal/`, the client had no `XDG_RUNTIME_DIR`: set `META_MCP_PERSONAL_SOCKET` for it (10.1, step 7). On Windows the message names a pipe: check that the daemon and the client use the same `META_MCP_PERSONAL_SOCKET` and the same user |
 | `error: cannot listen: path must be shorter than SUN_LEN` | The socket path is longer than the operating system allows (about 100 bytes) | Use a shorter `META_MCP_PERSONAL_SOCKET` or `--socket` |
 | `error: another personal daemon already uses ...` or `another personal daemon is already running on ...` | One daemon per `META_MCP_HOME`, and one per socket | Stop the other one (both units, or find the process), then start this one |
 | `sidecar_unavailable: could not start the sidecar at PATH: No such file or directory`, or `meta-mcp personal install` saying `the sidecar binaries cannot be located`; `status --json` shows `last_error` `sidecar_spawn_failed` (`sidecar_not_found` only when the daemon cannot work out where to look) | The sidecar binary is not where the daemon looks, or is not executable | Put the three files together (10.1, step 3) or set `META_MCP_SIDECAR_DIR` in the daemon's environment, then `meta-mcp personal restart PLATFORM`. The path in the message is the one the daemon tried |
@@ -2840,7 +2958,7 @@ Read the error text first: a personal tool error is `<code>: <message>`, and the
 | `client_outdated` | The sidecar's library is too old for WhatsApp (on Messenger, for its encrypted-chat client) | Update the pin and rebuild (10.5) |
 | `send_unknown: the message may have been sent: read the thread before retrying` (or `... before sending again`) | A timeout or a broken link after the send was written, at the sidecar (`retrying`) or between the tool and the daemon (`sending again`: the tool lost the connection or timed out, and the daemon finishes the write anyway) | Read the thread with the read tool. Send again only if the message is not there. The audit log has the `unknown` line |
 | `rate_limited: writes to PLATFORM are paced: retry_after_ms=N` | The daemon's pacing found no token for this platform (10.4). Nothing was sent | Wait N milliseconds and call again, or send less often. `META_MCP_PERSONAL_SEND_INTERVAL_MS` and `META_MCP_PERSONAL_SEND_BURST` change the new-message bucket |
-| `shutting_down: the daemon is shutting down and takes no new writes` | A write arrived while the daemon was stopping | Wait for it to come back (`systemctl --user status meta-mcp-personal.service`) and send again |
+| `shutting_down: the daemon is shutting down and takes no new writes` | A write arrived while the daemon was stopping | Wait for it to come back (`systemctl --user status meta-mcp-personal.service`; on macOS `launchctl print gui/$(id -u)/dev.meta-mcp.personal`; on Windows `meta-mcp personal status`) and send again |
 | `untrusted_daemon: ...` | The process behind the socket runs as another user, or its user could not be read | Check `META_MCP_PERSONAL_SOCKET` and who owns the daemon. Nothing was sent to it |
 | `send_failed` | The platform rejected the message (Messenger: "facebook rejected the message") | Read the message text; check the thread is one you can write to |
 | `not_logged_in: not logged in to PLATFORM ...` | No session, or the service ended it | `meta-mcp personal login PLATFORM` |
@@ -2852,7 +2970,7 @@ Read the error text first: a personal tool error is `<code>: <message>`, and the
 | `attachment_expired` | The platform refused the media even after a refresh | WhatsApp needs the phone online to re-upload expired media and does not ask after a fatal signal. Ask for the file to be sent again |
 | `too_many_requests`, `too_many_waiters` | More than 32 requests, 16 waits or 64 replies outstanding on one connection | Wait for earlier calls to finish |
 | `inbox_list` or `inbox_wait` shows no personal events | The call did not ask for them: personal rows are left out unless `platform` names `messenger_personal` or `whatsapp_personal`, or `include_personal` is true. Or the daemon and the assistant's `meta-mcp` use different inbox files, or the daemon is not connected | Pass `platform` or `include_personal`. Compare `META_MCP_INBOX_DB` in both (10.1, step 7) and check `meta-mcp personal status` |
-| The personal tools are missing from an HTTP server | `meta-mcp http` registers them only with `META_MCP_PERSONAL_HTTP=1`. A system that is not Unix has no personal mode at all | Use stdio, or set the variable knowing what it exposes (10.1, step 7) |
+| The personal tools are missing from an HTTP server | `meta-mcp http` registers them only with `META_MCP_PERSONAL_HTTP=1` | Use stdio, or set the variable knowing what it exposes (10.1, step 7) |
 | `meta-mcp personal install` says the files directory does not exist | `META_MCP_FILES_DIR` names a folder that is not there, and the sandboxed service may only write where a folder already is | Create the folder, then run `install` again |
 | The daemon under systemd cannot write its state, audit log or inbox after you moved a folder | `ReadWritePaths=` in the unit still names the old home, inbox or files folder | Edit the unit to match, `systemctl --user daemon-reload`, then restart the service (10.1) |
 | WhatsApp logs out about two weeks after the last time you opened it on the phone | The 14-day rule (it may show as `device_removed`) | Open WhatsApp on the phone at least every 14 days (10.3) |
@@ -2863,9 +2981,9 @@ Every personal command, with its flags (`-h` and `--help` print the same on each
 
 | Command | What it does | Flags and arguments |
 |---|---|---|
-| `meta-mcp personal install` | Writes and starts the sandboxed systemd user units, creating the home and inbox folders and refusing a files directory that does not exist | `--dry-run`: print the units and the commands, write and run nothing |
-| `meta-mcp personal uninstall` | Stops the daemon and removes the units. Sessions, state and the audit log stay | `--dry-run`: print what would happen |
-| `meta-mcp personal daemon` | Runs the daemon in the foreground | `--socket PATH`: the Unix socket to listen on. Default: `META_MCP_PERSONAL_SOCKET`, else `$XDG_RUNTIME_DIR/meta-mcp/personal.sock`, else `META_MCP_HOME/personal/personal.sock` |
+| `meta-mcp personal install` | Writes and starts the daemon at login: sandboxed systemd user units on Linux, a launchd agent on macOS (both create the home and inbox folders and refuse a files directory that does not exist), a logon task plus an immediate windowless start on Windows | `--dry-run`: print the units, plist or task XML and the commands, write and run nothing |
+| `meta-mcp personal uninstall` | Stops the daemon and removes the units, the launchd agent or the task. Sessions, state and the audit log stay | `--dry-run`: print what would happen |
+| `meta-mcp personal daemon` | Runs the daemon in the foreground | `--socket PATH`: the Unix socket (Windows: the pipe, `\\.\pipe\...`) to listen on. Default: `META_MCP_PERSONAL_SOCKET`, else on Linux `$XDG_RUNTIME_DIR/meta-mcp/personal.sock`, else `META_MCP_HOME/personal/personal.sock`; on Windows `\\.\pipe\meta-mcp-personal-<USERNAME>` |
 | `meta-mcp personal login messenger` | Logs in with browser cookies | `--cookies-file PATH`: a cURL command, a JSON object of cookies or a JSON array of `{name, value}`. Without it, the command prompts (nothing is echoed). There is no flag that takes the cookies as an argument |
 | `meta-mcp personal login whatsapp` | Links the machine as a companion device | `--pair-code PHONE`: link with a code typed on the phone instead of a QR code. `--full-history`: ask the phone for the full history (first link only). `--device-name NAME`: the name in the Linked devices list (default `meta-mcp`) |
 | `meta-mcp personal status` | Shows both accounts | `--json`: print the daemon's answer as JSON |
@@ -2978,7 +3096,7 @@ Third-party tools named in Part 6 (check their own documentation): the Cloudflar
 | **Standard / Advanced Access** | Whether a permission works only for people with an app role, or for everyone (App Review and Business Verification) |
 | **Conversation Routing** | Meta's replacement for the Messenger Handover Protocol: which app owns a thread |
 | **Tech Provider** | A business building apps used by other businesses. Out of scope here |
-| **Personal daemon** | `meta-mcp personal daemon`: the long-lived process that owns the personal sidecars, the session files, the send audit log and the Unix socket (Part 10) |
+| **Personal daemon** | `meta-mcp personal daemon`: the long-lived process that owns the personal sidecars, the session files, the send audit log and the Unix socket or Windows named pipe (Part 10) |
 | **Sidecar** | A Go program that the personal daemon starts for one account, Messenger or WhatsApp, and talks to over pipes |
 | **Linked device** | A companion device attached to a WhatsApp account, up to four per phone. The WhatsApp sidecar is one |
 | **JID, LID** | WhatsApp identifiers. A JID looks like `<digits>@s.whatsapp.net` (a person, by phone number) or `...@g.us` (a group). A LID (`...@lid`) is a hidden-user identifier that WhatsApp uses in place of the number for some chats |

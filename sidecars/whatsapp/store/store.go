@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"unicode/utf8"
 
@@ -192,6 +193,15 @@ type querier interface {
 
 type scanner interface{ Scan(dest ...any) error }
 
+// uriPath turns a native path into the slash form SQLite URIs expect (/C:/dir/file.db on Windows).
+func uriPath(p string) string {
+	p = filepath.ToSlash(p)
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	return p
+}
+
 // Open opens or creates messages.db at path with mode 0600 and migrates it.
 func Open(path string) (*Store, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
@@ -199,7 +209,7 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("store: create db file: %w", err)
 	}
 	f.Close()
-	esc := strings.NewReplacer("%", "%25", "?", "%3f", "#", "%23").Replace(path)
+	esc := strings.NewReplacer("%", "%25", "?", "%3f", "#", "%23").Replace(uriPath(path))
 	dsn := "file:" + esc + "?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=secure_delete(1)&_pragma=temp_store(2)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {

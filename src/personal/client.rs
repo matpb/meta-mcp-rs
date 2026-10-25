@@ -1,13 +1,13 @@
-//! Client side of the daemon socket: a `Link` over a unix stream.
+//! Client side of the daemon socket or pipe: a `Link` over the transport stream.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::net::UnixStream;
 use tokio::sync::mpsc::UnboundedReceiver;
 
+use super::ipc;
 use super::link::{Link, LinkError};
 use super::protocol::{CODE_TIMEOUT, Event};
 
@@ -64,7 +64,7 @@ pub struct DaemonClient {
 impl DaemonClient {
     /// Connects and checks that the process behind the socket runs as this user.
     pub async fn connect(path: &Path) -> Result<Self, ClientError> {
-        let own = super::own_uid().await.map_err(|e| {
+        let own = ipc::own_identity().await.map_err(|e| {
             ClientError::new(
                 CODE_UNTRUSTED_DAEMON,
                 format!("cannot read our own uid: {e}"),
@@ -73,23 +73,24 @@ impl DaemonClient {
         Self::connect_as(path, own).await
     }
 
-    async fn connect_as(path: &Path, expected_uid: u32) -> Result<Self, ClientError> {
-        let stream = UnixStream::connect(path).await.map_err(|e| {
+    async fn connect_as(path: &Path, expected: ipc::Identity) -> Result<Self, ClientError> {
+        let kind = ipc::ENDPOINT_KIND;
+        let stream = ipc::connect(path).await.map_err(|e| {
             ClientError::new(
                 CODE_NOT_RUNNING,
                 format!(
-                    "personal mode not running: start it with `meta-mcp personal install` or `meta-mcp personal daemon` (socket {}: {e})",
+                    "personal mode not running: start it with `meta-mcp personal install` or `meta-mcp personal daemon` ({kind} {}: {e})",
                     path.display()
                 ),
             )
         })?;
-        match stream.peer_cred() {
-            Ok(cred) if super::daemon::peer_allowed(cred.uid(), expected_uid) => {}
+        match ipc::server_identity(&stream) {
+            Ok(server) if super::daemon::peer_allowed(&server, &expected) => {}
             Ok(_) => {
                 return Err(ClientError::new(
                     CODE_UNTRUSTED_DAEMON,
                     format!(
-                        "the socket {} is served by another user: refusing to send anything to it",
+                        "the {kind} {} is served by another user: refusing to send anything to it",
                         path.display()
                     ),
                 ));
@@ -101,7 +102,7 @@ impl DaemonClient {
                 ));
             }
         }
-        let (read_half, write_half) = stream.into_split();
+        let (read_half, write_half) = ipc::split(stream);
         Ok(Self {
             link: Link::new(read_half, write_half),
             socket: path.to_path_buf(),
@@ -157,12 +158,13 @@ mod tests {
         assert!(err.message.contains(path.to_str().expect("utf8")), "{err}");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_server_running_as_another_uid_is_refused_before_anything_is_sent() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("s.sock");
         let listener = tokio::net::UnixListener::bind(&path).expect("bind");
-        let own = crate::personal::own_uid().await.expect("uid");
+        let own = ipc::own_identity().await.expect("uid");
         let seen = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut buf = [0u8; 1];

@@ -1,7 +1,6 @@
 //! MCP surface: the core tools (status and inbox) plus seams for Messenger and WhatsApp tools.
 
 pub mod messenger_tools;
-#[cfg(unix)]
 pub mod personal_tools;
 pub mod whatsapp_tools;
 
@@ -21,7 +20,6 @@ use crate::config::{Config, PageConfig, PhoneNumber, WhatsAppConfig};
 use crate::files::{FileError, FileJail};
 use crate::graph::{GraphClient, GraphError};
 use crate::inbox::{Event, EventKind, Inbox, InboxError, ListFilter, Platform, now_secs};
-#[cfg(unix)]
 use crate::personal::client::DaemonClient;
 
 /// Tools that change local state and disappear in read-only mode.
@@ -65,7 +63,6 @@ pub const BUSINESS_READ_ONLY_TOOL_NAMES: [&str; 9] = [
 ];
 
 /// Every tool the stdio server exposes, sorted.
-#[cfg(unix)]
 pub const ALL_TOOL_NAMES: [&str; 39] = [
     "inbox_list",
     "inbox_mark_processed",
@@ -108,12 +105,7 @@ pub const ALL_TOOL_NAMES: [&str; 39] = [
     "whatsapp_upload_media",
 ];
 
-/// Every tool the server exposes, sorted (no personal mode on this platform).
-#[cfg(not(unix))]
-pub const ALL_TOOL_NAMES: [&str; 20] = BUSINESS_TOOL_NAMES;
-
 /// The tools left in read-only mode (downloads stay: they only write local files).
-#[cfg(unix)]
 pub const READ_ONLY_TOOL_NAMES: [&str; 18] = [
     "inbox_list",
     "inbox_wait",
@@ -134,10 +126,6 @@ pub const READ_ONLY_TOOL_NAMES: [&str; 18] = [
     "whatsapp_personal_list_chats",
     "whatsapp_personal_read_chat",
 ];
-
-/// The tools left in read-only mode (no personal mode on this platform).
-#[cfg(not(unix))]
-pub const READ_ONLY_TOOL_NAMES: [&str; 9] = BUSINESS_READ_ONLY_TOOL_NAMES;
 
 const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 200;
@@ -248,20 +236,16 @@ pub struct MetaMcp {
     pub graph: Arc<GraphClient>,
     pub inbox: Inbox,
     tool_router: ToolRouter<Self>,
-    #[cfg(unix)]
     personal: Arc<tokio::sync::Mutex<Option<Arc<DaemonClient>>>>,
 }
 
-/// The tool router; `personal` adds the personal-account tools (unix only).
+/// The tool router; `personal` adds the personal-account tools.
 fn build_router(read_only: bool, personal: bool) -> ToolRouter<MetaMcp> {
     let mut router =
         MetaMcp::core_router() + MetaMcp::messenger_router() + MetaMcp::whatsapp_router();
-    #[cfg(unix)]
     if personal {
         router += MetaMcp::personal_router();
     }
-    #[cfg(not(unix))]
-    let _ = personal;
     if read_only {
         for name in CORE_WRITE_TOOLS
             .iter()
@@ -270,7 +254,6 @@ fn build_router(read_only: bool, personal: bool) -> ToolRouter<MetaMcp> {
         {
             router.remove_route(name);
         }
-        #[cfg(unix)]
         for name in personal_tools::WRITE_TOOLS {
             router.remove_route(name);
         }
@@ -308,7 +291,7 @@ impl MetaMcp {
     /// Builds the HTTP handler: the personal tools only when `META_MCP_PERSONAL_HTTP=1`.
     pub fn new_http(cfg: Config) -> Result<Self, anyhow::Error> {
         let personal = personal_over_http();
-        if personal && cfg!(unix) {
+        if personal {
             tracing::warn!(
                 "{ENV_PERSONAL_HTTP}=1: every API key holder can read and send as the owner's personal accounts"
             );
@@ -324,7 +307,6 @@ impl MetaMcp {
             cfg: Arc::new(cfg),
             graph: Arc::new(graph),
             inbox,
-            #[cfg(unix)]
             personal: Arc::default(),
         })
     }
@@ -761,7 +743,6 @@ mod tests {
         assert!(list.contains("unprocessed_only") && list.contains("include_raw"));
     }
 
-    #[cfg(unix)]
     #[test]
     fn personal_tools_document_every_parameter() {
         let names: Vec<&str> = ALL_TOOL_NAMES
@@ -786,7 +767,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn personal_write_tools_are_exactly_the_ten_sending_ones() {
         assert_eq!(personal_tools::WRITE_TOOLS.len(), 10);
@@ -832,7 +812,6 @@ mod tests {
             .filter(|n| !n.contains("personal"))
             .collect();
         assert_eq!(read_only, BUSINESS_READ_ONLY_TOOL_NAMES);
-        #[cfg(unix)]
         assert_eq!(tool_names_for_transport(false, true), ALL_TOOL_NAMES);
     }
 

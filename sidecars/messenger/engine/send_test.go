@@ -598,7 +598,7 @@ func TestDownloadAttachmentWritesFile(t *testing.T) {
 	if res.Path != dest || res.Mime != "image/png" || res.Bytes != 5 || res.SHA256 != "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824" {
 		t.Fatalf("result %+v", res)
 	}
-	if st, _ := os.Stat(dest); st.Mode().Perm() != 0o600 {
+	if st, _ := os.Stat(dest); posixModes && st.Mode().Perm() != 0o600 {
 		t.Fatalf("mode %v", st.Mode().Perm())
 	}
 }

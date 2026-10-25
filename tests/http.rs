@@ -243,7 +243,6 @@ async fn personal_tools_are_absent_over_http_by_default() {
     );
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn personal_tools_are_served_over_http_only_with_the_explicit_opt_in() {
     let s = Server::with_key(&[], &[("META_MCP_PERSONAL_HTTP", "1")]);

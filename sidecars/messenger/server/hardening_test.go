@@ -57,7 +57,7 @@ func TestLockFileIsPrivateAndSurvivesLogout(t *testing.T) {
 	h.helloOK(goodState)
 	p := filepath.Join(h.dir, lockFileName)
 	fi, err := os.Stat(p)
-	if err != nil || fi.Mode().Perm() != 0o600 {
+	if err != nil || posixModes && fi.Mode().Perm() != 0o600 {
 		t.Fatalf("lock file: %v %v", fi, err)
 	}
 	wantOK(t, h.call(h.req(2, "logout", "null")), 2)

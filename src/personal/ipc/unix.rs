@@ -1,24 +1,88 @@
-//! Where the daemon accepts clients: a systemd-passed socket, or one it binds itself.
+//! The unix socket transport: a systemd-passed socket, or one the daemon binds itself.
 
 use std::io;
 use std::os::fd::FromRawFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use tokio::net::UnixListener;
+use tokio::net::{UnixListener, UnixStream};
+
+use super::ListenError;
+
+/// The uid of a peer or of this process.
+pub type Identity = u32;
+pub type ServerStream = UnixStream;
+pub type ClientStream = UnixStream;
+
+/// Word for the endpoint in messages shown to users.
+pub const ENDPOINT_KIND: &str = "socket";
 
 pub struct Listener {
-    pub listener: UnixListener,
+    listener: UnixListener,
     /// Set when the daemon bound the socket itself and removes it on exit.
-    pub bound_path: Option<PathBuf>,
+    bound_path: Option<PathBuf>,
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum ListenError {
-    #[error("another personal daemon is already running on {0}")]
-    AlreadyRunning(PathBuf),
-    #[error("cannot listen: {0}")]
-    Io(#[from] io::Error),
+impl Listener {
+    pub async fn accept(&mut self) -> io::Result<ServerStream> {
+        self.listener.accept().await.map(|(stream, _)| stream)
+    }
+
+    /// True when systemd handed the socket over, so the daemon does not own the socket file.
+    pub fn socket_activated(&self) -> bool {
+        self.bound_path.is_none()
+    }
+
+    /// Removes the socket file the daemon bound itself.
+    pub fn cleanup(&self) {
+        if let Some(path) = &self.bound_path {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// The uid this process runs as, read from the peer credentials of a socket pair with itself.
+pub async fn own_identity() -> io::Result<Identity> {
+    let (a, _b) = UnixStream::pair()?;
+    Ok(a.peer_cred()?.uid())
+}
+
+pub fn peer_identity(stream: &ServerStream) -> io::Result<Identity> {
+    Ok(stream.peer_cred()?.uid())
+}
+
+pub fn server_identity(stream: &ClientStream) -> io::Result<Identity> {
+    Ok(stream.peer_cred()?.uid())
+}
+
+/// Splits a client stream; dropping the write half shuts the connection down at once.
+pub fn split(
+    stream: ClientStream,
+) -> (
+    tokio::net::unix::OwnedReadHalf,
+    tokio::net::unix::OwnedWriteHalf,
+) {
+    stream.into_split()
+}
+
+pub async fn connect(endpoint: &Path) -> io::Result<ClientStream> {
+    UnixStream::connect(endpoint).await
+}
+
+/// `META_MCP_PERSONAL_SOCKET`, else `$XDG_RUNTIME_DIR/meta-mcp/personal.sock`, else under the home.
+pub fn default_endpoint() -> PathBuf {
+    let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty());
+    if let Some(p) = env(crate::personal::ENV_SOCKET) {
+        return PathBuf::from(p);
+    }
+    if let Some(dir) = env("XDG_RUNTIME_DIR") {
+        return PathBuf::from(dir).join("meta-mcp/personal.sock");
+    }
+    let home = env("META_MCP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| crate::config::default_home().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    crate::personal::personal_dir(&home).join("personal.sock")
 }
 
 /// True when an `accept` error means the listener itself is unusable (not a socket, not listening).
@@ -191,5 +255,31 @@ mod tests {
         std::fs::write(&file, b"x").expect("write");
         assert!(acquire(&file).is_err());
         assert!(file.exists());
+    }
+
+    #[tokio::test]
+    async fn a_client_round_trips_a_line_and_both_ends_see_our_uid() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sub/s.sock");
+        let mut listener = acquire(&path).expect("acquire");
+        assert!(!listener.socket_activated());
+        let own = own_identity().await.expect("uid");
+        let client = connect(&path).await.expect("connect");
+        let server = listener.accept().await.expect("accept");
+        assert_eq!(peer_identity(&server).expect("peer"), own);
+        assert_eq!(server_identity(&client).expect("server"), own);
+        let (_read, mut write) = tokio::io::split(client);
+        write.write_all(b"hello\n").await.expect("write");
+        write.flush().await.expect("flush");
+        let (read, _write) = tokio::io::split(server);
+        let mut line = String::new();
+        BufReader::new(read)
+            .read_line(&mut line)
+            .await
+            .expect("read");
+        assert_eq!(line, "hello\n");
+        listener.cleanup();
+        assert!(!path.exists());
     }
 }

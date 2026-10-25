@@ -15,7 +15,8 @@ go test -count=1 ./...
 step "go build"
 # Symbols stay in: govulncheck -mode=binary on a stripped binary flags whole modules.
 go build -trimpath -ldflags="-buildid=" -o bin/meta-whatsapp-sidecar .
-if ! file bin/meta-whatsapp-sidecar | grep -q "statically linked"; then
+# Only Linux binaries are static; macOS links libSystem dynamically.
+if [ "$(go env GOOS)" = linux ] && ! file bin/meta-whatsapp-sidecar | grep -q "statically linked"; then
   echo "error: bin/meta-whatsapp-sidecar is not statically linked" >&2
   exit 1
 fi

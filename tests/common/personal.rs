@@ -535,6 +535,12 @@ impl RunningDaemon {
         wait_exit(&mut child)
     }
 
+    /// Waits for the daemon to exit on its own; the exit code (None when killed by a signal).
+    pub fn wait(mut self) -> Option<i32> {
+        let mut child = self.child.take().expect("running");
+        wait_exit(&mut child)
+    }
+
     /// Sets the daemon's file size limit in bytes (`prlimit`), so later writes past it fail.
     pub fn limit_file_size(&self, bytes: u64) {
         let status = Command::new("prlimit")

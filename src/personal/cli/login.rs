@@ -20,6 +20,22 @@ const CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
 const WHATSAPP_BUDGET: Duration = Duration::from_secs(300);
 const MAX_INPUT_BYTES: usize = 256 * 1024;
 const EXIT_USAGE: u8 = 2;
+#[cfg(unix)]
+type Interrupt = tokio::signal::unix::Signal;
+#[cfg(windows)]
+type Interrupt = tokio::signal::windows::CtrlC;
+
+/// Listens for Ctrl-C: SIGINT on Unix, the console event on Windows.
+#[cfg(unix)]
+fn interrupt() -> io::Result<Interrupt> {
+    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+}
+
+#[cfg(windows)]
+fn interrupt() -> io::Result<Interrupt> {
+    tokio::signal::windows::ctrl_c()
+}
+
 const NO_QR_SHOWN: &str = "no QR code was shown: the sidecar could not reach WhatsApp; check the network and run the command again";
 
 /// Options of `personal login whatsapp`.
@@ -244,8 +260,7 @@ pub async fn login_whatsapp(opts: WhatsAppLogin) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut sigint = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-    {
+    let mut sigint = match interrupt() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: cannot listen for Ctrl-C: {e}");
@@ -317,11 +332,7 @@ pub async fn login_whatsapp(opts: WhatsAppLogin) -> ExitCode {
 
 impl Flow<'_> {
     /// Acts on one event; `Some(code)` ends the command.
-    async fn handle(
-        &mut self,
-        ev: Event,
-        sigint: &mut tokio::signal::unix::Signal,
-    ) -> Option<ExitCode> {
+    async fn handle(&mut self, ev: Event, sigint: &mut Interrupt) -> Option<ExitCode> {
         let platform = PersonalPlatform::WhatsApp;
         match ev.event.as_str() {
             "qr" => {
@@ -446,11 +457,7 @@ impl Flow<'_> {
         self.qr_lines = 1 + art.lines().count();
     }
 
-    async fn passkey(
-        &self,
-        data: &Value,
-        sigint: &mut tokio::signal::unix::Signal,
-    ) -> Option<ExitCode> {
+    async fn passkey(&self, data: &Value, sigint: &mut Interrupt) -> Option<ExitCode> {
         let platform = PersonalPlatform::WhatsApp;
         if let Some(text) = data.get("instructions").and_then(Value::as_str) {
             println!("{}", clean(text));

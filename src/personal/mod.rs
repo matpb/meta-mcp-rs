@@ -1,15 +1,19 @@
 //! Personal Messenger and WhatsApp accounts: a long-lived daemon owns the Go sidecars and a
-//! unix socket serves the CLI and the MCP tools.
+//! unix socket or a named pipe serves the CLI and the MCP tools.
 
 pub mod audit;
 pub mod cli;
 pub mod client;
 pub mod daemon;
+pub mod ipc;
 pub mod link;
 pub mod protocol;
+pub mod secure;
 pub mod sidecar;
 pub mod state;
 pub mod validate;
+#[cfg(windows)]
+pub mod winsec;
 
 use std::path::{Path, PathBuf};
 
@@ -44,8 +48,14 @@ impl PersonalPlatform {
 
     pub fn binary_name(self) -> &'static str {
         match self {
+            #[cfg(not(windows))]
             Self::Messenger => "meta-messenger-sidecar",
+            #[cfg(not(windows))]
             Self::WhatsApp => "meta-whatsapp-sidecar",
+            #[cfg(windows)]
+            Self::Messenger => "meta-messenger-sidecar.exe",
+            #[cfg(windows)]
+            Self::WhatsApp => "meta-whatsapp-sidecar.exe",
         }
     }
 
@@ -57,26 +67,9 @@ impl PersonalPlatform {
     }
 }
 
-/// `META_MCP_PERSONAL_SOCKET`, else `$XDG_RUNTIME_DIR/meta-mcp/personal.sock`, else under the home.
+/// Where the daemon listens: a socket path on Unix, a `\\.\pipe\` name on Windows.
 pub fn default_socket_path() -> PathBuf {
-    let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty());
-    if let Some(p) = env(ENV_SOCKET) {
-        return PathBuf::from(p);
-    }
-    if let Some(dir) = env("XDG_RUNTIME_DIR") {
-        return PathBuf::from(dir).join("meta-mcp/personal.sock");
-    }
-    let home = env("META_MCP_HOME")
-        .map(PathBuf::from)
-        .or_else(|| crate::config::default_home().ok())
-        .unwrap_or_else(|| PathBuf::from("."));
-    personal_dir(&home).join("personal.sock")
-}
-
-/// The uid this process runs as, read from the peer credentials of a socket pair with itself.
-pub(crate) async fn own_uid() -> std::io::Result<u32> {
-    let (a, _b) = tokio::net::UnixStream::pair()?;
-    Ok(a.peer_cred()?.uid())
+    ipc::default_endpoint()
 }
 
 /// `<home>/personal`, where state, audit log and sidecar data live.
@@ -102,9 +95,10 @@ mod tests {
             Some(PersonalPlatform::Messenger)
         );
         assert_eq!(PersonalPlatform::parse("sms"), None);
+        let exe = if cfg!(windows) { ".exe" } else { "" };
         assert_eq!(
             PersonalPlatform::Messenger.binary_name(),
-            "meta-messenger-sidecar"
+            format!("meta-messenger-sidecar{exe}")
         );
         assert_eq!(
             PersonalPlatform::WhatsApp.inbox_platform().as_str(),

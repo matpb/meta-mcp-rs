@@ -29,7 +29,8 @@ a WhatsApp token can send from that number. Everything below follows from that.
 
 Personal mode has a second central fact: **the session files are your account.** The Messenger cookies and
 the WhatsApp linked-device keys that the daemon stores let whoever holds them be you on that platform, and the
-daemon socket lets any process running as your user do the same. See [Personal mode](#personal-mode).
+daemon socket (on Windows, its named pipe) lets any process running as your user do the same. See
+[Personal mode](#personal-mode).
 
 | Asset | What an attacker gains |
 |---|---|
@@ -43,7 +44,7 @@ daemon socket lets any process running as your user do the same. See [Personal m
 | Messenger session cookies (`personal/messenger/state.json`) | A Facebook web session as you: read and send in every chat |
 | Linked-device keys (`personal/whatsapp/data/session.db`) | Act as your linked WhatsApp device until you unlink it on the phone |
 | Personal message stores (`messages.db`, `e2ee.db`, `inbox.db`) | Your chat history, in the clear |
-| The personal daemon socket | Read your chats and send as you, from any process running as your user |
+| The personal daemon socket or pipe | Read your chats and send as you, from any process running as your user |
 
 Who and what is considered hostile:
 
@@ -114,9 +115,10 @@ or number you can afford to lose, and a client that asks for confirmation before
   token and API keys are protected by never being formatted into messages, not by scrubbing.
 - **`credentials.json`.** Written atomically (private temporary file, fsync, rename) as mode
   0600 inside a directory of mode 0700 on Unix. On load, a file readable by group or others
-  logs a warning that names the `chmod 600` fix. On non-Unix systems the permission bits
-  are not set, so rely on the ACLs of your profile directory. When meta-mcp creates the inbox
-  database it is created 0600 as well; an existing file keeps its mode.
+  logs a warning that names the `chmod 600` fix. On Windows the permission bits do not exist and meta-mcp sets no
+  ACL on this file or on the inbox database (the personal-mode files are different, see
+  [Personal mode on Windows](#personal-mode-on-windows)), so rely on the ACLs of your profile directory. When meta-mcp
+  creates the inbox database on Unix it is created 0600 as well; an existing file keeps its mode.
 - **Environment variables** override the file and suit containers. They are visible to the
   same user and to root through the process table, and to anything that inherits the
   environment. Prefer a systemd `EnvironmentFile` or your platform's secret mechanism over
@@ -382,7 +384,8 @@ does not stop logging in or out, reading, waiting, downloading attachments or st
 
 ### Session files
 
-The daemon keeps your logged-in sessions in `META_MCP_HOME/personal/` (folders 0700, files 0600):
+The daemon keeps your logged-in sessions in `META_MCP_HOME/personal/` (folders 0700, files 0600; on Windows an
+owner-only ACL, see [Personal mode on Windows](#personal-mode-on-windows)):
 
 | File | What it holds | What a copy lets someone do |
 |---|---|---|
@@ -395,7 +398,7 @@ The daemon keeps your logged-in sessions in `META_MCP_HOME/personal/` (folders 0
 | `audit.jsonl` | See below | Learn the thread IDs, message IDs and times of your sends |
 | `inbox.db` (`META_MCP_INBOX_DB`) | Every personal event the daemon stored, with the whole event in `raw` | Read stored messages, names and attachment descriptions |
 
-- **Who can read them.** Your user and root. Under `personal/`, folders are reset to 0700 whenever the daemon prepares
+- **Who can read them.** Your user and root (on Windows: your user and, by taking ownership, an administrator). Under `personal/`, folders are reset to 0700 whenever the daemon prepares
   them and files are created 0600 (the unit sets `UMask=0077`), so another local user cannot read them. The exception
   is `inbox.db`: it lives outside `personal/`, the daemon resets neither its mode nor the mode of its folder, and
   meta-mcp creates a new one 0600 while an existing file keeps its mode (see
@@ -437,7 +440,9 @@ The daemon keeps your logged-in sessions in `META_MCP_HOME/personal/` (folders 0
 
 ### The daemon socket
 
-The socket is mode 0600. A folder that the daemon, or a socket unit written by `personal install`, has to create for
+On Linux and macOS the socket is mode 0600 (on Windows the daemon listens on a named pipe instead, see
+[Personal mode on Windows](#personal-mode-on-windows)). A folder that the daemon, or a socket unit written by
+`personal install`, has to create for
 it is mode 0700, and so is `META_MCP_HOME/personal/`, which the daemon always resets to 0700; any other existing
 folder keeps its mode, so check it if you chose the path with `--socket` or `META_MCP_PERSONAL_SOCKET`. The
 daemon serves only connections whose peer uid is its own (other uids are logged and dropped), and the client checks
@@ -476,8 +481,10 @@ accident. That is a default, not an access control: a caller who asks for them g
 
 `messenger_personal_send_media` and `whatsapp_personal_send_media` take a path inside `META_MCP_FILES_DIR`. After the
 jail check the daemon opens the file without following a final symlink or blocking on it, then checks the open
-handle: it must be a regular file whose real path (read from `/proc/self/fd` on Linux) is still inside the files
-directory and, unless `allow_inbound` is true, outside `inbound/`. The copy that is sent is read from that handle,
+handle: it must be a regular file whose real path (read from `/proc/self/fd` on Linux, `GetFinalPathNameByHandleW`
+on Windows) is still inside the files directory and, unless `allow_inbound` is true, outside `inbound/`. On Windows
+the open does not follow reparse points (`FILE_FLAG_OPEN_REPARSE_POINT`) and a reparse point (a symlink or junction)
+is refused. The copy that is sent is read from that handle,
 so replacing the path with a symlink between the check and the read cannot send another file. A mismatch is
 `file_refused`. The checks are the daemon's own, and it hands the sidecar only the copy in the platform's private
 `outbox/`.
@@ -553,6 +560,35 @@ is AGPL-3.0 and that distributing it carries the AGPL source obligations; the Wh
 mautrix-meta and `whatsmeow`), which is GPL-3.0, so
 check the terms of every sidecar binary you distribute. The Rust `meta-mcp` binary is MIT. This is not legal advice.
 
+### Personal mode on Windows
+
+The same promises hold, kept with Windows mechanisms instead of Unix modes.
+
+- **The pipe.** The daemon listens on `\\.\pipe\meta-mcp-personal-<USERNAME>` (user name reduced to letters, digits,
+  `.`, `_` and `-`), or on the name in `META_MCP_PERSONAL_SOCKET`, which must start with `\\.\pipe\`. The pipe is
+  created with an explicit security descriptor, `D:P(A;;GA;;;<your SID>)`: one entry, full access for your user, and
+  nothing inherited. The default pipe descriptor would also give read access to `Everyone` and to anonymous users,
+  which is why it is not used. Remote clients are rejected. The daemon creates the first instance of the name, so when
+  another process already holds it the daemon refuses to start instead of serving next to it.
+- **Who may connect.** The daemon reads the user SID of each client process (`GetNamedPipeClientProcessId`, then the
+  process token) and drops a connection whose SID is not its own. The client does the mirror check on the process that
+  serves the pipe (`GetNamedPipeServerProcessId`) and refuses a daemon of another user (`untrusted_daemon`), as the
+  uid checks do on Unix. As on Unix, there are no tokens: any process running as your user can use the pipe.
+- **Files.** Where Unix uses 0700 folders and 0600 files, the daemon sets a protected owner-only ACL through the Win32
+  security API (`SetNamedSecurityInfoW`; no `icacls`): `D:P(A;OICI;FA;;;<your SID>)` on folders, which their children
+  inherit, and `D:P(A;;FA;;;<your SID>)` on files. It uses your user SID, not the `OW` and `CO` shortcuts, because the
+  default owner of an elevated administrator is the Administrators group. This covers `personal/`, the files the
+  daemon writes there, the outbox copies and the log folder. The sidecars' own files follow the ACL of their folder.
+- **Not covered.** `credentials.json` and the inbox database of business mode are not changed by this: on Windows they
+  rely on the ACL of your profile folder, as before. An administrator can take ownership and
+  read the files, and so can anyone who holds a copy of your disk.
+- **Sending files.** The reparse point refusal and the final path check are described under
+  [Files the assistant sends](#files-the-assistant-sends).
+- **Logs.** A daemon without a console writes to `%LOCALAPPDATA%\meta-mcp\logs\daemon.log` (folder with the same
+  owner-only ACL, rotated at 10 MiB), with the same scrubbed content as elsewhere.
+- **Autostart.** The logon task runs as you with a limited token (no administrator rights). It stores no secret: the
+  environment comes from your saved user environment, so do not put credentials in variables you save with `setx`.
+
 ### What personal mode does not defend against
 
 A process running as your user, a compromised host or disk, and the platforms themselves: a restriction, a
@@ -593,15 +629,17 @@ dropped). `inbox.db` is never purged. Apply your own retention, and see
 7. If you enable Meta's **Server IP Allow List** (Settings > Advanced > Security), run
    meta-mcp from an allowed address: Meta documents that it blocks app-secret-signed calls
    from other addresses.
-8. The crate denies `unsafe` code in its own source (`unsafe_code = "deny"` in `Cargo.toml`), with one
-   exception. `take_fd3` in `src/personal/daemon/listen.rs` carries `#[allow(unsafe_code)]` and calls
-   `from_raw_fd(3)`: when systemd starts the personal daemon through socket activation it passes the
-   listening socket as file descriptor 3, and the standard library has no safe function that adopts a descriptor
-   by its number. The call is made only when `LISTEN_FDS` is `1`, `LISTEN_PID` is the daemon's own pid and file
-   descriptor 3 is open and is a socket (checked through `/proc/self/fd/3`, so socket activation is Linux only), and
-   the descriptor is then duplicated close-on-exec so that no sidecar inherits it. Personal mode is compiled on Unix
-   only (`#[cfg(unix)]`). It is the only such
-   function in the crate. The Go sidecars are separate programs (see
+8. The crate denies `unsafe` code in its own source (`unsafe_code = "deny"` in `Cargo.toml`), with two
+   groups of exceptions, each marked `#[allow(unsafe_code)]` with a comment. On Unix, `take_fd3` in
+   `src/personal/ipc/unix.rs` calls `from_raw_fd(3)`: when systemd starts the personal daemon through socket
+   activation it passes the listening socket as file descriptor 3, and the standard library has no safe function that
+   adopts a descriptor by its number. The call is made only when `LISTEN_FDS` is `1`, `LISTEN_PID` is the daemon's own
+   pid and file descriptor 3 is open and is a socket (checked through `/proc/self/fd/3`, so socket activation is Linux
+   only), and the descriptor is then duplicated close-on-exec so that no sidecar inherits it. On Windows, the calls
+   into the Win32 API through the `windows-sys` crate (user SIDs and process tokens, security descriptors and
+   `SetNamedSecurityInfoW`, the named pipe peer process ids, console detach, and the final path of a file handle) sit
+   in `src/personal/winsec.rs`, `src/personal/ipc/windows.rs` and one function in `src/personal/daemon/write.rs`; they
+   are compiled only on Windows. The Go sidecars are separate programs (see
    [Supply chain and licences](#supply-chain-and-licences)). The dependencies of the Rust crate are not
    audited by this repository, so keep them updated.
 9. Personal mode only: keep `META_MCP_HOME`, the inbox database and the files directory (which holds downloads)

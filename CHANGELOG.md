@@ -10,6 +10,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Personal mode (your own Messenger and WhatsApp accounts through unofficial clients), hardening of the
 download, file and send paths, and the setup wizard as built.
 
+### Personal mode on macOS and Windows
+
+Personal mode now builds and runs on Linux, macOS and Windows. This replaces the "compiled on Unix only" entry under
+Changed below: all 39 tools are available on all three systems.
+
+- `meta-mcp personal install` and `uninstall` (both with `--dry-run`) work on every system. Linux keeps the systemd user
+  units with socket activation. macOS gets a launchd agent, `dev.meta-mcp.personal`, in `~/Library/LaunchAgents`
+  (starts at login, restarts after a failed exit every 10 seconds, `Umask` 077, log in
+  `~/Library/Logs/meta-mcp/daemon.log`, no socket activation; it needs a logged-in graphical session). Windows gets a
+  logon task named `meta-mcp personal` (this user only, limited token, no administrator rights, no execution time limit,
+  restart on failure three times a minute apart) and an immediate windowless start of the daemon. A logon task cannot
+  carry environment variables, so `META_MCP_HOME` and the others must be saved in the user environment with `setx`;
+  `install` prints a note when they are set only in the current shell. `uninstall` on Windows stops the daemon through
+  the new `shutdown` op, then deletes the task.
+- On Windows the daemon listens on the named pipe `\\.\pipe\meta-mcp-personal-<USERNAME>`; `META_MCP_PERSONAL_SOCKET`
+  replaces it and must start with `\\.\pipe\`. The pipe has an explicit owner-only security descriptor
+  (`D:P(A;;GA;;;<your SID>)`, where the default would also grant read access to `Everyone` and anonymous users), rejects
+  remote clients and refuses a second daemon on the same name. Daemon and client compare the other side's user SID, the
+  Windows counterpart of the uid check. On macOS the default socket is `META_MCP_HOME/personal/personal.sock`.
+- On Windows the files under `personal/` get a protected owner-only ACL set through the Win32 API instead of modes 0700
+  and 0600 (folders `D:P(A;OICI;FA;;;<your SID>)`, files `D:P(A;;FA;;;<your SID>)`). `credentials.json` and the inbox
+  database of business mode are unchanged and rely on the ACL of your profile folder there.
+- Sending a file on Windows opens it without following reparse points, refuses one, and checks that the final path of the
+  open handle is inside `META_MCP_FILES_DIR`.
+- New daemon op `shutdown` (reply `{"stopping": true}`, then the normal clean shutdown; allowed in read-only mode). On
+  Windows the daemon also stops cleanly on Ctrl-C, Ctrl-Break, console close, logoff and system shutdown.
+- A Windows daemon without a console (started by the logon task or by `install`) detaches and logs to
+  `%LOCALAPPDATA%\meta-mcp\logs\daemon.log` without colour codes (renamed to `daemon.log.1` over 10 MiB at start). Started
+  from a terminal it logs to that terminal. Sidecars start without a window.
+- The daemon's log lines carry ANSI colour codes only when its stderr is a terminal: the systemd journal, the launchd
+  log and the Windows log file get plain text.
+- On Windows `personal install` starts the daemon with no inherited handles and, when the job allows it, outside the
+  caller's job, so an SSH session or a captured shell that ran `install` neither waits for the daemon nor stops it.
+- The sidecars are `meta-messenger-sidecar.exe` and `meta-whatsapp-sidecar.exe` on Windows, found next to `meta-mcp.exe`
+  or in `META_MCP_SIDECAR_DIR`. The Go sidecars lock their `data_dir` with `LockFileEx` on Windows (`flock` on Unix).
+- `scripts/build-all.ps1` builds `meta-mcp.exe` and both sidecars into `dist\` on Windows (Rust with the MSVC toolchain
+  and Go; `govulncheck` is optional). `scripts/build-all.sh` stays for Linux and macOS.
+- `tests/personal.rs` still runs on Unix only (its fake sidecars are shell scripts); the Windows-specific unit tests run
+  with `cargo test --lib personal` on Windows.
+
 ### Security
 
 - Personal mode keeps a copy of your logged-in sessions, so its files live in `META_MCP_HOME/personal/` (folders

@@ -1,13 +1,13 @@
 //! Per-platform session state kept on disk: `<home>/personal/<platform>/state.json` (0600) and
 //! the sidecar's `data/` folder (0700). The content is opaque and never logged.
 
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use super::secure::{private_dir, private_open, set_private_file};
 use super::{PersonalPlatform, personal_dir};
 
 const STATE_FILE: &str = "state.json";
@@ -20,16 +20,15 @@ pub struct StateStore {
     dir: PathBuf,
 }
 
-fn make_private_dir(path: &Path) -> io::Result<()> {
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
 }
 
-fn sync_dir(dir: &Path) -> io::Result<()> {
-    File::open(dir)?.sync_all()
+/// Windows cannot open a folder as a file; the rename is durable enough there.
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 impl StateStore {
@@ -54,9 +53,9 @@ impl StateStore {
 
     /// Creates the folders with mode 0700 and resets the mode of ones that already exist.
     pub fn ensure_dirs(&self) -> io::Result<()> {
-        make_private_dir(&self.personal)?;
-        make_private_dir(&self.dir)?;
-        make_private_dir(&self.data_dir())
+        private_dir(&self.personal)?;
+        private_dir(&self.dir)?;
+        private_dir(&self.data_dir())
     }
 
     pub fn exists(&self) -> bool {
@@ -90,13 +89,13 @@ impl StateStore {
         self.ensure_dirs()?;
         let bytes = serde_json::to_vec(state).map_err(io::Error::other)?;
         let tmp = self.dir.join(TMP_FILE);
-        let mut file = OpenOptions::new()
+        let mut opts = OpenOptions::new();
+        let mut file = private_open(&mut opts)
             .write(true)
             .create(true)
             .truncate(true)
-            .mode(0o600)
             .open(&tmp)?;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        set_private_file(&file, &tmp)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
         drop(file);
@@ -147,7 +146,10 @@ impl StateStore {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
+    #[cfg(unix)]
     fn mode(path: &Path) -> u32 {
         std::fs::metadata(path).expect("stat").permissions().mode() & 0o777
     }
@@ -158,6 +160,7 @@ mod tests {
         (home, store)
     }
 
+    #[cfg(unix)]
     #[test]
     fn save_creates_private_files_and_dirs() {
         let (home, store) = store();
@@ -171,6 +174,7 @@ mod tests {
         assert!(!store.dir().join(TMP_FILE).exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn existing_dirs_get_their_mode_reset() {
         let (_home, store) = store();
@@ -184,6 +188,7 @@ mod tests {
         assert_eq!(mode(&store.data_dir()), 0o700);
     }
 
+    #[cfg(unix)]
     #[test]
     fn save_replaces_atomically_and_tightens_a_loose_tmp_file() {
         let (_home, store) = store();
@@ -218,6 +223,7 @@ mod tests {
         assert!(!store.dir().join(CORRUPT_FILE).exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn wipe_data_empties_the_folder_but_keeps_it() {
         let (_home, store) = store();

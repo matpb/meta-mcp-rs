@@ -26,18 +26,18 @@ Module `github.com/matpb/meta-mcp-rs/sidecars/whatsapp`.
 | `api/` | Protocol shapes (Thread, Message, Attachment, events, `State`) and the error codes, including `sending_blocked`. |
 | `store/` | `messages.db`: the sidecar's own chats, messages (keyed by chat, sender and id), reactions, receipts, contact names and LID cache. whatsmeow keeps no messages, so this is the only message history there is. |
 | `normalize/` | Converts `waE2E.Message` into protocol shapes: `Classify` (message, edit, revoke, reaction, encrypted variants, ignore), `Extract` (kind, text, reply, attachments, preview), `Filtered` (status, broadcast, newsletters, bots), `Canonical` (phone JID vs LID), `Batches` and `BatchesSized` (history batches of at most 200 messages and about 4 MiB serialised). |
-| `wa/` | The `Client` interface, the `Real` adapter (thin pass-throughs to `*whatsmeow.Client`; its event trampoline turns a handler panic into a failed handler), `wa.Open` (the Factory: lock file, `session.db`, sqlstore upgrade, `Scrub`) and the web version refresh. |
+| `wa/` | The `Client` interface, the `Real` adapter (thin pass-throughs to `*whatsmeow.Client`; its event trampoline turns a handler panic into a failed handler), `wa.Open` (the Factory: lock file in `lock_unix.go` and `lock_windows.go`, `session.db`, sqlstore upgrade, `Scrub`) and the web version refresh. |
 | `server/` | Request loop, one handler per op, the login state machine, event ingest, history sync, sends, media, and `download.go` (the capped temp file and the checked destination of downloads). |
 | `docs/` | This file. |
 | `build.sh` | The build and verification script described above. |
 
-Files under `data_dir` (given by the daemon in `hello`; it must be an absolute path to an existing directory, mode 0700 expected, a laxer mode only logs a warning). The process umask is 077 and every file is chmod 0600:
+Files under `data_dir` (given by the daemon in `hello`; it must be an absolute path to an existing directory, mode 0700 expected, a laxer mode only logs a warning; both apply to Unix only, on Windows access follows the folder ACL). On Unix the process umask is 077 and every file is chmod 0600:
 
 | File | Content | Handling |
 |---|---|---|
 | `session.db` | whatsmeow's SQL store: device identity, Signal sessions and sender keys, pre-keys, app state keys, contacts, LID map. Private keys are stored in the clear, and the file runs with `secure_delete` on so deleted rows are zeroed. | Treat it like a password. Whoever copies it can act as the linked device until it is unlinked on the phone. Never commit it, back it up only to encrypted storage, keep the disk encrypted. |
 | `messages.db` | The sidecar's own store (schema version 2 by `PRAGMA user_version`; a version 1 file is migrated in place on open, keeping every row): chats, messages (with the raw protobuf of each), reactions, receipts, contact names, meta keys `paired_at`, `full_history`, `owner_jid`. Message text is in the clear. | Same care as the message content itself. Cleared by `logout` and when a different account is paired; the clearing runs with `secure_delete`, then a WAL checkpoint and a `VACUUM`, so no deleted text stays in the file. |
-| `sidecar.lock` | Empty file holding an exclusive non-blocking `flock` for the life of the process. | Not data. A second process on the same `data_dir` fails to start with `io` ("another sidecar process holds this data_dir"). |
+| `sidecar.lock` | Empty file holding an exclusive non-blocking lock for the life of the process: `flock` on Unix, `LockFileEx` on Windows. | Not data. A second process on the same `data_dir` fails to start with `io` ("another sidecar process holds this data_dir"). |
 
 SQLite runs in WAL mode, so `-wal` and `-shm` files appear beside each database and share its protection. Both databases use `foreign_keys(1)`, `busy_timeout(5000)` and a single connection.
 

@@ -16,7 +16,7 @@ Module `github.com/matpb/meta-mcp-rs/sidecars/messenger`.
 | `ipc/` | JSON-line framing and the reply writer. |
 | `logscrub/` | Stderr scrubber: an allowlist of top-level log fields (`level`, `time`, `message`, `op`, `code`, `reason`, `component`, `count`, `event`, `platform`, `thread`, `id`, `state`), every other field is dropped, and URLs, cookies, tokens, long key-like runs, plus-prefixed phone numbers, XML tags with attributes (a protocol node carries push names) and the quoted input of strconv, time, URL and JSON parse errors are cut out of the strings that stay; a JSON line that is malformed, cut off or over 1 MiB becomes one fixed marker line and the rest of an oversized line is discarded. |
 | `api/` | Wire shapes, error codes, `State`, and the `Factory` and `Session` contract between server and engine. |
-| `server/` | Request loop, op validation, login state machine, event sink, error replies, the `data_dir` lock (`lock.go`). |
+| `server/` | Request loop, op validation, login state machine, event sink, error replies, the `data_dir` lock (`lock.go`, with `lock_unix.go` and `lock_windows.go`). |
 | `engine/` | The session. `session.go` (state, validate, logout), `client.go` (the `metaClient` seam over messagix), `factory.go` (Open, Wipe), `connect.go`, `backoff.go`, `queue.go` (connect loop and event queue), `classify.go` (library errors to failure verdicts), `cookies.go` (cookie rotation to `state_updated`), `events.go` (tables to events), `threads.go` (thread registry, `list_threads`), `history.go` (message cache, `fetch_messages`), `e2ee.go` (encrypted client), `send.go`, `sendwait.go` (sends, reactions, read, typing, OTID waiter), `media.go` (uploads, downloads, file writer). |
 | `normalize/` | Pure conversion of Lightspeed tables and E2EE events into protocol shapes and ids. |
 | `e2ee/` | `e2ee.db`: whatsmeow device store, the encrypted message cache, the account binding and the attachment index of unencrypted messages. |
@@ -39,13 +39,13 @@ Pins in `go.mod`:
 
 ## 4. Data on disk and state
 
-`data_dir` is given by the daemon in `hello`. It must be absolute and existing and should be mode 0700 (anything else logs a warning). Files inside are created 0600.
+`data_dir` is given by the daemon in `hello`. It must be absolute and existing and should be mode 0700 (on Unix anything else logs a warning; on Windows the mode is not checked and access follows the folder ACL). Files inside are created 0600.
 
 | File | Content |
 |---|---|
 | `e2ee.db` | SQLite (WAL, `synchronous=FULL`, so an acked message survives power loss). whatsmeow device keys, Signal sessions and sender keys in the clear, plus the E2EE message cache as plaintext JSON (newest 2000 messages per thread kept) and the encrypted media download records. It also records the account (fbid) it belongs to and, for each unencrypted message with downloadable media, the thread, timestamp and attachment metadata including the signed CDN link (newest 10000 kept), so `download_attachment` works after a restart. Opening it for a different account wipes it first, while a file written before accounts were recorded is judged by the JID of its device and otherwise adopted. Treat it like a password and like the messages themselves. Deleted by `logout`. |
 | `threads.json` | Hybrid thread map: Messenger thread key to the shared thread id and thread type, with the account it belongs to (a map of another account is ignored, one without an account is adopted). No message content. |
-| `sidecar.lock` | Empty file, 0600, holding an exclusive `flock` for the life of the process. `logout` leaves it in place. |
+| `sidecar.lock` | Empty file, 0600, holding an exclusive lock for the life of the process: `flock` on Unix, `LockFileEx` on Windows. `logout` leaves it in place. |
 
 `state` (opaque to the daemon, persisted from `state_updated`): `{"cookies": {"c_user": "...", "xs": "...", ...}, "user_agent": "<string>", "fbid": "<c_user>", "e2ee_registered": bool}`. Cookies rotate; the sidecar re-emits the blob when they change. `user_agent` is stored but not applied (section 9).
 

@@ -42,12 +42,12 @@ func TestOpenCreatesFilesWithMode0600(t *testing.T) {
 		if err != nil {
 			t.Fatalf("stat %s: %v", name, err)
 		}
-		if got := fi.Mode().Perm(); got != 0o600 {
+		if got := fi.Mode().Perm(); posixModes && got != 0o600 {
 			t.Errorf("%s mode = %o, want 600", name, got)
 		}
 	}
 	for _, suffix := range []string{"-wal", "-shm"} {
-		if fi, err := os.Stat(filepath.Join(dir, "session.db"+suffix)); err == nil && fi.Mode().Perm() != 0o600 {
+		if fi, err := os.Stat(filepath.Join(dir, "session.db"+suffix)); err == nil && posixModes && fi.Mode().Perm() != 0o600 {
 			t.Errorf("session.db%s mode = %o, want 600", suffix, fi.Mode().Perm())
 		}
 	}
@@ -266,7 +266,7 @@ func TestScrubAfterAnExternalDeleteAndOnALiveDevice(t *testing.T) {
 		t.Error("key bytes survive a scrub after the device was deleted")
 	}
 	for _, suffix := range []string{"", "-wal", "-shm"} {
-		if fi, err := os.Stat(filepath.Join(dir, "session.db"+suffix)); err == nil && fi.Mode().Perm() != 0o600 {
+		if fi, err := os.Stat(filepath.Join(dir, "session.db"+suffix)); err == nil && posixModes && fi.Mode().Perm() != 0o600 {
 			t.Errorf("session.db%s mode %o after the scrub", suffix, fi.Mode().Perm())
 		}
 	}

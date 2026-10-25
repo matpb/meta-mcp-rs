@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -68,7 +69,7 @@ func sidecarBinary(t *testing.T) string {
 			buildErr = err
 			return
 		}
-		binPath = filepath.Join(dir, "bin")
+		binPath = filepath.Join(dir, "bin"+exeSuffix())
 		cmd := exec.Command("go", "build", "-o", binPath, ".")
 		cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOTOOLCHAIN=local")
 		buildOut, buildErr = cmd.CombinedOutput()
@@ -221,7 +222,7 @@ func TestBinaryHelloPingShutdown(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
-		if fi.Mode().Perm() != 0o600 {
+		if posixModes && fi.Mode().Perm() != 0o600 {
 			t.Fatalf("%s mode %v", name, fi.Mode().Perm())
 		}
 	}
@@ -368,4 +369,11 @@ func TestBinaryRefusesSecondProcessOnSameDataDir(t *testing.T) {
 	_ = second.in.Close()
 	first.exitCode(t)
 	second.exitCode(t)
+}
+
+func exeSuffix() string {
+	if runtime.GOOS == "windows" {
+		return ".exe"
+	}
+	return ""
 }

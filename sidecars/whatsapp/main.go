@@ -17,7 +17,7 @@ import (
 )
 
 func main() {
-	syscall.Umask(0o077)
+	setUmask()
 	os.Exit(run())
 }
 

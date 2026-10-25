@@ -61,7 +61,7 @@ func TestDownloadAttachmentWritesFile(t *testing.T) {
 	if err != nil || string(data) != "hello" {
 		t.Fatalf("file %q %v", data, err)
 	}
-	if fi, _ := os.Stat(dest); fi.Mode().Perm() != 0o600 {
+	if fi, _ := os.Stat(dest); posixModes && fi.Mode().Perm() != 0o600 {
 		t.Fatalf("mode %v", fi.Mode().Perm())
 	}
 }
@@ -385,7 +385,7 @@ func TestDownloadReplacesTheFileInsteadOfWritingThroughIt(t *testing.T) {
 	if data, _ := os.ReadFile(dest); string(data) != "hello" {
 		t.Fatalf("dest %q", data)
 	}
-	if fi, _ := os.Stat(dest); fi.Mode().Perm() != 0o600 {
+	if fi, _ := os.Stat(dest); posixModes && fi.Mode().Perm() != 0o600 {
 		t.Fatalf("mode %v", fi.Mode().Perm())
 	}
 	if got := dirNames(t, dir); fmt.Sprint(got) != "[out.jpg victim.txt]" {

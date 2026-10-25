@@ -4,13 +4,13 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use super::hub::{Delivery, LAGGED_FRAME, Subscription};
 use super::{Daemon, InflightGuard, peer_allowed};
+use crate::personal::ipc;
 use crate::personal::link::{Line, encode_line, read_line};
 use crate::personal::protocol::{
     CODE_TOO_MANY_REQUESTS, CODE_TOO_MANY_WAITERS, Reply, ReplyError, Request,
@@ -33,12 +33,20 @@ struct Outgoing {
     flushed: oneshot::Sender<()>,
 }
 
-/// Checks the peer uid, then serves the connection until the client leaves.
-pub async fn handle(stream: UnixStream, daemon: Arc<Daemon>, own_uid: u32) {
-    match stream.peer_cred() {
-        Ok(cred) if peer_allowed(cred.uid(), own_uid) => {}
-        Ok(cred) => {
-            tracing::warn!(uid = cred.uid(), "rejected connection from another uid");
+/// Checks who the peer is, then serves the connection until the client leaves.
+pub async fn handle(stream: ipc::ServerStream, daemon: Arc<Daemon>, own: Arc<ipc::Identity>) {
+    match ipc::peer_identity(&stream) {
+        Ok(peer) if peer_allowed(&peer, &*own) => {}
+        Ok(peer) => {
+            #[cfg(unix)]
+            tracing::warn!(uid = peer, "rejected connection from another uid");
+            #[cfg(not(unix))]
+            tracing::warn!(sid = %peer, "rejected connection from another user");
+            return;
+        }
+        // macOS reports ENOTCONN when a probing client already hung up.
+        Err(e) if e.kind() == std::io::ErrorKind::NotConnected => {
+            tracing::debug!("peer left before its credentials were read");
             return;
         }
         Err(e) => {
@@ -108,8 +116,8 @@ fn is_protected(op: &str) -> bool {
     )
 }
 
-async fn serve(stream: UnixStream, daemon: Arc<Daemon>) {
-    let (read_half, write_half) = stream.into_split();
+async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(stream: S, daemon: Arc<Daemon>) {
+    let (read_half, write_half) = tokio::io::split(stream);
     let (tx, rx) = mpsc::channel::<Outgoing>(REPLY_QUEUE);
     let (sub_tx, sub_rx) = mpsc::unbounded_channel::<EventRx>();
     let writer = tokio::spawn(write_loop(write_half, rx, sub_rx));
@@ -311,14 +319,22 @@ async fn write_loop<W: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::time::Duration;
 
+    #[cfg(unix)]
     use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    #[cfg(unix)]
+    use tokio::net::UnixStream;
 
+    #[cfg(unix)]
     use crate::config::Config;
+    #[cfg(unix)]
     use crate::inbox::Inbox;
+    #[cfg(unix)]
     use crate::personal::audit::AuditLog;
 
+    #[cfg(unix)]
     fn daemon(dir: &std::path::Path) -> Arc<Daemon> {
         let cfg = Config::from_lookup(|_| None, Some(dir.join("home"))).expect("config");
         let inbox = Inbox::open(&dir.join("inbox.db")).expect("inbox");
@@ -351,20 +367,22 @@ mod tests {
             "mark_read",
             "set_typing",
             "login_cancel",
+            "shutdown",
         ] {
             assert!(!is_protected(op), "{op}");
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_peer_with_another_uid_is_dropped_without_a_reply() {
         let dir = tempfile::tempdir().expect("tempdir");
         let d = daemon(dir.path());
-        let own = crate::personal::own_uid().await.expect("uid");
+        let own = ipc::own_identity().await.expect("uid");
         let (server, mut client) = UnixStream::pair().expect("pair");
         tokio::time::timeout(
             Duration::from_secs(2),
-            handle(server, d, own.wrapping_add(1)),
+            handle(server, d, Arc::new(own.wrapping_add(1))),
         )
         .await
         .expect("handle returns at once for a foreign uid");
@@ -377,13 +395,14 @@ mod tests {
         assert_eq!((n, buf.len()), (0, 0), "nothing may be served: {buf:?}");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_peer_with_our_uid_is_served() {
         let dir = tempfile::tempdir().expect("tempdir");
         let d = daemon(dir.path());
-        let own = crate::personal::own_uid().await.expect("uid");
+        let own = ipc::own_identity().await.expect("uid");
         let (server, mut client) = UnixStream::pair().expect("pair");
-        tokio::spawn(handle(server, d, own));
+        tokio::spawn(handle(server, d, Arc::new(own)));
         client
             .write_all(b"{\"id\":7,\"op\":\"status\"}\n")
             .await

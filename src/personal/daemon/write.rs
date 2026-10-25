@@ -3,7 +3,6 @@
 
 use std::fs::File;
 use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use super::ops::{opt_str_param, str_param};
 use super::pace::PaceClass;
-use super::platform::{PlatformRt, private_dir};
+use super::platform::PlatformRt;
 use super::{Daemon, OpError, reply_code, sanitize_code};
 use crate::config::secret::random_hex;
 use crate::files::{FileJail, clean_remote_filename};
@@ -24,6 +23,9 @@ use crate::personal::protocol::{
     CODE_AUDIT_FAILED, CODE_FILE_REFUSED, CODE_NO_FILES_DIR, CODE_RATE_LIMITED, CODE_READ_ONLY,
     CODE_SEND_UNKNOWN, CODE_SHUTTING_DOWN,
 };
+#[cfg(windows)]
+use crate::personal::secure::set_private_file;
+use crate::personal::secure::{private_dir, private_open};
 use crate::personal::sidecar::Sidecar;
 use crate::personal::validate;
 
@@ -291,8 +293,40 @@ fn handle_path(file: &File, _resolved: &Path) -> std::io::Result<PathBuf> {
     std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
 }
 
+/// The final path of the open handle (`\\?\C:\...`, the form `canonicalize` gives the jail root).
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn handle_path(file: &File, _resolved: &Path) -> std::io::Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
+    };
+    let handle = file.as_raw_handle() as HANDLE;
+    let mut buf = vec![0u16; 512];
+    loop {
+        // SAFETY: the handle is open while `file` is borrowed and `buf` has the stated length.
+        let n = unsafe {
+            GetFinalPathNameByHandleW(
+                handle,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+            )
+        } as usize;
+        if n == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if n < buf.len() {
+            return Ok(PathBuf::from(std::ffi::OsString::from_wide(&buf[..n])));
+        }
+        buf.resize(n + 1, 0);
+    }
+}
+
 /// Without /proc: the canonical path counts only when it is still the same inode as the handle.
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn handle_path(file: &File, resolved: &Path) -> std::io::Result<PathBuf> {
     use std::os::unix::fs::MetadataExt;
     let real = std::fs::canonicalize(resolved)?;
@@ -312,14 +346,28 @@ fn open_checked(
     allow_inbound: bool,
 ) -> Result<(File, u64), OpError> {
     let swapped = || refused_file("the file changed while it was being checked");
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut opts, libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    #[cfg(windows)]
+    std::os::windows::fs::OpenOptionsExt::custom_flags(
+        &mut opts,
+        windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+    );
+    let file = opts
         .open(resolved)
         .map_err(|e| refused_file(format!("cannot read the file: {e}")))?;
     let meta = file
         .metadata()
         .map_err(|e| refused_file(format!("cannot read the file: {e}")))?;
+    #[cfg(windows)]
+    if std::os::windows::fs::MetadataExt::file_attributes(&meta)
+        & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+        != 0
+    {
+        return Err(swapped());
+    }
     if !meta.is_file() {
         return Err(refused_file("only regular files can be sent"));
     }
@@ -367,13 +415,16 @@ fn prepare_media(
         .filter(|e| !e.is_empty() && e.len() <= 8 && e.bytes().all(|b| b.is_ascii_alphanumeric()))
         .map_or_else(|| "bin".to_owned(), str::to_ascii_lowercase);
     let copy = outbox.join(format!("{}.{ext}", random_hex(8)));
-    let mut dest = std::fs::OpenOptions::new()
+    let mut dest_opts = std::fs::OpenOptions::new();
+    let mut dest = private_open(&mut dest_opts)
         .write(true)
         .create_new(true)
-        .mode(0o600)
         .open(&copy)
         .map_err(|_| OpError::new(CODE_AUDIT_FAILED, "cannot create the outbound copy"))?;
     let guard = RemoveOnDrop::new(copy.clone());
+    #[cfg(windows)]
+    set_private_file(&dest, &copy)
+        .map_err(|_| OpError::new(CODE_AUDIT_FAILED, "cannot create the outbound copy"))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
     let mut total: u64 = 0;
@@ -629,5 +680,41 @@ impl Daemon {
                 MARK_TIMEOUT,
             )
             .await?)
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    fn jail_with_file() -> (tempfile::TempDir, FileJail, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let jail = FileJail::new(dir.path()).expect("jail");
+        let file = jail.root().join("a.txt");
+        std::fs::write(&file, b"hello").expect("write");
+        (dir, jail, file)
+    }
+
+    #[test]
+    fn a_regular_file_inside_the_jail_opens_and_its_handle_path_is_inside_the_root() {
+        let (_dir, jail, file) = jail_with_file();
+        let (handle, len) = open_checked(&jail, &file, false).expect("open");
+        assert_eq!(len, 5);
+        let real = handle_path(&handle, &file).expect("path");
+        assert!(real.starts_with(jail.root()), "{real:?}");
+    }
+
+    #[test]
+    fn a_symlink_to_a_file_outside_the_jail_is_refused() {
+        let (_dir, jail, _file) = jail_with_file();
+        let outside = tempfile::tempdir().expect("outside");
+        let target = outside.path().join("secret.txt");
+        std::fs::write(&target, b"secret").expect("write");
+        let link = jail.root().join("link.txt");
+        if let Err(e) = std::os::windows::fs::symlink_file(&target, &link) {
+            eprintln!("skipped: cannot create a symlink here: {e}");
+            return;
+        }
+        assert!(open_checked(&jail, &link, false).is_err());
     }
 }

@@ -9,8 +9,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -56,9 +56,9 @@ func Open(ctx context.Context, dataDir string, log zerolog.Logger) (*Session, er
 	if err != nil {
 		return nil, fmt.Errorf("wa: open lock file: %w", err)
 	}
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	if err := tryLock(lock); err != nil {
 		_ = lock.Close()
-		if errors.Is(err, syscall.EWOULDBLOCK) {
+		if errors.Is(err, errWouldBlock) {
 			return nil, ErrLocked
 		}
 		return nil, fmt.Errorf("wa: lock data dir: %w", err)
@@ -71,8 +71,17 @@ func Open(ctx context.Context, dataDir string, log zerolog.Logger) (*Session, er
 	return s, nil
 }
 
+// uriPath turns a native path into the slash form SQLite URIs expect (/C:/dir/file.db on Windows).
+func uriPath(p string) string {
+	p = filepath.ToSlash(p)
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	return p
+}
+
 func (s *Session) openDB(ctx context.Context) error {
-	u := url.URL{Scheme: "file", Path: s.dbPath, RawQuery: "_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=secure_delete(1)"}
+	u := url.URL{Scheme: "file", Path: uriPath(s.dbPath), RawQuery: "_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=secure_delete(1)"}
 	db, err := sql.Open("sqlite", u.String())
 	if err != nil {
 		return fmt.Errorf("wa: open session db: %w", err)
@@ -101,7 +110,7 @@ func (s *Session) chmodDB() {
 }
 
 func (s *Session) releaseLock() {
-	_ = syscall.Flock(int(s.lock.Fd()), syscall.LOCK_UN)
+	unlock(s.lock)
 	_ = s.lock.Close()
 }
 

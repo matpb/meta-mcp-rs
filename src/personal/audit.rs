@@ -2,7 +2,6 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{FileExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -10,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::PersonalPlatform;
+use super::secure::{private_open, set_private_file};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -149,6 +149,25 @@ fn parse_lines(data: &[u8]) -> Vec<AuditEntry> {
         .collect()
 }
 
+#[cfg(unix)]
+fn read_byte_at(file: &File, buf: &mut [u8; 1], offset: u64) -> io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
+}
+
+/// Reads one byte at `offset` without moving the append position.
+#[cfg(windows)]
+fn read_byte_at(file: &File, buf: &mut [u8; 1], offset: u64) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    loop {
+        match file.seek_read(buf, offset) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
@@ -157,13 +176,13 @@ impl AuditLog {
     /// Opens or creates the log with mode 0600, reads the highest id and ends a torn last line
     /// so the next entry starts on its own line.
     pub fn open(path: &Path) -> io::Result<AuditLog> {
-        let mut file = OpenOptions::new()
+        let mut opts = OpenOptions::new();
+        let mut file = private_open(&mut opts)
             .read(true)
             .append(true)
             .create(true)
-            .mode(0o600)
             .open(path)?;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        set_private_file(&file, path)?;
         let mut data = Vec::new();
         file.read_to_end(&mut data)?;
         let max_id = parse_lines(&data).iter().map(|e| e.id).max().unwrap_or(0);
@@ -211,7 +230,7 @@ impl AuditLog {
         let len = inner.file.metadata()?.len();
         if len > 0 {
             let mut last = [0u8; 1];
-            inner.file.read_exact_at(&mut last, len - 1)?;
+            read_byte_at(&inner.file, &mut last, len - 1)?;
             if last[0] != b'\n' {
                 line.insert(0, b'\n');
             }
@@ -363,8 +382,10 @@ mod tests {
         assert_eq!(log.tail(10).expect("tail").len(), 2);
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_file_is_private_even_when_it_existed_loose() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("audit.jsonl");
         std::fs::write(&path, b"").expect("create");

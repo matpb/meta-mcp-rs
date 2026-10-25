@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -72,7 +73,7 @@ func sidecarBinary(t *testing.T) string {
 			buildErr = err
 			return
 		}
-		binPath = filepath.Join(dir, "bin")
+		binPath = filepath.Join(dir, "bin"+exeSuffix())
 		cmd := exec.Command("go", "build", "-o", binPath, ".")
 		cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 		buildOut, buildErr = cmd.CombinedOutput()
@@ -258,4 +259,11 @@ func TestBinaryExitsTwoOnOversizedLine(t *testing.T) {
 func quote(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
+}
+
+func exeSuffix() string {
+	if runtime.GOOS == "windows" {
+		return ".exe"
+	}
+	return ""
 }

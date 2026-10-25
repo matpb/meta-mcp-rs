@@ -223,7 +223,7 @@ func TestThreadsFileRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fi.Mode().Perm() != 0o600 {
+	if posixModes && fi.Mode().Perm() != 0o600 {
 		t.Fatalf("threads.json mode %v", fi.Mode().Perm())
 	}
 	if _, err := os.Stat(path + ".tmp"); err == nil {

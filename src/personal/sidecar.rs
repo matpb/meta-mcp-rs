@@ -1,5 +1,5 @@
-//! The Go sidecar as a child process: spawned with an empty environment (HOME only), spoken to
-//! over its stdin and stdout through a `Link`.
+//! The Go sidecar as a child process: spawned with an empty environment (HOME only; a few system
+//! variables on Windows), spoken to over its stdin and stdout through a `Link`.
 
 use std::ffi::OsString;
 use std::io;
@@ -17,6 +17,25 @@ use tokio::time::Instant;
 use super::PersonalPlatform;
 use super::link::{Link, LinkError};
 use super::protocol::{Event, HelloParams, HelloResult, PROTOCOL_VERSION};
+
+/// The only variables a sidecar inherits.
+#[cfg(not(windows))]
+const PASSED_ENV: [&str; 1] = ["HOME"];
+/// Winsock and Go need SystemRoot; Go finds the home folder through USERPROFILE.
+#[cfg(windows)]
+const PASSED_ENV: [&str; 8] = [
+    "SystemRoot",
+    "SystemDrive",
+    "windir",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "TEMP",
+    "TMP",
+];
+/// Keeps a windowless daemon from opening a console for every sidecar.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub const ENV_SIDECAR_DIR: &str = "META_MCP_SIDECAR_DIR";
 pub const READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -85,9 +104,13 @@ impl Sidecar {
             .stderr(Stdio::inherit())
             .env_clear()
             .kill_on_drop(true);
-        if let Some(home) = std::env::var_os("HOME") {
-            cmd.env("HOME", home);
+        for name in PASSED_ENV {
+            if let Some(value) = std::env::var_os(name) {
+                cmd.env(name, value);
+            }
         }
+        #[cfg(windows)]
+        cmd.creation_flags(CREATE_NO_WINDOW);
         let mut child = cmd.spawn().map_err(|source| SpawnError {
             path: abs.display().to_string(),
             source,
@@ -207,10 +230,14 @@ impl Sidecar {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    #[cfg(unix)]
     const READY: &str = r#"echo '{"event":"ready","data":{"pid":1,"protocol":1}}'"#;
+    #[cfg(unix)]
     const ECHO_LOOP: &str = r#"
 while read -r line; do
   id=${line#*\"id\":}; id=${id%%,*}
@@ -219,8 +246,10 @@ while read -r line; do
     *) echo "{\"id\":$id,\"ok\":true,\"result\":{\"pong\":true}}";;
   esac
 done"#;
+    #[cfg(unix)]
     const WAIT: Duration = Duration::from_secs(10);
 
+    #[cfg(unix)]
     fn fake(body: &str) -> PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -238,6 +267,7 @@ done"#;
     }
 
     // A freshly written script can hit ETXTBSY while a parallel test forks.
+    #[cfg(unix)]
     fn start(body: &str) -> Sidecar {
         let path = fake(body);
         for _ in 0..50 {
@@ -259,7 +289,10 @@ done"#;
             PersonalPlatform::WhatsApp,
         )
         .expect("path");
-        assert_eq!(p, PathBuf::from("/opt/side/meta-whatsapp-sidecar"));
+        assert_eq!(
+            p,
+            Path::new("/opt/side").join(PersonalPlatform::WhatsApp.binary_name())
+        );
     }
 
     #[test]
@@ -271,7 +304,10 @@ done"#;
                 PersonalPlatform::Messenger,
             )
             .expect("path");
-            assert_eq!(p, PathBuf::from("/usr/local/bin/meta-messenger-sidecar"));
+            assert_eq!(
+                p,
+                Path::new("/usr/local/bin").join(PersonalPlatform::Messenger.binary_name())
+            );
         }
     }
 
@@ -288,6 +324,7 @@ done"#;
         assert!(text.contains("meta-messenger-sidecar"), "{text}");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn ready_hello_ping_and_shutdown() {
         let s = start(&format!("{READY}\n{ECHO_LOOP}"));
@@ -305,6 +342,7 @@ done"#;
         assert!(status.success(), "{status:?}");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn only_home_reaches_the_sidecar() {
         let body = format!(
@@ -323,6 +361,7 @@ read -r l"#
         assert_eq!(ev.data["user"], "unset");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn shutdown_closes_stdin_of_a_sidecar_that_refuses() {
         let body = format!(
@@ -340,6 +379,7 @@ done"#
         assert!(t0.elapsed() < Duration::from_millis(1500), "was killed");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_sidecar_that_ignores_everything_is_killed_at_the_deadline() {
         let s = start(&format!("{READY}\nsleep 30"));

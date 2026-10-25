@@ -72,11 +72,11 @@ func TestOpenCreatesDeviceStore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fi.Mode().Perm() != 0o600 {
+	if posixModes && fi.Mode().Perm() != 0o600 {
 		t.Fatalf("mode = %v", fi.Mode().Perm())
 	}
 	for _, suffix := range []string{"-wal", "-shm"} {
-		if fi, err := os.Stat(filepath.Join(dir, DBName+suffix)); err == nil && fi.Mode().Perm() != 0o600 {
+		if fi, err := os.Stat(filepath.Join(dir, DBName+suffix)); err == nil && posixModes && fi.Mode().Perm() != 0o600 {
 			t.Fatalf("%s mode = %v", suffix, fi.Mode().Perm())
 		}
 	}
@@ -117,7 +117,7 @@ func TestOpenTightensMode(t *testing.T) {
 	s := openStore(t, dir)
 	defer s.Close()
 	fi, _ := os.Stat(p)
-	if fi.Mode().Perm() != 0o600 {
+	if posixModes && fi.Mode().Perm() != 0o600 {
 		t.Fatalf("mode = %v", fi.Mode().Perm())
 	}
 }

@@ -468,7 +468,7 @@ func checkDataDir(dir string, log zerolog.Logger) string {
 	if err != nil || !fi.IsDir() {
 		return "data_dir must be an existing directory"
 	}
-	if fi.Mode().Perm() != 0o700 {
+	if dirModeLoose(fi) {
 		log.Warn().Msg("data_dir mode is not 0700")
 	}
 	return ""

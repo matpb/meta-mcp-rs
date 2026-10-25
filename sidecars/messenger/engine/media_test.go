@@ -48,7 +48,7 @@ func TestWriteReaderHashModeAndHead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Mode().Perm() != 0o600 {
+	if posixModes && st.Mode().Perm() != 0o600 {
 		t.Fatalf("mode %v, want 0600", st.Mode().Perm())
 	}
 	got, _ := os.ReadFile(dest)
@@ -148,7 +148,7 @@ func TestWriteWithCapAndCleanup(t *testing.T) {
 	if err != nil || info.n != 5 || info.sha != "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824" {
 		t.Fatalf("info %+v err %v", info, err)
 	}
-	if st, _ := os.Stat(dest); st.Mode().Perm() != 0o600 {
+	if st, _ := os.Stat(dest); posixModes && st.Mode().Perm() != 0o600 {
 		t.Fatalf("mode %v", st.Mode().Perm())
 	}
 	_, err = writeWith(filepath.Join(dir, "f.bin"), 3, func(f *os.File) error {

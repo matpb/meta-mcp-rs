@@ -6,12 +6,11 @@ use std::process::ExitCode;
 use clap::{ArgGroup, Args, Parser, Subcommand};
 
 use crate::config::Config;
-#[cfg(unix)]
 use crate::personal::PersonalPlatform;
 use crate::setup::oauth::RedirectMode;
 use crate::{mcp, server, setup};
 
-/// MCP server for Facebook Messenger and WhatsApp: the Meta Graph API (Pages and business numbers) and, on Unix, personal accounts through local sidecars.
+/// MCP server for Facebook Messenger and WhatsApp: the Meta Graph API (Pages and business numbers) and personal accounts through local sidecars.
 #[derive(Debug, Parser)]
 #[command(name = "meta-mcp", version)]
 pub struct Cli {
@@ -182,7 +181,6 @@ pub enum TokenCommand {
     },
 }
 
-#[cfg(unix)]
 /// The personal platforms a command can name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum PersonalPlatformArg {
@@ -190,7 +188,6 @@ pub enum PersonalPlatformArg {
     Whatsapp,
 }
 
-#[cfg(unix)]
 impl PersonalPlatformArg {
     fn platform(self) -> PersonalPlatform {
         match self {
@@ -200,7 +197,6 @@ impl PersonalPlatformArg {
     }
 }
 
-#[cfg(unix)]
 /// A personal-account login flow.
 #[derive(Debug, Clone, Subcommand)]
 pub enum LoginCommand {
@@ -224,13 +220,12 @@ pub enum LoginCommand {
     },
 }
 
-#[cfg(unix)]
 /// A personal-account command.
 #[derive(Debug, Clone, Subcommand)]
 pub enum PersonalCommand {
     /// Run the long-lived daemon that owns the Messenger and WhatsApp sidecars
     Daemon {
-        /// Unix socket to listen on (default: $XDG_RUNTIME_DIR/meta-mcp/personal.sock)
+        /// Socket (Unix) or named pipe (Windows) to listen on (default: META_MCP_PERSONAL_SOCKET, else a per-user location)
         #[arg(long, value_name = "PATH")]
         socket: Option<PathBuf>,
     },
@@ -253,13 +248,13 @@ pub enum PersonalCommand {
         #[arg(value_enum)]
         platform: PersonalPlatformArg,
     },
-    /// Install and start the daemon as systemd user units
+    /// Install and start the daemon as a login service
     Install {
         /// Print the units and the commands without writing or running anything
         #[arg(long)]
         dry_run: bool,
     },
-    /// Stop the daemon and remove its systemd user units (sessions and audit log stay)
+    /// Stop the daemon and remove its login service (sessions and audit log stay)
     Uninstall {
         /// Print what would happen without doing it
         #[arg(long)]
@@ -267,20 +262,11 @@ pub enum PersonalCommand {
     },
 }
 
-#[cfg(unix)]
 /// Options of `meta-mcp personal`.
 #[derive(Debug, Clone, Args)]
 pub struct PersonalArgs {
     #[command(subcommand)]
     pub command: PersonalCommand,
-}
-
-/// Options of `meta-mcp personal` on a system without personal mode: the words are ignored.
-#[cfg(not(unix))]
-#[derive(Debug, Clone, Args)]
-pub struct PersonalArgs {
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
-    pub rest: Vec<String>,
 }
 
 /// Options of `meta-mcp token`.
@@ -332,13 +318,6 @@ pub async fn run() -> ExitCode {
     execute(cli.command.unwrap_or(Command::Stdio)).await
 }
 
-#[cfg(not(unix))]
-async fn run_personal(_args: PersonalArgs) -> ExitCode {
-    eprintln!("personal mode needs a Unix system");
-    ExitCode::from(2)
-}
-
-#[cfg(unix)]
 async fn run_personal(args: PersonalArgs) -> ExitCode {
     use crate::personal::cli as pcli;
     match args.command {
@@ -363,8 +342,8 @@ async fn run_personal(args: PersonalArgs) -> ExitCode {
         PersonalCommand::Status { json } => pcli::status(json).await,
         PersonalCommand::Logout { platform } => pcli::logout(platform.platform()).await,
         PersonalCommand::Restart { platform } => pcli::restart(platform.platform()).await,
-        PersonalCommand::Install { dry_run } => pcli::install(dry_run),
-        PersonalCommand::Uninstall { dry_run } => pcli::uninstall(dry_run),
+        PersonalCommand::Install { dry_run } => pcli::install(dry_run).await,
+        PersonalCommand::Uninstall { dry_run } => pcli::uninstall(dry_run).await,
     }
 }
 
@@ -407,7 +386,6 @@ mod tests {
         Cli::try_parse_from(std::iter::once("meta-mcp").chain(args.iter().copied()))
     }
 
-    #[cfg(unix)]
     #[test]
     fn personal_daemon_parses_with_an_optional_socket() {
         assert!(matches!(

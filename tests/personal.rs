@@ -147,7 +147,7 @@ async fn daemon_hello_and_status() {
     assert_eq!(env.request_count("messenger", "connect"), 1);
     assert_eq!(mode(&env.socket()), 0o600);
 
-    for op in ["hello", "shutdown", "connect", "disconnect", "nonsense"] {
+    for op in ["hello", "connect", "disconnect", "nonsense"] {
         assert_eq!(
             err(&client, op, json!({"platform": "messenger"}))
                 .await
@@ -1596,6 +1596,30 @@ async fn sigterm_stops_sidecars_and_removes_the_socket() {
 }
 
 #[tokio::test]
+async fn the_shutdown_op_stops_the_daemon_cleanly_and_removes_the_socket() {
+    let env = TestEnv::new();
+    let (daemon, client) = env.start_logged_in("messenger").await;
+    let reply = ok(&client, "shutdown", Value::Null).await;
+    assert_eq!(reply, json!({"stopping": true}));
+    assert_eq!(daemon.wait(), Some(0));
+    assert!(!env.socket().exists(), "the socket file is removed");
+    assert_eq!(env.request_count("messenger", "shutdown"), 1);
+}
+
+#[tokio::test]
+async fn the_shutdown_op_is_allowed_in_read_only_mode() {
+    let env = TestEnv::new();
+    let daemon = env.start_with(&[("META_MCP_READ_ONLY", "true")]);
+    let client = env.connect().await;
+    assert_eq!(
+        ok(&client, "shutdown", Value::Null).await,
+        json!({"stopping": true})
+    );
+    assert_eq!(daemon.wait(), Some(0));
+    assert!(!env.socket().exists());
+}
+
+#[tokio::test]
 async fn too_many_requests_in_flight_are_refused_at_once() {
     let env = TestEnv::new();
     let (_daemon, client) = env.start_logged_in("messenger").await;
@@ -2476,6 +2500,40 @@ async fn cli_logout_platform() {
     assert_eq!(st["platforms"]["messenger"]["logged_in"], false);
 }
 
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn cli_install_dry_run_prints_the_launchd_agent() {
+    let env = TestEnv::with_files();
+    let mut cmd = env.cli_command(&["personal", "install", "--dry-run"]);
+    cmd.env("META_MCP_READ_ONLY", "1");
+    let run = env.cli_with(cmd, "").await;
+    assert_eq!(run.code, 0, "{run:?}");
+    let exe = std::fs::canonicalize(common::BIN).expect("canonical exe");
+    let plist = env
+        .root()
+        .join("Library/LaunchAgents/dev.meta-mcp.personal.plist");
+    for want in [
+        format!("# {}", plist.display()),
+        "<key>Label</key>".to_owned(),
+        format!("<string>{}</string>", exe.display()),
+        "<key>META_MCP_READ_ONLY</key>".to_owned(),
+        "<key>SuccessfulExit</key>".to_owned(),
+        "launchctl bootout gui/".to_owned(),
+        "launchctl bootstrap gui/".to_owned(),
+        "launchctl kickstart gui/".to_owned(),
+    ] {
+        assert!(run.stdout.contains(&want), "{want}\n{}", run.stdout);
+    }
+    assert!(
+        !env.root().join("Library").exists(),
+        "a dry run writes nothing"
+    );
+    let off = env.cli(&["personal", "uninstall", "--dry-run"], "").await;
+    assert_eq!(off.code, 0, "{off:?}");
+    assert!(off.stdout.contains("launchctl bootout gui/"), "{off:?}");
+}
+
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn cli_install_dry_run_prints_units() {
     let env = TestEnv::with_files();
@@ -2549,6 +2607,7 @@ async fn cli_install_dry_run_prints_units() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn cli_install_refuses_without_sidecars_and_uninstall_dry_run_lists_steps() {
     let env = TestEnv::new();
@@ -3990,6 +4049,7 @@ async fn install_refuses_a_files_dir_that_does_not_exist() {
     assert!(!env.xdg_dir().exists(), "nothing was written");
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn install_pins_the_default_inbox_so_the_sandbox_can_write_it() {
     let env = TestEnv::new();

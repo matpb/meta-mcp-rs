@@ -29,10 +29,16 @@ const MCP_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
 /// Logs to stderr (stdout carries the MCP stream); filter from `META_MCP_LOG`.
 pub fn init_tracing() {
+    init_tracing_ansi(true);
+}
+
+/// `init_tracing` with ANSI colours on or off (off when stderr is a log file).
+pub fn init_tracing_ansi(ansi: bool) {
     let filter =
         EnvFilter::try_from_env("META_MCP_LOG").unwrap_or_else(|_| EnvFilter::new("meta_mcp=info"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_ansi(ansi)
         .with_writer(std::io::stderr)
         .try_init();
 }

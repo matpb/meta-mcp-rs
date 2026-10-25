@@ -14,7 +14,8 @@ go test -count=1 ./...
 
 step "go build"
 go build -trimpath -ldflags=-buildid= -o bin/meta-messenger-sidecar .
-if ! file bin/meta-messenger-sidecar | grep -q "statically linked"; then
+# Only Linux binaries are static; macOS links libSystem dynamically.
+if [ "$(go env GOOS)" = linux ] && ! file bin/meta-messenger-sidecar | grep -q "statically linked"; then
   echo "error: bin/meta-messenger-sidecar is not statically linked" >&2
   exit 1
 fi

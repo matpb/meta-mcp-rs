@@ -80,7 +80,7 @@ func TestFileModeAndReopen(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if fi.Mode().Perm() != 0o600 {
+		if posixModes && fi.Mode().Perm() != 0o600 {
 			t.Fatalf("%s mode %o", path+suffix, fi.Mode().Perm())
 		}
 	}

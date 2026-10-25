@@ -1,6 +1,5 @@
 //! Op dispatch: status, waiters, the recent ring, read proxies and attachment downloads.
 
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,7 +16,7 @@ use crate::personal::protocol::{
     CODE_FILE_REFUSED, CODE_INTERNAL, CODE_NO_FILES_DIR, CODE_UNKNOWN_OP, Reply, ReplyError,
     Request,
 };
-use crate::personal::{PersonalPlatform, validate};
+use crate::personal::{PersonalPlatform, secure, validate};
 
 const LIST_TIMEOUT: Duration = Duration::from_secs(60);
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -42,7 +41,7 @@ pub(super) fn opt_str_param<'a>(
     }
 }
 
-/// Creates the download folder with mode 0700, but only when it really lies inside the files root:
+/// Creates the download folder as private (0700 on Unix), but only when it really lies inside the files root:
 /// a symlinked `inbound/...` pointing elsewhere is refused before anything is created or chmodded.
 fn prepare_download_dir(root: &Path, dir: &Path) -> Result<(), OpError> {
     let refused = || {
@@ -59,16 +58,16 @@ fn prepare_download_dir(root: &Path, dir: &Path) -> Result<(), OpError> {
     {
         return Err(refused());
     }
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .map_err(failed)?;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(dir).map_err(failed)?;
     let real = std::fs::canonicalize(dir).map_err(failed)?;
     if !real.starts_with(root) {
         return Err(refused());
     }
-    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).map_err(failed)
+    secure::set_private_dir(&real).map_err(failed)
 }
 
 fn timed_out() -> Value {
@@ -114,6 +113,10 @@ impl Daemon {
             "status" => return Ok(self.status()),
             "wait_for_message" => return self.wait_for_message(&params).await,
             "recent" => return self.recent(&params),
+            "shutdown" => {
+                self.stop.notify_one();
+                return Ok(json!({"stopping": true}));
+            }
             "login_start"
             | "login_finish"
             | "login_cancel"

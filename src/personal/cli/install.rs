@@ -1,15 +1,34 @@
-//! `personal install` and `personal uninstall`: systemd user units for the daemon.
+//! `personal install` and `personal uninstall`: systemd user units on Linux, a launchd agent on
+//! macOS, a logon task plus an immediate windowless start on Windows.
 
+#[cfg(any(target_os = "macos", test))]
+mod launchd;
+#[cfg(any(windows, test))]
+mod task;
+
+#[cfg(all(unix, any(test, not(target_os = "macos"))))]
 use std::ffi::OsString;
+#[cfg(unix)]
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+#[cfg(unix)]
+use std::path::Path;
+#[cfg(all(unix, any(test, not(target_os = "macos"))))]
+use std::path::PathBuf;
+#[cfg(any(unix, windows))]
+use std::process::Command;
+use std::process::ExitCode;
 
-use crate::personal::{ENV_SOCKET, PersonalPlatform, sidecar};
+#[cfg(all(unix, not(target_os = "macos")))]
+use crate::personal::ENV_SOCKET;
+use crate::personal::{PersonalPlatform, sidecar};
 
+#[cfg(all(unix, any(test, not(target_os = "macos"))))]
 pub const SOCKET_UNIT: &str = "meta-mcp-personal.socket";
+#[cfg(all(unix, not(target_os = "macos")))]
 pub const SERVICE_UNIT: &str = "meta-mcp-personal.service";
+#[cfg(all(unix, any(test, not(target_os = "macos"))))]
 const DEFAULT_LISTEN: &str = "%t/meta-mcp/personal.sock";
 /// Variables copied into the service when the installing shell sets them; the bool marks paths.
 const PASSED_ENV: [(&str, bool); 5] = [
@@ -20,9 +39,11 @@ const PASSED_ENV: [(&str, bool); 5] = [
     ("META_MCP_LOG", false),
 ];
 
+#[cfg(all(unix, any(test, not(target_os = "macos"))))]
 /// Sandbox lines of the service; the folders it writes are added as `ReadWritePaths=`.
 const HARDENING: &str = "NoNewPrivileges=yes\nProtectSystem=strict\nProtectHome=read-only\nPrivateTmp=yes\nLimitCORE=0\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nRestrictNamespaces=yes\nSystemCallArchitectures=native\n";
 
+#[cfg(all(unix, any(test, not(target_os = "macos"))))]
 /// The two unit files as text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Units {
@@ -30,12 +51,14 @@ pub struct Units {
     pub service: String,
 }
 
+#[cfg(all(unix, any(test, not(target_os = "macos"))))]
 fn escape_value(v: &str) -> String {
     v.replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('%', "%%")
 }
 
+#[cfg(all(unix, any(test, not(target_os = "macos"))))]
 /// A command word for `ExecStart=`: quoted only when it holds characters systemd would split on.
 fn exec_word(v: &str) -> String {
     let plain = !v.is_empty()
@@ -52,6 +75,7 @@ fn exec_word(v: &str) -> String {
     format!("\"{body}\"")
 }
 
+#[cfg(all(unix, any(test, not(target_os = "macos"))))]
 /// A path word for `ReadWritePaths=`: quoted when it holds characters systemd would split on.
 fn path_word(v: &str) -> String {
     let plain = !v.is_empty()
@@ -67,6 +91,7 @@ fn path_word(v: &str) -> String {
     format!("\"{body}\"")
 }
 
+#[cfg(all(unix, any(test, not(target_os = "macos"))))]
 /// The folders the daemon writes: the home, the inbox database's folder and the files folder.
 fn writable_paths(env: &[(String, String)]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -88,10 +113,12 @@ fn writable_paths(env: &[(String, String)]) -> Vec<String> {
     out
 }
 
+#[cfg(all(unix, any(test, not(target_os = "macos"))))]
 fn listen_value(v: &str) -> String {
     v.replace('%', "%%")
 }
 
+#[cfg(all(unix, any(test, not(target_os = "macos"))))]
 /// Renders both units. `listen` is the socket path to bind (None: the runtime directory default).
 pub fn render_units(exe: &Path, listen: Option<&str>, env: &[(String, String)]) -> Units {
     let listen = listen.map_or_else(|| DEFAULT_LISTEN.to_owned(), listen_value);
@@ -117,6 +144,7 @@ pub fn render_units(exe: &Path, listen: Option<&str>, env: &[(String, String)]) 
     Units { socket, service }
 }
 
+#[cfg(all(unix, any(test, not(target_os = "macos"))))]
 /// `$XDG_CONFIG_HOME/systemd/user`, else `<home>/.config/systemd/user`.
 pub fn unit_dir(xdg: Option<OsString>, home: Option<PathBuf>) -> Option<PathBuf> {
     let xdg = xdg
@@ -127,10 +155,12 @@ pub fn unit_dir(xdg: Option<OsString>, home: Option<PathBuf>) -> Option<PathBuf>
     Some(base.join("systemd/user"))
 }
 
+#[cfg(unix)]
 fn absolute(p: &str) -> String {
     std::path::absolute(p).map_or_else(|_| p.to_owned(), |a| a.display().to_string())
 }
 
+#[cfg(unix)]
 /// The `Environment=` pairs for the service: the home always, the rest when set here.
 fn service_env(get: &dyn Fn(&str) -> Option<String>) -> Result<Vec<(String, String)>, String> {
     let home = match get("META_MCP_HOME") {
@@ -169,6 +199,7 @@ fn non_empty_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
+#[cfg(all(unix, not(target_os = "macos")))]
 struct Plan {
     dir: PathBuf,
     units: Units,
@@ -178,6 +209,7 @@ struct Plan {
     must_exist: Vec<PathBuf>,
 }
 
+#[cfg(all(unix, not(target_os = "macos")))]
 fn plan() -> Result<Plan, String> {
     let exe = std::env::current_exe()
         .and_then(std::fs::canonicalize)
@@ -230,6 +262,7 @@ fn missing_sidecars() -> Vec<String> {
         .collect()
 }
 
+#[cfg(unix)]
 fn write_unit(dir: &Path, name: &str, text: &str) -> std::io::Result<()> {
     let path = dir.join(name);
     let mut f = std::fs::OpenOptions::new()
@@ -243,10 +276,10 @@ fn write_unit(dir: &Path, name: &str, text: &str) -> std::io::Result<()> {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
 }
 
-/// Runs `systemctl --user <args>` and reports its exit status; true when it exited 0.
-fn systemctl(args: &[&str]) -> bool {
-    let shown = format!("systemctl --user {}", args.join(" "));
-    match Command::new("systemctl").arg("--user").args(args).status() {
+/// Runs `cmd` and reports its exit status as `shown`; true when it exited 0.
+#[cfg(any(unix, windows))]
+fn run_shown(mut cmd: Command, program: &str, shown: &str) -> bool {
+    match cmd.status() {
         Ok(s) if s.success() => {
             println!("ok (exit 0): {shown}");
             true
@@ -259,13 +292,61 @@ fn systemctl(args: &[&str]) -> bool {
             false
         }
         Err(e) => {
-            println!("failed (cannot run systemctl: {e}): {shown}");
+            println!("failed (cannot run {program}: {e}): {shown}");
             false
         }
     }
 }
 
-pub fn install(dry_run: bool) -> ExitCode {
+/// Runs `systemctl --user <args>` and reports its exit status; true when it exited 0.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn systemctl(args: &[&str]) -> bool {
+    let shown = format!("systemctl --user {}", args.join(" "));
+    let mut cmd = Command::new("systemctl");
+    cmd.arg("--user").args(args);
+    run_shown(cmd, "systemctl", &shown)
+}
+
+#[cfg(target_os = "macos")]
+pub async fn install(dry_run: bool) -> ExitCode {
+    launchd::install(dry_run).await
+}
+
+#[cfg(target_os = "macos")]
+pub async fn uninstall(dry_run: bool) -> ExitCode {
+    launchd::uninstall(dry_run).await
+}
+
+#[cfg(windows)]
+pub async fn install(dry_run: bool) -> ExitCode {
+    task::install(dry_run).await
+}
+
+#[cfg(windows)]
+pub async fn uninstall(dry_run: bool) -> ExitCode {
+    task::uninstall(dry_run).await
+}
+
+/// Waits up to `timeout` for the daemon to answer on its default endpoint.
+#[cfg(any(target_os = "macos", windows))]
+async fn wait_for_daemon(timeout: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if crate::personal::client::DaemonClient::connect_default()
+            .await
+            .is_ok()
+        {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub async fn install(dry_run: bool) -> ExitCode {
     let plan = match plan() {
         Ok(p) => p,
         Err(e) => {
@@ -341,7 +422,8 @@ pub fn install(dry_run: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-pub fn uninstall(dry_run: bool) -> ExitCode {
+#[cfg(all(unix, not(target_os = "macos")))]
+pub async fn uninstall(dry_run: bool) -> ExitCode {
     let Some(dir) = unit_dir(
         std::env::var_os("XDG_CONFIG_HOME"),
         std::env::var_os("HOME").map(PathBuf::from),
@@ -379,7 +461,7 @@ pub fn uninstall(dry_run: bool) -> ExitCode {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

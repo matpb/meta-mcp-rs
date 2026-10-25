@@ -229,10 +229,18 @@ async fn read_loop<R: AsyncRead + Unpin>(
 type BoxWriter = Box<dyn AsyncWrite + Send + Unpin>;
 
 pub struct Link {
+    /// Aborted on drop, so a link over a split stream closes the whole connection.
+    read_task: tokio::task::JoinHandle<()>,
     writer: AsyncMutex<Option<BoxWriter>>,
     shared: Arc<Shared>,
     events: AsyncMutex<Option<UnboundedReceiver<Event>>>,
     next_id: AtomicU64,
+}
+
+impl Drop for Link {
+    fn drop(&mut self) {
+        self.read_task.abort();
+    }
 }
 
 impl Link {
@@ -249,8 +257,9 @@ impl Link {
             closing: AtomicBool::new(false),
         });
         let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(read_loop(reader, Arc::clone(&shared), tx));
+        let read_task = tokio::spawn(read_loop(reader, Arc::clone(&shared), tx));
         Link {
+            read_task,
             writer: AsyncMutex::new(Some(Box::new(writer))),
             shared,
             events: AsyncMutex::new(Some(rx)),

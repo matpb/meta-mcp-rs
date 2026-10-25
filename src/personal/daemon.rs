@@ -5,7 +5,6 @@ mod conn;
 mod events;
 mod hub;
 mod inbox_map;
-mod listen;
 mod login;
 mod ops;
 mod pace;
@@ -20,20 +19,22 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::{Semaphore, broadcast, watch};
+use tokio::sync::{Notify, Semaphore, broadcast, watch};
 use tokio::time::Instant;
 
 use super::audit::AuditLog;
 use super::link::LinkError;
 use super::protocol::{CODE_BAD_PARAMS, CODE_SIDECAR_UNAVAILABLE, CODE_TIMEOUT};
-use super::{PersonalPlatform, default_socket_path, own_uid, personal_dir};
+use super::secure;
+use super::{PersonalPlatform, default_socket_path, ipc, personal_dir};
 use crate::config::Config;
 use crate::inbox::Inbox;
 use platform::PlatformRt;
 
 pub use inbox_map::inbox_events;
-pub use listen::{ListenError, systemd_passed_one_fd};
+pub use ipc::ListenError;
+#[cfg(unix)]
+pub use ipc::systemd_passed_one_fd;
 
 pub const MAX_CONNECTIONS: usize = 64;
 /// Consecutive accept failures that mean the listener is dead.
@@ -54,9 +55,9 @@ pub struct DaemonOptions {
     pub socket: Option<PathBuf>,
 }
 
-/// Whether a connecting peer may be served: only our own uid.
-pub fn peer_allowed(peer_uid: u32, own_uid: u32) -> bool {
-    peer_uid == own_uid
+/// Whether a connecting peer may be served: only our own user (a uid on Unix, a SID on Windows).
+pub fn peer_allowed<T: PartialEq>(peer: T, own: T) -> bool {
+    peer == own
 }
 
 /// An error answer for the client: a stable code and a message with no secrets.
@@ -182,6 +183,8 @@ pub struct Daemon {
     events: Arc<hub::EventHub>,
     incoming: broadcast::Sender<Arc<Incoming>>,
     cancel: Cancel,
+    /// Notified by the `shutdown` op to stop the serve loop.
+    stop: Notify,
     inflight: AtomicUsize,
     backoff: Vec<Duration>,
     /// How long a connection must last before the backoff starts over.
@@ -244,6 +247,7 @@ impl Daemon {
             events: hub::EventHub::new(),
             incoming: broadcast::channel(256).0,
             cancel: Cancel::new(),
+            stop: Notify::new(),
             inflight: AtomicUsize::new(0),
             backoff,
             stable: stable_period(std::env::var(ENV_STABLE_MS).ok().as_deref()),
@@ -279,9 +283,13 @@ impl Daemon {
     }
 }
 
-/// Runs the daemon until SIGTERM or SIGINT; the value is the process exit code.
+/// Runs the daemon until SIGTERM, SIGINT (Ctrl-C on Windows) or a `shutdown` request; the value
+/// is the process exit code.
 pub async fn run(opts: DaemonOptions) -> ExitCode {
-    crate::server::init_tracing();
+    #[cfg(windows)]
+    super::winsec::detach_console_to_log();
+    // Colours only on a terminal: launchd, systemd and the Windows log file get plain text.
+    crate::server::init_tracing_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()));
     let cfg = match Config::from_env() {
         Ok(c) => c,
         Err(e) => {
@@ -300,13 +308,12 @@ pub async fn run(opts: DaemonOptions) -> ExitCode {
 
 /// Takes the exclusive per-home lock that makes the daemon a single instance.
 fn lock_instance(personal: &std::path::Path) -> Result<std::fs::File, String> {
-    use std::os::unix::fs::OpenOptionsExt;
     let path = personal.join("daemon.lock");
-    let file = std::fs::OpenOptions::new()
+    let mut opts = std::fs::OpenOptions::new();
+    let file = secure::private_open(&mut opts)
         .write(true)
         .create(true)
         .truncate(false)
-        .mode(0o600)
         .open(&path)
         .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
     match file.try_lock() {
@@ -320,12 +327,13 @@ fn lock_instance(personal: &std::path::Path) -> Result<std::fs::File, String> {
 }
 
 async fn serve(cfg: Config, opts: DaemonOptions) -> Result<(), String> {
-    let own = own_uid()
-        .await
-        .map_err(|e| format!("cannot read the daemon uid: {e}"))?;
+    let own = Arc::new(ipc::own_identity().await.map_err(|e| {
+        let what = if cfg!(windows) { "user SID" } else { "uid" };
+        format!("cannot read the daemon {what}: {e}")
+    })?);
     let inbox = Inbox::open(&cfg.inbox_db).map_err(|e| e.to_string())?;
     let personal = personal_dir(&cfg.home);
-    platform::private_dir(&personal)
+    secure::private_dir(&personal)
         .map_err(|e| format!("cannot secure {}: {e}", personal.display()))?;
     // Held until this function returns; the descriptor is close-on-exec, so no sidecar keeps it.
     let _instance_lock = lock_instance(&personal)?;
@@ -333,18 +341,13 @@ async fn serve(cfg: Config, opts: DaemonOptions) -> Result<(), String> {
         .map_err(|e| format!("cannot open the audit log: {e}"))?;
     // The listener first: an inherited fd is duplicated close-on-exec before any sidecar exists.
     let socket = opts.socket.unwrap_or_else(default_socket_path);
-    let listener = listen::acquire(&socket).map_err(|e| e.to_string())?;
-    let (Ok(mut sigterm), Ok(mut sigint)) = (
-        signal(SignalKind::terminate()),
-        signal(SignalKind::interrupt()),
-    ) else {
-        return Err("cannot install signal handlers".to_owned());
-    };
+    let mut listener = ipc::acquire(&socket).map_err(|e| e.to_string())?;
+    let mut stop_signal = StopSignal::install()?;
 
     let backoff = backoff_schedule(std::env::var(ENV_BACKOFF_MS).ok().as_deref());
     let daemon = Daemon::new(cfg, inbox, audit, backoff);
     tracing::info!(
-        socket_activated = listener.bound_path.is_none(),
+        socket_activated = listener.socket_activated(),
         read_only = daemon.cfg.read_only,
         "personal daemon accepting connections"
     );
@@ -355,13 +358,14 @@ async fn serve(cfg: Config, opts: DaemonOptions) -> Result<(), String> {
     let mut dead_accepts = 0u32;
     loop {
         tokio::select! {
-            _ = sigterm.recv() => { tracing::info!("SIGTERM, shutting down"); break; }
-            _ = sigint.recv() => { tracing::info!("SIGINT, shutting down"); break; }
-            accepted = listener.listener.accept() => match accepted {
-                Ok((stream, _)) => { dead_accepts = 0; match Arc::clone(&slots).try_acquire_owned() {
+            what = stop_signal.recv() => { tracing::info!("{what}, shutting down"); break; }
+            () = daemon.stop.notified() => { tracing::info!("shutdown requested, shutting down"); break; }
+            accepted = listener.accept() => match accepted {
+                Ok(stream) => { dead_accepts = 0; match Arc::clone(&slots).try_acquire_owned() {
                     Ok(slot) => {
                         cap_warned = false;
                         let daemon = Arc::clone(&daemon);
+                        let own = Arc::clone(&own);
                         tokio::spawn(async move {
                             conn::handle(stream, daemon, own).await;
                             drop(slot);
@@ -375,11 +379,14 @@ async fn serve(cfg: Config, opts: DaemonOptions) -> Result<(), String> {
                     }
                 } },
                 Err(e) => {
-                    if listen::accept_error_is_fatal(&e) {
+                    if ipc::accept_error_is_fatal(&e) {
                         dead_accepts += 1;
                         if dead_accepts >= MAX_DEAD_ACCEPTS {
                             daemon.shutdown().await;
-                            return Err(format!("the listening socket is unusable ({e})"));
+                            return Err(format!(
+                                "the listening {} is unusable ({e})",
+                                ipc::ENDPOINT_KIND
+                            ));
                         }
                     }
                     tracing::warn!(error = %e, "accept failed");
@@ -390,10 +397,73 @@ async fn serve(cfg: Config, opts: DaemonOptions) -> Result<(), String> {
     }
 
     daemon.shutdown().await;
-    if let Some(path) = &listener.bound_path {
-        let _ = std::fs::remove_file(path);
-    }
+    listener.cleanup();
     Ok(())
+}
+
+/// Waits for the signals that stop the daemon.
+#[cfg(unix)]
+struct StopSignal {
+    term: tokio::signal::unix::Signal,
+    int: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl StopSignal {
+    fn install() -> Result<Self, String> {
+        use tokio::signal::unix::{SignalKind, signal};
+        match (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        ) {
+            (Ok(term), Ok(int)) => Ok(Self { term, int }),
+            _ => Err("cannot install signal handlers".to_owned()),
+        }
+    }
+
+    async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.term.recv() => "SIGTERM",
+            _ = self.int.recv() => "SIGINT",
+        }
+    }
+}
+
+/// Waits for the console events that stop the daemon.
+#[cfg(windows)]
+struct StopSignal {
+    c: tokio::signal::windows::CtrlC,
+    brk: tokio::signal::windows::CtrlBreak,
+    close: tokio::signal::windows::CtrlClose,
+    shutdown: tokio::signal::windows::CtrlShutdown,
+    logoff: tokio::signal::windows::CtrlLogoff,
+}
+
+#[cfg(windows)]
+impl StopSignal {
+    fn install() -> Result<Self, String> {
+        use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_logoff, ctrl_shutdown};
+        let handlers = (|| {
+            Ok::<_, std::io::Error>(Self {
+                c: ctrl_c()?,
+                brk: ctrl_break()?,
+                close: ctrl_close()?,
+                shutdown: ctrl_shutdown()?,
+                logoff: ctrl_logoff()?,
+            })
+        })();
+        handlers.map_err(|e| format!("cannot install signal handlers: {e}"))
+    }
+
+    async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.c.recv() => "Ctrl-C",
+            _ = self.brk.recv() => "Ctrl-Break",
+            _ = self.close.recv() => "console close",
+            _ = self.shutdown.recv() => "system shutdown",
+            _ = self.logoff.recv() => "logoff",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -427,9 +497,10 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn our_own_uid_is_readable() {
-        let uid = own_uid().await.expect("uid");
+        let uid = ipc::own_identity().await.expect("uid");
         assert!(peer_allowed(uid, uid));
         assert_eq!(
             uid,

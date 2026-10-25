@@ -7,8 +7,8 @@ share the same configuration, Graph client and local inbox.
 A second mode, the **personal mode**, reaches your own Messenger and WhatsApp accounts, which the Graph
 API cannot. It adds a long-lived daemon (`meta-mcp personal daemon`), two Go sidecar programs that the
 daemon owns, a command group (`meta-mcp personal ...`) and 19 more tools on the same MCP server (served over
-stdio; `meta-mcp http` leaves them out unless `META_MCP_PERSONAL_HTTP=1`). Personal mode is compiled on Unix systems
-only (`#[cfg(unix)]`); elsewhere the server has the 20 business tools. It is described in
+stdio; `meta-mcp http` leaves them out unless `META_MCP_PERSONAL_HTTP=1`). Personal mode builds and runs on Linux,
+macOS and Windows; the daemon is reached over a Unix socket or, on Windows, a named pipe. It is described in
 [Personal mode](#personal-mode). The rest of this page, up to that section, is about the business mode.
 
 - [Components and data flow](#components-and-data-flow)
@@ -80,22 +80,28 @@ Two facts shape everything else:
 | `src/mcp/mod.rs` | `MetaMcp` handler, core tools, router composition, result helpers |
 | `src/mcp/messenger_tools.rs` | Messenger tool definitions (schemas, descriptions, annotations) |
 | `src/mcp/whatsapp_tools.rs` | WhatsApp tool definitions |
-| `src/mcp/personal_tools.rs` | The 19 personal tool definitions (Unix only), and the lazily connected socket client they share |
+| `src/mcp/personal_tools.rs` | The 19 personal tool definitions, and the lazily connected daemon client they share |
 | `src/messenger/` | Messenger operations: conversations, messages, sends, attachments, profile |
 | `src/whatsapp/` | WhatsApp operations: sends, media, templates, window warning |
 | `src/setup/` | The wizard, the doctor and the token commands (OAuth, discovery, subscription, prompts, report) |
-| `src/personal/mod.rs` | `PersonalPlatform`, the default socket path, the `personal/` folder, the daemon's own uid (read from the peer credential of a socket pair). The whole `personal` module is `#[cfg(unix)]` |
+| `src/personal/mod.rs` | `PersonalPlatform` (with the sidecar binary names, `.exe` on Windows), the default endpoint, the `personal/` folder |
+| `src/personal/ipc/mod.rs` | The one place that knows the transport: the types and functions the rest of `personal` uses (`Listener`, `acquire`, `connect`, `default_endpoint`, `own_identity`, `peer_identity`, `server_identity`) and `ListenError` |
+| `src/personal/ipc/unix.rs` | The Unix socket transport: systemd socket activation or a socket the daemon binds, the uid of the peer from its credential, the default path |
+| `src/personal/ipc/windows.rs` | The named pipe transport: `\\.\pipe\meta-mcp-personal-<USERNAME>`, an explicit owner-only security descriptor, local clients only, the user SID of the peer from its process token |
+| `src/personal/secure.rs` | Owner-only folders and files: modes 0700 and 0600 on Unix, a protected owner-only ACL on Windows |
+| `src/personal/winsec.rs` | Windows only: the user SID, security descriptors and `SetNamedSecurityInfoW`, and the console detach that sends a console-less daemon's output to its log file |
 | `src/personal/protocol.rs`, `link.rs` | The typed frames of the sidecar line protocol (version 1) and the line-framed request/reply link used for both the sidecar pipes and the daemon socket |
 | `src/personal/sidecar.rs` | Locating, spawning (empty environment) and stopping a sidecar; the `hello` handshake |
-| `src/personal/client.rs` | The socket client used by the tools and the commands; it checks that the daemon behind the socket runs as the same uid |
+| `src/personal/client.rs` | The daemon client used by the tools and the commands; it checks that the daemon behind the socket or pipe runs as the same user (uid, or user SID on Windows) |
 | `src/personal/state.rs`, `audit.rs`, `validate.rs` | The session state files and folders (modes, atomic writes), the append-only send audit log, and the input checks for writes |
-| `src/personal/daemon.rs`, `src/personal/daemon/` | The daemon: socket (`listen.rs`), connections (`conn.rs`), the byte-capped event ring for subscribers (`hub.rs`), op dispatch (`ops.rs`), login and logout (`login.rs`), platform lifecycle, reconnects and the sidecar heartbeat (`platform.rs`), sidecar events (`events.rs`), inbox mapping (`inbox_map.rs`), the recent-messages ring (`ring.rs`), write pacing (`pace.rs`) and the write pipeline (`write.rs`) |
-| `src/personal/cli.rs`, `src/personal/cli/` | The `meta-mcp personal` commands: login flows, cookie parsing, QR drawing, status, install |
+| `src/personal/daemon.rs`, `src/personal/daemon/` | The daemon: connections (`conn.rs`; the socket or pipe itself is in `ipc/`), the byte-capped event ring for subscribers (`hub.rs`), op dispatch (`ops.rs`), login and logout (`login.rs`), platform lifecycle, reconnects and the sidecar heartbeat (`platform.rs`), sidecar events (`events.rs`), inbox mapping (`inbox_map.rs`), the recent-messages ring (`ring.rs`), write pacing (`pace.rs`) and the write pipeline (`write.rs`) |
+| `src/personal/cli.rs`, `src/personal/cli/` | The `meta-mcp personal` commands: login flows, cookie parsing, QR drawing, status, install. `install.rs` holds the shared parts and the systemd units (Linux); `install/launchd.rs` writes the launchd agent (macOS); `install/task.rs` registers the logon task (Windows) |
 | `sidecars/messenger/` | The Go Messenger sidecar (mautrix-meta messagix, whatsmeow for encrypted chats); `docs/SIDECAR-MESSENGER.md` |
 | `sidecars/whatsapp/` | The Go WhatsApp sidecar (whatsmeow plus its own message store); `docs/SIDECAR-WHATSAPP.md` |
 | `tests/` | Integration tests against wiremock and scripted fake sidecars; no network |
 | `scripts/check.sh` | The local gate: format, lints, tests |
-| `scripts/build-all.sh` | Builds `meta-mcp` and both sidecars into `dist/` |
+| `scripts/build-all.sh` | Builds `meta-mcp` and both sidecars into `dist/` (Linux, macOS) |
+| `scripts/build-all.ps1` | The same for Windows PowerShell: `meta-mcp.exe` and both sidecar `.exe` files into `dist\`; `govulncheck` is optional |
 
 ## Command line
 
@@ -111,12 +117,13 @@ Two facts shape everything else:
 | `meta-mcp personal daemon [--socket PATH]` | The personal daemon (Personal mode below) |
 | `meta-mcp personal login messenger [--cookies-file PATH] \| whatsapp [--pair-code PHONE]` | Log in through the daemon (cookies for Messenger, from a file or a hidden prompt; QR code or pair code for WhatsApp) |
 | `meta-mcp personal status [--json]`, `logout PLATFORM`, `restart PLATFORM` | Show both accounts, log out (stop the sidecar, delete the session, empty the platform's data folder), restart a sidecar and clear a sending block |
-| `meta-mcp personal install [--dry-run]`, `uninstall [--dry-run]` | Write and start, or remove, the systemd user units of the daemon. `install` creates the home and the inbox folder and refuses a configured files directory that does not exist |
+| `meta-mcp personal install [--dry-run]`, `uninstall [--dry-run]` | Write and start, or remove, what runs the daemon at login: the systemd user units (Linux), a launchd agent (macOS) or a logon task plus an immediate windowless start (Windows; `uninstall` stops the daemon with the `shutdown` op and deletes the task). On Linux and macOS `install` creates the home and the inbox folder and refuses a configured files directory that does not exist. `--dry-run` prints the units, plist or task XML and the commands |
 
 Exit codes: 0 success, 1 runtime or configuration error, 2 usage error. Startup errors are
 printed to stderr as `error: <message>`. The personal daemon exits 2 on a configuration error, and the
-unit `personal install` writes does not restart it for that status (`RestartPreventExitStatus=2`). On a system
-without personal mode, `meta-mcp personal ...` prints `personal mode needs a Unix system` and exits 2.
+unit `personal install` writes on Linux does not restart it for that status (`RestartPreventExitStatus=2`). The macOS
+agent does restart it, every 10 seconds, after any failed exit (`KeepAlive` with `SuccessfulExit` false); the Windows
+task restarts it up to three times a minute apart.
 
 ## Configuration and precedence
 
@@ -141,7 +148,7 @@ without personal mode, `meta-mcp personal ...` prints `personal mode needs a Uni
   contain `META_MCP_HOME`, `credentials.json` or the inbox database; the error names the overlap.
   A broken `credentials.json`, or one with a newer `version` than the build supports, is a
   startup error that says so.
-- **Personal mode.** `META_MCP_PERSONAL_SOCKET` (the daemon socket) and `META_MCP_SIDECAR_DIR` (where the
+- **Personal mode.** `META_MCP_PERSONAL_SOCKET` (the daemon socket, or on Windows the pipe name) and `META_MCP_SIDECAR_DIR` (where the
   sidecar binaries are) are read by the personal code only; `META_MCP_PERSONAL_BACKOFF_MS` tunes the daemon's
   reconnect delays and `META_MCP_PERSONAL_STABLE_MS` (default 120000) how long a connection must last before they
   start over; `META_MCP_PERSONAL_PING_MS` (30000) and `META_MCP_PERSONAL_PING_TIMEOUT_MS` (10000) set the sidecar
@@ -288,15 +295,16 @@ CREATE INDEX IF NOT EXISTS idx_events_processed_received ON events (processed, r
 - `inbox_wait` records the highest row number when it starts and polls every 500 ms for
   matching rows above it, so it returns only events that arrived during the wait.
 - `processed` is a plain flag set by `inbox_mark_processed`; it never deletes anything.
-- A new database file is created with mode 0600 (and a new parent directory 0700) on Unix.
+- A new database file is created with mode 0600 (and a new parent directory 0700) on Unix. On Windows no ACL is set on
+  it; it follows the folder.
 - All database work runs on the blocking thread pool behind async wrappers.
 
 ## MCP layer and transports
 
 - **Handler.** `MetaMcp` holds the configuration, the Graph client, the inbox and a tool
-  router. The router is the sum of the core, Messenger, WhatsApp and personal routers (39 tools on Unix over stdio).
-  The personal router is added for stdio, and for `meta-mcp http` only when `META_MCP_PERSONAL_HTTP=1`; without
-  personal mode compiled in (non-Unix) it is absent, leaving 20 tools. In read-only mode the write tools (11
+  router. The router is the sum of the core, Messenger, WhatsApp and personal routers (39 tools over stdio).
+  The personal router is added for stdio, and for `meta-mcp http` only when `META_MCP_PERSONAL_HTTP=1`; without that
+  variable `meta-mcp http` serves the 20 business tools. In read-only mode the write tools (11
   business, 10 personal) are removed from the router, so they are neither listed nor callable.
 - **Results.** A successful call returns one text block holding compact JSON. The download
   tools may add an image block. Failures set `isError` and return the redacted error text.
@@ -353,7 +361,7 @@ printer (`report.rs`).
 Personal mode reaches the owner's own Messenger and WhatsApp accounts. The Graph API cannot, so it uses two
 **unofficial** clients written in Go, each run as a child process (a *sidecar*), and one long-lived Rust
 process that owns them: the *personal daemon*, `meta-mcp personal daemon`. The MCP server and the command
-line never talk to a sidecar. They talk to the daemon over a Unix socket. Nothing here uses a Meta
+line never talk to a sidecar. They talk to the daemon over a Unix socket (a named pipe on Windows). Nothing here uses a Meta
 developer account, a token or a webhook. What the mode does and the risks of unofficial clients are in the
 [guide, Part 10](GUIDE.md#part-10-personal-mode-your-own-messenger-and-whatsapp) and
 [SECURITY.md](../SECURITY.md#personal-mode).
@@ -361,15 +369,15 @@ developer account, a token or a webhook. What the mode does and the risks of uno
 ```mermaid
 flowchart LR
     Client["MCP client (the assistant)"] -->|"stdio, or HTTP"| MCP["meta-mcp MCP server"]
-    MCP -->|"JSON lines on a Unix socket"| Daemon["personal daemon"]
-    CLI["meta-mcp personal ..."] -->|"JSON lines on a Unix socket"| Daemon
+    MCP -->|"JSON lines on a Unix socket or named pipe"| Daemon["personal daemon"]
+    CLI["meta-mcp personal ..."] -->|"JSON lines on a Unix socket or named pipe"| Daemon
     Daemon -->|"stdin and stdout pipes"| MS["meta-messenger-sidecar (Go)"]
     Daemon -->|"stdin and stdout pipes"| WS["meta-whatsapp-sidecar (Go)"]
     MS -->|"unofficial Messenger clients"| FB["Facebook Messenger"]
     WS -->|"linked-device client"| WA["WhatsApp"]
     Daemon -->|"INSERT OR IGNORE"| DB[("SQLite inbox")]
     Daemon -->|"append-only"| Audit[("audit.jsonl")]
-    Daemon -->|"0600 files in 0700 folders"| Disk[("personal/ state and data")]
+    Daemon -->|"private files and folders"| Disk[("personal/ state and data")]
     MCP -->|"inbox tools"| DB
     MCP -->|"path arguments"| Jail["File jail"]
     Daemon -->|"downloads"| Jail
@@ -379,28 +387,43 @@ flowchart LR
 
 | Process | Started by | Lives | Role |
 |---|---|---|---|
-| `meta-mcp` (stdio, or `meta-mcp http`) | The MCP client, or the owner for HTTP | One assistant session, or until stopped | Serves the 19 personal tools over stdio. `meta-mcp http` registers them only with `META_MCP_PERSONAL_HTTP=1`; then, with a daemon under the same user, every holder of one of its API keys reaches your accounts (see SECURITY.md). Holds one lazily connected socket client, shared by all calls, that reconnects when the daemon was restarted and refuses a daemon that runs as another uid. Keeps no personal state |
+| `meta-mcp` (stdio, or `meta-mcp http`) | The MCP client, or the owner for HTTP | One assistant session, or until stopped | Serves the 19 personal tools over stdio. `meta-mcp http` registers them only with `META_MCP_PERSONAL_HTTP=1`; then, with a daemon under the same user, every holder of one of its API keys reaches your accounts (see SECURITY.md). Holds one lazily connected daemon client, shared by all calls, that reconnects when the daemon was restarted and refuses a daemon that runs as another user. Keeps no personal state |
 | `meta-mcp personal login`, `status`, `logout`, `restart` | The owner | One command | Short-lived socket clients. The login commands also subscribe to events (QR codes, passkey requests) |
-| `meta-mcp personal daemon` | systemd (`personal install`) or the owner | Until SIGTERM or SIGINT | Owns the socket, the sidecars, the session state, the audit log and the writes into the inbox. One per `META_MCP_HOME`: it takes an exclusive lock on `personal/daemon.lock`, so a second daemon on the same home exits with `another personal daemon already uses ...`, even on another socket |
+| `meta-mcp personal daemon` | systemd, launchd or the logon task (`personal install`), or the owner | Until SIGTERM or SIGINT (Windows: Ctrl-C, Ctrl-Break, console close, logoff or shutdown), or a `shutdown` request | Owns the socket, the sidecars, the session state, the audit log and the writes into the inbox. One per `META_MCP_HOME`: it takes an exclusive lock on `personal/daemon.lock`, so a second daemon on the same home exits with `another personal daemon already uses ...`, even on another socket |
 | `meta-messenger-sidecar`, `meta-whatsapp-sidecar` | The daemon | Until the daemon stops or replaces it (`restart`, a reconnect, shutdown, or a heartbeat kill after two missed pings); a `logout` stops it too | One process per account and one connection set. No network listener. Started at daemon start for a platform that has a stored session, otherwise at its first `login_start` |
 
 ### The daemon socket
 
-- **Where.** `META_MCP_PERSONAL_SOCKET`, else `$XDG_RUNTIME_DIR/meta-mcp/personal.sock`, else
-  `<META_MCP_HOME>/personal/personal.sock`. The daemon takes `--socket PATH` too; the clients do not, so they need
-  `META_MCP_PERSONAL_SOCKET` to find a daemon started that way. The path is limited by the operating system
-  (about 100 bytes). A longer one stops the daemon with `error: cannot listen: path must be shorter than SUN_LEN`.
-- **How it is created.** Either systemd hands the daemon a listening socket (socket activation: the daemon
+The transport lives in `src/personal/ipc/`: `unix.rs` on Linux and macOS, `windows.rs` on Windows. The rest of the
+daemon, the client and the protocol are the same on all three.
+
+- **Where.** `META_MCP_PERSONAL_SOCKET`, else on Linux `$XDG_RUNTIME_DIR/meta-mcp/personal.sock`, else
+  `<META_MCP_HOME>/personal/personal.sock` (the second is the default on macOS, which has no `XDG_RUNTIME_DIR`; the home
+  is `~/Library/Application Support/meta-mcp` there). On Windows a named pipe, `\\.\pipe\meta-mcp-personal-<USERNAME>`
+  (the user name reduced to `[A-Za-z0-9._-]`, anything else becomes `_`), and `META_MCP_PERSONAL_SOCKET` must start with
+  `\\.\pipe\`. The daemon takes `--socket PATH` too; the clients do not, so they need `META_MCP_PERSONAL_SOCKET` to find
+  a daemon started that way. A socket path is limited by the operating system (about 100 bytes). A longer one stops the
+  daemon with `error: cannot listen: path must be shorter than SUN_LEN`. A pipe name has no such limit.
+- **How it is created (Windows).** The daemon creates the first instance of the pipe name with an explicit security
+  descriptor, `D:P(A;;GA;;;<your SID>)` (the default descriptor would also give read access to `Everyone` and to
+  anonymous users), in byte mode and with remote clients rejected, and keeps one instance waiting for the next client.
+  If the name is already taken, it opens it as a client to tell a running daemon (`another personal daemon is already
+  running on ...`) from another error, and either way it does not start. There is no file to remove on exit.
+- **How it is created (Unix).** Either systemd hands the daemon a listening socket (socket activation: the daemon
   adopts file descriptor 3 when `LISTEN_FDS` is `1` and `LISTEN_PID` is its own pid, duplicating it
   close-on-exec so no sidecar inherits it), or the daemon binds the path itself: it creates the
   missing folders on the path with mode 0700 (an existing folder keeps its mode, except `META_MCP_HOME/personal/`, which
   the daemon always resets to 0700), removes a stale socket, refuses a live one (`another personal daemon is already running on ...`) and a path that is not a socket, binds, sets
   mode 0600 and removes the file on exit.
-  The units `personal install` writes use socket activation.
-- **Who may connect.** Only the daemon's own uid, checked on every connection with the peer credentials; the daemon
-  learns its own uid from the peer credential of a socket pair, not from `/proc`. The clients check the other end:
-  before sending anything, the tool or command compares the daemon's uid with its own and refuses a socket served
-  by another user (`untrusted_daemon`). There are no tokens: the 0600 socket and the uid checks are the whole gate (the folder is 0700 when the
+  The units `personal install` writes on Linux use socket activation; the macOS agent does not (launchd does not pass a
+  socket), so the daemon binds its own.
+- **Who may connect.** Only the daemon's own user, checked on every connection. On Unix that is the uid from the peer
+  credentials; the daemon learns its own uid from the peer credential of a socket pair, not from `/proc`. On Windows
+  it is the user SID: the daemon reads the token of the client's process (`GetNamedPipeClientProcessId`) and compares
+  it with its own. The clients check the other end the same way (on Windows with `GetNamedPipeServerProcessId`):
+  before sending anything, the tool or command compares the daemon's user with its own and refuses a daemon served
+  by another user (`untrusted_daemon`). There are no tokens: the 0600 socket (on Windows the owner-only pipe) and the
+  user checks are the whole gate (the folder is 0700 when the
   daemon or a unit written by `personal install` created it, and for `personal/`; any other existing folder keeps its
   mode), so any process running as the same user can use it.
 - **Protocol.** The sidecar line protocol again: one JSON object per line, at most 16 MiB including the
@@ -414,7 +437,8 @@ flowchart LR
   falls behind it receives one error event, `{"event":"error","data":{"code":"lagged","message":"lagged:
   resubscribe"}}`, and no more events (its connection stays open; it must subscribe again). A warning is logged.
 - **Shutdown.** Once the daemon is stopping, the write ops answer `shutting_down`; writes already running may finish
-  (up to 5 seconds).
+  (up to 5 seconds). The daemon stops on SIGTERM or SIGINT on Unix, on Ctrl-C, Ctrl-Break, console close, logoff or
+  system shutdown on Windows, or on the `shutdown` op.
 - **Protected requests.** `send_text`, `send_media`, `send_reaction`, `login_start`, `login_finish`,
   `logout` and `restart` keep running when the client disconnects, so that an audit line gets its
   completion and a state change is finished. Everything else is aborted with the connection.
@@ -422,6 +446,7 @@ flowchart LR
 | Op | Params (besides `platform`) | Result |
 |---|---|---|
 | `status` | none | Daemon and per-platform status (see `personal_status`) |
+| `shutdown` | none | `{"stopping": true}`, then the normal clean shutdown (below). Allowed in read-only mode. `personal uninstall` uses it on Windows, where there is no signal to send |
 | `subscribe` | none | `{}`; events follow on this connection |
 | `wait_for_message` | `timeout_ms` 1 to 300000, optional `platform` | `{message, timed_out, lagged}` |
 | `recent` | `since_ts` (Unix seconds), optional `platform` | `{messages, truncated}` from the in-memory ring |
@@ -432,8 +457,9 @@ flowchart LR
 | `mark_read`, `set_typing` | `thread_id`, and `on` for `set_typing` or an optional `up_to_ts_ms` for `mark_read` (the tools do not expose it) | `{}` |
 
 `platform` is `messenger` or `whatsapp` on every op except `status`, `subscribe`, `wait_for_message` and
-`recent`, where it is optional or absent. Any other op is `unknown_op`; `hello`, `shutdown`, `connect` and
-`disconnect` are not exposed: the daemon alone drives the sidecar lifecycle.
+`recent`, where it is optional or absent (`shutdown` takes none). Any other op is `unknown_op`; `hello`, `connect` and
+`disconnect` are not exposed: the daemon alone drives the sidecar lifecycle. (`shutdown` here stops the daemon; the
+sidecar's own `shutdown` op is never exposed.)
 
 ### The sidecar link
 
@@ -475,7 +501,8 @@ Events the daemon consumes from a sidecar:
 
 ### Session state and data on disk
 
-Everything lives under `META_MCP_HOME/personal/` (`~/.config/meta-mcp/personal/` by default on Linux).
+Everything lives under `META_MCP_HOME/personal/` (`~/.config/meta-mcp/personal/` by default on Linux). The modes below
+are the Unix ones; on Windows the same folders and files get a protected owner-only ACL instead (see the list).
 
 ```
 personal/                      0700
@@ -499,7 +526,14 @@ personal/                      0700
 
 - Folders are created 0700 and **reset to 0700** whenever the daemon prepares them (at start and at each
   sidecar start). The sidecars create their files 0600 (the WhatsApp sidecar sets umask 077), and the service
-  unit sets `UMask=0077`. Each database has `-wal` and `-shm` companions with the same protection.
+  unit sets `UMask=0077` (the launchd agent sets `Umask` 077). Each database has `-wal` and `-shm` companions with the
+  same protection.
+- **On Windows** `src/personal/secure.rs` does the same job with ACLs, through `src/personal/winsec.rs` and the Win32
+  call `SetNamedSecurityInfoW` (no `icacls`): a folder gets the protected DACL `D:P(A;OICI;FA;;;<your SID>)`, so its
+  children inherit it, and a file the daemon writes gets `D:P(A;;FA;;;<your SID>)`. The ACL names your user SID, not
+  `OW` or `CO`, because the default owner of an elevated administrator is the Administrators group. The sidecars' own
+  files inherit the ACL of their folder. The business-mode `credentials.json` and the inbox (`src/config`,
+  `src/inbox`) are not changed: on Windows they rely on the ACL of the profile folder.
 - `state.json` is written through a private temporary file, fsync, rename and a folder fsync, so a crash
   leaves the old or the new file. A file that does not parse is moved to `state.json.corrupt` and counts as
   absent; deleting a session removes the file and its leftovers.
@@ -564,8 +598,14 @@ reconnect timer. `connection` takes the values `stopped`, `starting`, `connectin
    a failed remote step is `remote_error` as `code: message`. The generation counter changed when the sidecar
    stopped, so a late event of that sidecar is dropped and nothing is ingested after a logout. The next
    `login_start` spawns a fresh sidecar with no state.
-7. **Shutdown.** On SIGTERM or SIGINT the daemon cancels waiters and loops, lets in-flight writes finish
-   (up to 5 seconds), stops both sidecars (15 seconds in all) and removes a socket it bound.
+7. **Shutdown.** On SIGTERM or SIGINT (Windows: Ctrl-C, Ctrl-Break, console close, logoff or system shutdown) or after
+   a `shutdown` op, the daemon cancels waiters and loops, lets in-flight writes finish
+   (up to 5 seconds), stops both sidecars (15 seconds in all) and removes a socket it bound. A Windows daemon that has no
+   console (started by the logon task or by `install`) detaches from it and writes its log to
+   `%LOCALAPPDATA%\meta-mcp\logs\daemon.log`; a log over 10 MiB is renamed `daemon.log.1` at start. ANSI colours are
+   used only when stderr is a terminal.
+   Started from a terminal it logs to the terminal. On macOS the launchd agent writes to
+   `~/Library/Logs/meta-mcp/daemon.log`. Sidecars start without a window on Windows.
 
 ### The write pipeline
 
@@ -591,7 +631,8 @@ the audit log, as a `refused` or `invalid` line.
 6. **Media only.** The daemon resolves the path in the jail, refuses anything under `inbound/` unless
    `allow_inbound`, opens the file without following a final symlink or blocking, checks the open handle (a regular
    file, whose real path from `/proc/self/fd` is still inside the jail and, unless `allow_inbound`, outside
-   `inbound/`), enforces `META_MCP_MAX_FILE_BYTES`, and copies from that handle into the platform's `data/outbox/`
+   `inbound/`; on Windows the open uses `FILE_FLAG_OPEN_REPARSE_POINT`, a reparse point is refused, and the real path is
+   `GetFinalPathNameByHandleW` of the handle), enforces `META_MCP_MAX_FILE_BYTES`, and copies from that handle into the platform's `data/outbox/`
    (0600) while hashing it.
 7. **Write-ahead.** An `attempt` line is appended to `audit.jsonl` and fsynced. If that fails, nothing is sent
    (`audit_failed`).
@@ -914,10 +955,10 @@ sequenceDiagram
 | The operator to stored secrets | `credentials.json`, environment | 0600 file in a 0700 directory, environment alternatives |
 | Message senders to the assistant (personal) | Untrusted names, text and files from your own chats | Descriptions that mark them untrusted, read-only mode, no URL ever reaches a download tool |
 | The assistant to your contacts (personal) | Sends, reactions, read receipts and typing, as you | Confirm-intent wording and tool annotations, read-only in two layers, the write-ahead audit log |
-| The MCP server or a command to the daemon | JSON lines on a Unix socket | Socket mode 0600 (a folder that the daemon, or a socket unit written by `personal install`, creates is 0700), same-uid peer check in both directions (the client refuses a daemon of another uid), connection, request and outstanding-reply caps, a byte-capped event ring, 16 MiB line limit, a sandboxed service unit, paced writes |
+| The MCP server or a command to the daemon | JSON lines on a Unix socket, or a named pipe on Windows | Socket mode 0600 (a folder that the daemon, or a socket unit written by `personal install`, creates is 0700); on Windows an owner-only pipe descriptor, local clients only and one first instance; same-user peer check in both directions (uid on Unix, user SID on Windows; the client refuses a daemon of another user), connection, request and outstanding-reply caps, a byte-capped event ring, 16 MiB line limit, a sandboxed service unit on Linux, paced writes |
 | The daemon to a sidecar | JSON lines on pipes | Empty environment but `HOME`, line limit, a malformed line kills the sidecar, error codes reduced to plain words, `state_updated` and `ready` never forwarded |
 | A sidecar to Messenger or WhatsApp | An unofficial client speaking the platform's own protocol | Pinned libraries, scrubbed logs, one connection set per account, presence unavailable on WhatsApp, a sidecar starts a chat only for a first send to one person the platform confirms (a registered WhatsApp number, a Messenger person found by user search), and reactions, read marks and typing need an existing conversation. The account itself is at risk: outside the platforms' terms |
-| The daemon to the local disk (personal) | Session state, databases, audit log, downloads | 0600 files in 0700 folders, atomic writes, downloads confined to the files directory, files directory may not contain the home |
+| The daemon to the local disk (personal) | Session state, databases, audit log, downloads | 0600 files in 0700 folders (Windows: owner-only ACLs), atomic writes, downloads confined to the files directory, files directory may not contain the home, reparse points refused on Windows sends |
 
 ## Threat model summary
 
@@ -930,7 +971,7 @@ limits of each control and the reporting process are in [SECURITY.md](../SECURIT
 
 Personal mode changes the stake: it holds a copy of your logged-in session (Messenger cookies, WhatsApp
 linked-device keys), it speaks protocols the platforms do not offer to third parties, and what it sends
-carries your name. Its defences are a local-only socket, private files, an audit log that stores hashes
+carries your name. Its defences are a local-only socket or pipe, private files, an audit log that stores hashes
 and never text, a read-only mode that works in the tool router and again in the daemon, and a token-bucket
 pacing of writes in the daemon. The personal tools are not served over HTTP unless you opt in. The limit that no control removes is the platforms' own: an unofficial client can get the
 account restricted or banned. See [SECURITY.md](../SECURITY.md#personal-mode).
@@ -943,5 +984,8 @@ calls are served by wiremock, the binary is driven over stdio and HTTP as a chil
 the webhook router is exercised in process. The personal daemon is tested as a child process too:
 `tests/personal.rs` starts the real daemon against scripted fake sidecars (shell programs that speak
 the line protocol), so the socket, the lifecycle, the audit log and the CLI are covered without
-touching Messenger or WhatsApp. Each Go sidecar has its own tests; its `build.sh` runs `go vet`, `go test`,
-a static build and `govulncheck` on the source and the binary, and `scripts/build-all.sh` runs both.
+touching Messenger or WhatsApp. That file runs on Unix only, because the fake sidecars are shell scripts; the
+Windows-specific unit tests (pipe, ACLs, SIDs, the task XML) run with `cargo test --lib personal` on Windows, and the
+launchd plist and task XML renderers are plain text functions that the Linux run covers too. Each Go sidecar has its
+own tests; its `build.sh` runs `go vet`, `go test`, a static build and `govulncheck` on the source and the binary, and
+`scripts/build-all.sh` runs both (`scripts/build-all.ps1` does the same on Windows).
