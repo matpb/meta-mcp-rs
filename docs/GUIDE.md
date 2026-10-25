@@ -954,7 +954,7 @@ pass it in the client's `env`.
 **Claude Code.**
 
 ```bash
-claude mcp add meta-mcp -- meta-mcp
+claude mcp add --scope user meta-mcp -- meta-mcp
 claude mcp add --env META_MCP_READ_ONLY=true --transport stdio meta-mcp -- meta-mcp
 claude mcp add --transport http meta-mcp https://meta.example.org/mcp --header "Authorization: Bearer YOUR_API_KEY"
 ```
@@ -2396,7 +2396,7 @@ The `meta-mcp` binary stays MIT. Not legal advice.
 8. **Connect your assistant.** Personal mode is part of the normal MCP server, so the command is the one from Part 4.8:
 
    ```bash
-   claude mcp add meta-mcp -- meta-mcp
+   claude mcp add --scope user meta-mcp -- meta-mcp
    claude mcp add --env META_MCP_FILES_DIR=/var/lib/meta-mcp/files --env META_MCP_READ_ONLY=true --transport stdio meta-mcp -- meta-mcp
    ```
 

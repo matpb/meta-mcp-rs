@@ -119,7 +119,7 @@ META_MCP_FILES_DIR=~/.local/share/meta-mcp/files meta-mcp personal install   # d
 meta-mcp personal login whatsapp           # QR code in the terminal (or --pair-code YOUR_NUMBER)
 meta-mcp personal login messenger --cookies-file cookies.json
 meta-mcp personal status
-claude mcp add meta-mcp --env META_MCP_FILES_DIR=$HOME/.local/share/meta-mcp/files -- meta-mcp
+claude mcp add --scope user meta-mcp --env META_MCP_FILES_DIR=$HOME/.local/share/meta-mcp/files -- meta-mcp
 ```
 
 On macOS the build and the commands are the same, and `personal install` writes a launchd agent
@@ -140,13 +140,15 @@ meta-mcp personal install                  # logon task "meta-mcp personal", and
 meta-mcp personal login whatsapp
 meta-mcp personal login messenger --cookies-file cookies.json
 meta-mcp personal status
-claude mcp add meta-mcp --env META_MCP_FILES_DIR=$files -- meta-mcp
+claude mcp add --scope user meta-mcp --env META_MCP_FILES_DIR=$files -- meta-mcp
 ```
 
 `personal install` copies `META_MCP_FILES_DIR` into the unit (systemd) or the plist (launchd), so set it before
 installing (or run `install` again with it); the MCP server needs the same value to read and send files. A Windows
 logon task cannot carry variables: it starts the daemon with your saved user environment, which is what `setx` is
 for (`install` prints a note when a variable is set only in the current shell).
+`--scope user` on `claude mcp add` registers the server for every folder; without it Claude Code registers it for the
+current folder only.
 
 The cookies, the QR flow, the passkey step some WhatsApp accounts need, operations and troubleshooting are in the
 [guide, Part 10](docs/GUIDE.md#part-10-personal-mode-your-own-messenger-and-whatsapp). Session files live in
@@ -186,7 +188,7 @@ Login for Business > Settings** (the guide explains why, and what to do if Meta 
 3. **Connect your assistant.** For Claude Code:
 
    ```bash
-   claude mcp add meta-mcp -- meta-mcp
+   claude mcp add --scope user meta-mcp -- meta-mcp
    ```
 
    Other clients (Claude Desktop, Cursor, any MCP client) are covered in the
