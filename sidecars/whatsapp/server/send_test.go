@@ -618,3 +618,19 @@ func TestReviewNormalizePhone(t *testing.T) {
 		}
 	}
 }
+
+// The owner's own number is accepted as a target before any chat exists; any other unknown number is not.
+func TestSendTextToOwnNumberCreatesTheSelfChat(t *testing.T) {
+	h, c := startPaired(t, true)
+	h.wantErr(h.call("send_text", map[string]any{"thread_id": selfPN, "text": "x"}), api.CodeThreadNotFound)
+	_ = h.srv.store.SetMeta(h.srv.ctx, metaOwnerJID, selfPN)
+	h.wantErr(h.call("send_text", map[string]any{"thread_id": "15550009999@s.whatsapp.net", "text": "x"}), api.CodeThreadNotFound)
+	res := h.mustCall("send_text", map[string]any{"thread_id": selfPN, "text": "note to self"})
+	if res["message_id"] == "" || len(c.sentSnapshot()) != 1 {
+		t.Fatalf("result %v, sent %d", res, len(c.sentSnapshot()))
+	}
+	chat, found, err := h.srv.store.GetChat(h.srv.ctx, selfPN)
+	if err != nil || !found || chat.Kind != api.KindDM {
+		t.Fatalf("self chat not stored: found=%v kind=%q err=%v", found, chat.Kind, err)
+	}
+}

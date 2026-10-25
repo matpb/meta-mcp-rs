@@ -227,7 +227,7 @@ Pairing failures: `err-client-outdated` is fatal `client_outdated` (update the p
 
 Everything below is out of scope. An op that is not in the table of section 3.1 returns `unsupported`.
 
-- Starting new chats. A send to a chat that is absent from the local store returns `thread_not_found` ("the owner must open this chat on the phone first"). The chat appears in the store once the owner has chatted there (live message, history sync). This is deliberate: see section 6 on new-chat restrictions.
+- Starting new chats. A send to a chat that is absent from the local store returns `thread_not_found` ("the owner must open this chat on the phone first"). The chat appears in the store once the owner has chatted there (live message, history sync). The one exception is the owner's own number (the linked account's phone JID, the "message yourself" chat): a send there creates the chat on first use. This is deliberate: see section 6 on new-chat restrictions.
 - Group management (create, add, remove, rename, admin changes). Group chats are readable and repliable only when they already exist.
 - Polls (creation and votes), status updates, newsletters and channels, calls (call log entries are read as kind `call`, nothing is placed or answered).
 - Edits and revokes from our side. Incoming edits and revokes are applied to the store (`edited`, `unsent`) only when their sender wrote the message, a revoke also when the sender is a known group admin (section 3.4).

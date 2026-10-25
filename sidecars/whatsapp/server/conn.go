@@ -120,6 +120,14 @@ func (s *server) chatFor(ctx context.Context, threadID string) (store.Chat, erro
 		return store.Chat{}, api.Errorf(api.CodeIO, "message database error")
 	}
 	if !found {
+		if owner, ok, err := s.store.GetMeta(ctx, metaOwnerJID); err == nil && ok && owner != "" && owner == threadID {
+			// The owner's own chat (message yourself) is always a safe target: create it on first use.
+			chat, _, err = s.store.EnsureChat(ctx, owner, "", api.KindDM)
+			if err != nil {
+				return store.Chat{}, api.Errorf(api.CodeIO, "message database error")
+			}
+			return chat, nil
+		}
 		return store.Chat{}, api.Errorf(api.CodeThreadNotFound, "unknown thread; the owner must open this chat on the phone first")
 	}
 	return chat, nil
