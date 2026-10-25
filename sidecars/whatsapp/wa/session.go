@@ -77,6 +77,8 @@ func (s *Session) openDB(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("wa: open session db: %w", err)
 	}
+	// One connection: a second writer in WAL mode gets SQLITE_BUSY without honouring busy_timeout.
+	db.SetMaxOpenConns(1)
 	wmLog := waLog.Zerolog(s.log.With().Str("component", "whatsmeow").Logger())
 	container := sqlstore.NewWithDB(db, "sqlite3", wmLog)
 	if err := container.Upgrade(ctx); err != nil {
