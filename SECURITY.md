@@ -332,12 +332,19 @@ precaution whose effect is unproven. None of it brings the risk to zero, and no 
 - **A human can approve each send, if your client is set to ask.** The personal send tools are annotated as not read-only and
   open-world, and their descriptions say they reach real people as you and to confirm intent first. meta-mcp has no
   approval step of its own: whether you are asked depends on your MCP client's settings.
-- **Nothing paces sends.** Neither the daemon nor the sidecars limit the rate of sends, reactions, read marks or
-  typing. The figures that circulate (at least 500 ms between messages, about 20 per minute per account) are
-  folklore: neither is a threshold WhatsApp published.
+- **The daemon paces writes.** Per platform, a token bucket allows a new message (`send_text`, `send_media`) once
+  every 2 seconds with a burst of 3, and a reaction, read mark or typing indicator once a second with a burst of 5
+  (`META_MCP_PERSONAL_SEND_INTERVAL_MS` and `META_MCP_PERSONAL_SEND_BURST` change the first). A call without a token
+  is refused with `rate_limited` and a `retry_after_ms` value before anything reaches the sidecar, and the refusal
+  of a text, media or reaction send is written to the audit log. The sidecars limit nothing themselves. This is a
+  courtesy limiter whose effect on the platforms is unproven: the figures that circulate (at least 500 ms between
+  messages, about 20 per minute per account) are folklore, and neither is a threshold WhatsApp published.
 - **A fatal signal stops sending.** A temporary ban, a reach-out time-lock, an outdated client, a replaced stream, a
   removed device or a ban sets `sending_blocked` and stops reconnecting. `meta-mcp personal restart` clears the
-  block, not the cause: do not restart in a loop.
+  block, not the cause: do not restart in a loop. Any other fatal signal follows the action the sidecar names: `none`
+  or `relogin` stop the reconnecting too (`status` says so and asks for a `restart`), and `wait` makes the next delay
+  at least 300 seconds. The delay list starts over only after a connection has stayed up for 120 seconds, and a
+  sidecar that misses two pings in a row (one every 30 seconds) is killed and restarted with the same backoff.
 - **Read-only mode**, in two layers (below).
 
 ### The no-new-chats rule
@@ -388,34 +395,81 @@ The daemon keeps your logged-in sessions in `META_MCP_HOME/personal/` (folders 0
 - **Keep the files directory away from them.** Startup refuses a `META_MCP_FILES_DIR` that contains `META_MCP_HOME`,
   but accepts one that sits inside it, and the file tools can read everything in the files directory. Keep
   `META_MCP_FILES_DIR` outside `META_MCP_HOME`, and never point it at `personal/`.
-- **Deleting a session.** With the daemon running, `meta-mcp personal logout PLATFORM` always tries to delete
-  `state.json`; if that fails the command still says the session is cleared, and `meta-mcp personal status` shows `last error: state_delete_failed`.
-  If the sidecar is running, it also deletes its own copies (Messenger: the cookies, `threads.json`, `e2ee.db`;
-  WhatsApp: the device, `messages.db` and the leftovers in `session.db`), and on WhatsApp it removes the linked device
-  on WhatsApp's side, which unlinks it on the phone, but only while it is connected: offline, the device stays linked,
-  with no warning, so check the Linked devices list. If no sidecar is running, only `state.json` is deleted and the
-  data folder stays as it is. A `logged_out` from the service deletes the state file as well (on WhatsApp the sidecar
-  also tries to wipe the leftovers in `session.db`, as a best effort). `meta-mcp personal uninstall` keeps everything.
+- **Deleting a session.** With the daemon running, `meta-mcp personal logout PLATFORM` does four things, in order:
+  it asks the sidecar to log out (when none runs and a session is stored, the daemon starts one for the purpose,
+  without connecting it); it stops the sidecar; it deletes `state.json`; and it always empties the platform's
+  `data/` folder (databases, thread cache, locks and outbox; the folder itself stays), whether or not the remote
+  logout worked. The sidecar's own deletion is the first try and the daemon's wipe is the second, so a failed
+  deletion in the sidecar does not leave the files behind. The command prints exactly what happened (stored
+  session cleared or not, local data wiped or not, and the result of the remote logout) and exits 1 when any of
+  them failed; the daemon's reply carries `state_cleared`, `data_wiped` and, on failure, `remote_error`. A state
+  file that could not be deleted shows in `meta-mcp personal status` as `last error: state_delete_failed`, a data
+  folder that could not be emptied as `data_wipe_failed`: delete those files by hand. After a logout the daemon
+  ingests no further event from that sidecar, and a later login starts a fresh sidecar with no state.
+  On WhatsApp the linked device is removed on WhatsApp's side, which unlinks it on the phone, only while the sidecar
+  is connected. Otherwise (and logout starts a sidecar unconnected when none runs) only the local copy is deleted:
+  the sidecar still answers success, the device stays linked with no warning, and the command's `service` line, which
+  only says whether the sidecar's logout call failed, still reads that the device was unlinked. Check the Linked
+  devices list. The Messenger sidecar documents no call to Facebook, so check your account's active sessions if you
+  want that session gone.
+- **When the service ends the session.** A `logged_out` event clears the account in the daemon and stops reconnecting.
+  The daemon deletes `state.json` for `device_removed`, `token_invalidated`, `banned` and `logged_out_by_user`; for
+  a Messenger checkpoint, challenge, consent or suspension the file is kept, `status` shows the reason and, when the
+  platform named one, the page to open (`reason_url`), and you run `meta-mcp personal restart messenger` after
+  resolving it. Any other `logged_out` leaves the decision to the sidecar's own `state_updated`. On WhatsApp the
+  sidecar also tries to wipe the leftovers in `session.db`, as a best effort. `meta-mcp personal uninstall` keeps
+  everything.
 - **The cookies you paste.** The login command reads a cURL command or a JSON object and parses it in the process;
-  nothing is executed. Its errors never carry cookie values. `--cookies-json` is visible in the process list and in
-  shell history: prefer `--cookies-file` (a file only you can read, which you delete yourself afterwards) or the hidden prompt.
+  nothing is executed. Its errors never carry cookie values. There is no flag that takes the cookies as an argument,
+  because an argument is visible in the process list and in shell history: use `--cookies-file` (a file only you can
+  read, which you delete yourself afterwards) or the hidden prompt.
 
 ### The daemon socket
 
 The socket is mode 0600. A folder that the daemon, or a socket unit written by `personal install`, has to create for
 it is mode 0700, and so is `META_MCP_HOME/personal/`, which the daemon always resets to 0700; any other existing
 folder keeps its mode, so check it if you chose the path with `--socket` or `META_MCP_PERSONAL_SOCKET`. The
-daemon serves only connections whose peer uid is its own (other uids are logged and dropped). There are no tokens and
+daemon serves only connections whose peer uid is its own (other uids are logged and dropped), and the client checks
+the other end as well: before it sends anything, the tool or command compares the daemon's uid with its own and
+refuses a socket served by another user (`untrusted_daemon`). Both read their own uid from the peer credential of a
+socket pair, not from `/proc`. There are no tokens and
 no per-client permissions: **any process running as your user can read your chats and send as you through it**, as it
-could read the session files. The daemon limits a connection to 32 requests in flight and 16 waits, and the
-daemon to 64 connections. The unit `personal install` writes sets `UMask=0077` and `NoNewPrivileges=yes` and no
-further sandboxing.
+could read the session files. The daemon bounds what one client can cost it: a connection gets at most 32 requests
+in flight, 16 waits and 64 replies outstanding (the excess is refused with `too_many_requests` or
+`too_many_waiters`, and a client that stops reading its replies is dropped), the daemon at most 64 connections, and
+the ring that feeds subscribed clients (the login commands) holds at most 16 MiB: a subscriber that falls behind
+gets one `lagged` error event and no more events. During a shutdown the write ops answer `shutting_down` while
+writes already running finish (up to 5 seconds).
 
-**The HTTP transport reaches it too.** `meta-mcp http` builds the same tool router as `meta-mcp stdio`, personal tools
-included. When a daemon runs under the same user and the HTTP server can open its socket, every holder of one of the
-server's API keys can read your chats and send as you, and the keys carry no per-key permissions. Keep personal mode
-on stdio for the assistant that should have it, or start the HTTP server read-only (`META_MCP_READ_ONLY=true`, and the
-daemon read-only as well), and give HTTP API keys only to people you would give the session files.
+The unit `personal install` writes is sandboxed: `UMask=0077`, `NoNewPrivileges=yes`, `ProtectSystem=strict`,
+`ProtectHome=read-only`, `PrivateTmp=yes`, `LimitCORE=0`, `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`,
+`RestrictNamespaces=yes` and `SystemCallArchitectures=native`. The only places the service may write are named in
+`ReadWritePaths=`: the meta-mcp home, the folder of the inbox database and the files directory (plus a private
+`/tmp`). `install` pins the
+inbox path in the unit (the default path when your shell sets none), creates the home and the inbox folder (mode
+0700), and refuses to install when a configured files directory does not exist. This limits what a compromised
+daemon or sidecar can change on disk; it does not make anything unreadable, and it does not limit what a process
+running as your user can ask the daemon to do.
+
+**The HTTP transport does not reach it by default.** `meta-mcp stdio` registers the personal tools; `meta-mcp http`
+does not, unless `META_MCP_PERSONAL_HTTP=1` is set. With that variable (the server logs a warning at start), and a
+daemon under the same user whose socket the HTTP server can open, every holder of one of the server's API keys can
+read your chats and send as you, and the keys carry no per-key permissions. Keep personal mode on stdio for the
+assistant that should have it, or, if you turn the variable on, start the HTTP server read-only
+(`META_MCP_READ_ONLY=true`, and the daemon read-only as well), and give HTTP API keys only to people you would give
+the session files. Independently of this switch, `inbox_list` and `inbox_wait` leave the personal rows out unless the
+call names a personal `platform` or sets `include_personal`, so a generic inbox query does not return your chats by
+accident. That is a default, not an access control: a caller who asks for them gets them.
+
+### Files the assistant sends
+
+`messenger_personal_send_media` and `whatsapp_personal_send_media` take a path inside `META_MCP_FILES_DIR`. After the
+jail check the daemon opens the file without following a final symlink or blocking on it, then checks the open
+handle: it must be a regular file whose real path (read from `/proc/self/fd` on Linux) is still inside the files
+directory and, unless `allow_inbound` is true, outside `inbound/`. The copy that is sent is read from that handle,
+so replacing the path with a symlink between the check and the read cannot send another file. A mismatch is
+`file_refused`. The checks are the daemon's own, and it hands the sidecar only the copy in the platform's private
+`outbox/`.
 
 ### Sidecars, logs and scrubbing
 
@@ -447,8 +501,9 @@ daemon read-only as well), and give HTTP API keys only to people you would give 
 ### The send audit log
 
 `META_MCP_HOME/personal/audit.jsonl` (mode 0600, append-only) records every text, media and reaction send, and
-every such write that one of the first pipeline steps refused before it reached the sidecar (read-only mode, a blocked
-account, invalid input, a platform that is not online, a missing files directory, a file the jail refuses). A request that the connection limits
+every such write that one of the first pipeline steps refused before it reached the sidecar (a daemon that is shutting down, read-only mode, a blocked
+account, invalid input, a platform that is not online, a missing files directory, a send the pacing refuses with
+`rate_limited`, a file the jail or the handle check refuses). A request that the connection limits
 turn away, or one that names no valid platform, writes no line.
 
 - **Write-ahead.** An `attempt` line is appended and fsynced before the sidecar is asked. If it cannot be written,
@@ -504,8 +559,8 @@ the receiver logs batch counts only.
 In personal mode the same file also holds **your own conversations**: every message, reaction and receipt that
 the personal daemon sees (including the history batches WhatsApp sends after pairing), with the whole event in
 `raw`, which `inbox_list` returns when asked for it. Next to it are the sidecars' own stores, `messages.db` and
-`e2ee.db`, which hold message text in the clear. Nothing expires on a schedule. Sidecar data goes on a
-logout; when you link a different WhatsApp account (which clears `messages.db`) or open the Messenger store with a
+`e2ee.db`, which hold message text in the clear. Nothing expires on a schedule. Sidecar data goes on every
+logout (the daemon empties the platform's data folder whether or not the remote logout worked); when you link a different WhatsApp account (which clears `messages.db`) or open the Messenger store with a
 different account (it is wiped first); when the service ends the linked device (whatsmeow deletes the device); when
 the Messenger sidecar trims a thread past about 2000 cached encrypted messages or keeps only about the newest 10000
 attachment records; and when a deletion is mirrored (a WhatsApp chat you delete on your phone is deleted from
@@ -531,8 +586,10 @@ dropped). `inbox.db` is never purged. Apply your own retention, and see
    exception. `take_fd3` in `src/personal/daemon/listen.rs` carries `#[allow(unsafe_code)]` and calls
    `from_raw_fd(3)`: when systemd starts the personal daemon through socket activation it passes the
    listening socket as file descriptor 3, and the standard library has no safe function that adopts a descriptor
-   by its number. The call is made only when `LISTEN_FDS` is `1` and `LISTEN_PID` is the daemon's own pid, and the
-   descriptor is then duplicated close-on-exec so that no sidecar inherits it. It is the only such
+   by its number. The call is made only when `LISTEN_FDS` is `1`, `LISTEN_PID` is the daemon's own pid and file
+   descriptor 3 is open and is a socket (checked through `/proc/self/fd/3`, so socket activation is Linux only), and
+   the descriptor is then duplicated close-on-exec so that no sidecar inherits it. Personal mode is compiled on Unix
+   only (`#[cfg(unix)]`). It is the only such
    function in the crate. The Go sidecars are separate programs (see
    [Supply chain and licences](#supply-chain-and-licences)). The dependencies of the Rust crate are not
    audited by this repository, so keep them updated.

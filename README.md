@@ -90,12 +90,19 @@ assistant reads goes wherever the assistant runs.
   files, react, mark read, show typing, and save attachments. 18 tools in all
   ([docs/TOOLS.md](docs/TOOLS.md#personal-tools)); the messages also land in the local inbox as the platforms
   `messenger_personal` and `whatsapp_personal`.
-- **What it needs.** Rust 1.89 or newer, Go 1.26 or newer, and Linux: the daemon reads its own user id from `/proc`, and
-  `meta-mcp personal install` writes systemd user units. Without systemd, run `meta-mcp personal daemon` under your own
-  supervisor, still on Linux.
+- **What it needs.** Rust 1.89 or newer, Go 1.26 or newer, and a Unix system. Personal mode is compiled on Unix only
+  (`#[cfg(unix)]`): elsewhere the crate builds without it, serves the 20 business tools, and `meta-mcp personal` says
+  `personal mode needs a Unix system`. Only Linux was exercised: `meta-mcp personal install` writes systemd user
+  units, and socket activation is Linux only. Without systemd, run `meta-mcp personal daemon` under your own
+  supervisor.
 - **What it does not do.** Start new chats (each sidecar sends only into a conversation it already holds), manage
-  groups, send polls, or pace sends for you (neither the daemon nor the sidecars rate-limit sends). Encrypted
-  Messenger history from before the device was registered is not available.
+  groups, or send polls. Encrypted Messenger history from before the device was registered is not available.
+- **Pacing.** The daemon paces writes per platform with a token bucket: new messages one per 2 seconds with a burst
+  of 3, reactions, read marks and typing one per second with a burst of 5. A call without a token is refused with
+  `rate_limited` and a `retry_after_ms` value. It is a courtesy limiter, not a promise about what the platforms
+  tolerate ([docs/TOOLS.md](docs/TOOLS.md#personal-tools) has the details and the two variables).
+- **Over HTTP.** The personal tools are served over stdio. `meta-mcp http` leaves them out unless
+  `META_MCP_PERSONAL_HTTP=1` is set.
 
 From the repository root:
 
@@ -125,8 +132,8 @@ register as a developer, create an app with the Messenger use case, copy the App
 **Settings > Basic**, and register `http://localhost:8766/callback` as a redirect URI under **Facebook
 Login for Business > Settings** (the guide explains why, and what to do if Meta refuses it).
 
-1. **Install.** You need Rust 1.89 or newer and a C compiler. Since personal mode was added the crate uses Unix-only
-   APIs without a platform guard, so a build for Windows is not expected to work (not tried).
+1. **Install.** You need Rust 1.89 or newer and a C compiler. Personal mode is compiled on Unix systems only; on
+   other systems the crate is meant to build without it and serve the business tools (not tried on Windows).
 
    ```bash
    git clone https://github.com/matpb/meta-mcp-rs.git
@@ -174,13 +181,14 @@ systemd or your process manager. Personal mode needs none of these routes: it ha
 
 38 tools: 20 for business mode and 18 for personal mode. Full parameters, results and examples are in
 [docs/TOOLS.md](docs/TOOLS.md). "Read-only mode" says whether the tool stays available when
-`META_MCP_READ_ONLY=true`.
+`META_MCP_READ_ONLY=true`. The personal tools exist on Unix systems and are served over stdio; `meta-mcp http`
+lists only the 20 business tools unless `META_MCP_PERSONAL_HTTP=1` is set.
 
 | Tool | What it does | Read-only mode |
 |---|---|---|
 | `meta_status` | Shows the app, Pages, WhatsApp numbers, token expiry, webhook and inbox health | kept |
-| `inbox_list` | Lists stored events (webhook and personal), newest first, with filters | kept |
-| `inbox_wait` | Waits for new inbox events | kept |
+| `inbox_list` | Lists stored events (webhook, and personal ones when `platform` names one or `include_personal` is true), newest first, with filters | kept |
+| `inbox_wait` | Waits for new inbox events (personal ones as for `inbox_list`) | kept |
 | `inbox_mark_processed` | Flags inbox events as handled | removed |
 | `messenger_list_conversations` | Lists a Page's conversations and the customers' PSIDs | kept |
 | `messenger_read_conversation` | Reads the messages of one conversation | kept |
@@ -253,6 +261,12 @@ writes the file; every variable below overrides it.
 | `META_MCP_LOG` | `meta_mcp=info` | Log filter (tracing syntax); logs go to stderr |
 | `META_MCP_PERSONAL_SOCKET` | `$XDG_RUNTIME_DIR/meta-mcp/personal.sock`, else `META_MCP_HOME/personal/personal.sock` | Personal mode. The Unix socket of the personal daemon, used by the daemon, the MCP server and every `meta-mcp personal` command. Keep the path under about 100 bytes |
 | `META_MCP_SIDECAR_DIR` | the directory of the `meta-mcp` executable | Personal mode. Where `meta-messenger-sidecar` and `meta-whatsapp-sidecar` are |
+| `META_MCP_PERSONAL_HTTP` | unset | Personal mode. `1` serves the personal tools over `meta-mcp http` too; without it they are not registered there. Every API key holder then reaches your accounts |
+| `META_MCP_PERSONAL_SEND_INTERVAL_MS` | `2000` | Personal mode, daemon. Milliseconds between the tokens of the new-message bucket (`send_text`, `send_media`), per platform |
+| `META_MCP_PERSONAL_SEND_BURST` | `3` | Personal mode, daemon. Size of that bucket. Reactions, read marks and typing have a fixed bucket (one per second, burst 5) |
+
+`env.example` also documents `META_MCP_PERSONAL_BACKOFF_MS`, `META_MCP_PERSONAL_STABLE_MS`, `META_MCP_PERSONAL_PING_MS`
+and `META_MCP_PERSONAL_PING_TIMEOUT_MS`, which tune the daemon's restarts of a sidecar.
 
 Booleans accept `true`, `false`, `1`, `0`, `yes`, `no`, `on` and `off`.
 
@@ -279,8 +293,9 @@ The access token is the Page, or the business number, so the defaults are conser
 - Personal mode keeps a copy of your logged-in session, so its files (`META_MCP_HOME/personal/`) are 0600 in 0700
   folders and the daemon socket accepts only your own user. The sidecars start with an empty environment, the
   logs are scrubbed, and sends are written to an audit log (hashes and ids, never the text) before they are
-  attempted. Nothing paces sends. The HTTP transport serves the personal tools too, so every holder of one of its API
-  keys can reach your accounts. The risk that no control removes is the platforms': an unofficial client can get the
+  attempted. The daemon paces writes and refuses an excess with `rate_limited`. The HTTP transport does not register
+  the personal tools unless you set `META_MCP_PERSONAL_HTTP=1`; with it, every holder of one of its API keys can
+  reach your accounts. The risk that no control removes is the platforms': an unofficial client can get the
   account restricted or banned.
 
 The full threat model, each control's limits and how to report a vulnerability are in

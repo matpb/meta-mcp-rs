@@ -6,9 +6,10 @@ share the same configuration, Graph client and local inbox.
 
 A second mode, the **personal mode**, reaches your own Messenger and WhatsApp accounts, which the Graph
 API cannot. It adds a long-lived daemon (`meta-mcp personal daemon`), two Go sidecar programs that the
-daemon owns, a command group (`meta-mcp personal ...`) and 18 more tools on the same MCP server. It is
-described in [Personal mode](#personal-mode). The rest of this page, up to that section, is about the
-business mode.
+daemon owns, a command group (`meta-mcp personal ...`) and 18 more tools on the same MCP server (served over
+stdio; `meta-mcp http` leaves them out unless `META_MCP_PERSONAL_HTTP=1`). Personal mode is compiled on Unix systems
+only (`#[cfg(unix)]`); elsewhere the server has the 20 business tools. It is described in
+[Personal mode](#personal-mode). The rest of this page, up to that section, is about the business mode.
 
 - [Components and data flow](#components-and-data-flow)
 - [Modules](#modules)
@@ -79,16 +80,16 @@ Two facts shape everything else:
 | `src/mcp/mod.rs` | `MetaMcp` handler, core tools, router composition, result helpers |
 | `src/mcp/messenger_tools.rs` | Messenger tool definitions (schemas, descriptions, annotations) |
 | `src/mcp/whatsapp_tools.rs` | WhatsApp tool definitions |
-| `src/mcp/personal_tools.rs` | The 18 personal tool definitions, and the lazily connected socket client they share |
+| `src/mcp/personal_tools.rs` | The 18 personal tool definitions (Unix only), and the lazily connected socket client they share |
 | `src/messenger/` | Messenger operations: conversations, messages, sends, attachments, profile |
 | `src/whatsapp/` | WhatsApp operations: sends, media, templates, window warning |
 | `src/setup/` | The wizard, the doctor and the token commands (OAuth, discovery, subscription, prompts, report) |
-| `src/personal/mod.rs` | `PersonalPlatform`, the default socket path, the `personal/` folder |
+| `src/personal/mod.rs` | `PersonalPlatform`, the default socket path, the `personal/` folder, the daemon's own uid (read from the peer credential of a socket pair). The whole `personal` module is `#[cfg(unix)]` |
 | `src/personal/protocol.rs`, `link.rs` | The typed frames of the sidecar line protocol (version 1) and the line-framed request/reply link used for both the sidecar pipes and the daemon socket |
 | `src/personal/sidecar.rs` | Locating, spawning (empty environment) and stopping a sidecar; the `hello` handshake |
-| `src/personal/client.rs` | The socket client used by the tools and the commands |
+| `src/personal/client.rs` | The socket client used by the tools and the commands; it checks that the daemon behind the socket runs as the same uid |
 | `src/personal/state.rs`, `audit.rs`, `validate.rs` | The session state files and folders (modes, atomic writes), the append-only send audit log, and the input checks for writes |
-| `src/personal/daemon.rs`, `src/personal/daemon/` | The daemon: socket (`listen.rs`), connections (`conn.rs`), op dispatch (`ops.rs`), login (`login.rs`), platform lifecycle (`platform.rs`), sidecar events (`events.rs`), inbox mapping (`inbox_map.rs`), the recent ring (`ring.rs`) and the write pipeline (`write.rs`) |
+| `src/personal/daemon.rs`, `src/personal/daemon/` | The daemon: socket (`listen.rs`), connections (`conn.rs`), the byte-capped event ring for subscribers (`hub.rs`), op dispatch (`ops.rs`), login and logout (`login.rs`), platform lifecycle, reconnects and the sidecar heartbeat (`platform.rs`), sidecar events (`events.rs`), inbox mapping (`inbox_map.rs`), the recent-messages ring (`ring.rs`), write pacing (`pace.rs`) and the write pipeline (`write.rs`) |
 | `src/personal/cli.rs`, `src/personal/cli/` | The `meta-mcp personal` commands: login flows, cookie parsing, QR drawing, status, install |
 | `sidecars/messenger/` | The Go Messenger sidecar (mautrix-meta messagix, whatsmeow for encrypted chats); `docs/SIDECAR-MESSENGER.md` |
 | `sidecars/whatsapp/` | The Go WhatsApp sidecar (whatsmeow plus its own message store); `docs/SIDECAR-WHATSAPP.md` |
@@ -101,20 +102,21 @@ Two facts shape everything else:
 | Command | What it does |
 |---|---|
 | `meta-mcp` or `meta-mcp stdio` | MCP over stdin and stdout; logs go to stderr |
-| `meta-mcp http [--with-webhook]` | MCP over streamable HTTP at `/mcp` plus `GET /health`; `--with-webhook` adds `/webhook` |
+| `meta-mcp http [--with-webhook]` | MCP over streamable HTTP at `/mcp` plus `GET /health`; `--with-webhook` adds `/webhook`. The personal tools are registered only when `META_MCP_PERSONAL_HTTP=1` |
 | `meta-mcp webhook` | Webhook receiver only: `/webhook` and `/health` |
 | `meta-mcp setup` | Guided setup (flags in the guide, Part 4) |
 | `meta-mcp doctor [--json] [--webhook]` | Live verification; exit code 1 when any check fails |
 | `meta-mcp token refresh \| import \| show` | Refresh, import or inspect stored tokens |
-| `meta-mcp tools` | Print the tool names, one per line, honouring read-only mode |
+| `meta-mcp tools` | Print the tool names of the stdio server, one per line, honouring read-only mode |
 | `meta-mcp personal daemon [--socket PATH]` | The personal daemon (Personal mode below) |
-| `meta-mcp personal login messenger \| whatsapp` | Log in through the daemon (cookies for Messenger; QR code or pair code for WhatsApp) |
-| `meta-mcp personal status [--json]`, `logout PLATFORM`, `restart PLATFORM` | Show both accounts, forget a session, restart a sidecar and clear a sending block |
-| `meta-mcp personal install [--dry-run]`, `uninstall [--dry-run]` | Write and start, or remove, the systemd user units of the daemon |
+| `meta-mcp personal login messenger [--cookies-file PATH] \| whatsapp [--pair-code PHONE]` | Log in through the daemon (cookies for Messenger, from a file or a hidden prompt; QR code or pair code for WhatsApp) |
+| `meta-mcp personal status [--json]`, `logout PLATFORM`, `restart PLATFORM` | Show both accounts, log out (stop the sidecar, delete the session, empty the platform's data folder), restart a sidecar and clear a sending block |
+| `meta-mcp personal install [--dry-run]`, `uninstall [--dry-run]` | Write and start, or remove, the systemd user units of the daemon. `install` creates the home and the inbox folder and refuses a configured files directory that does not exist |
 
 Exit codes: 0 success, 1 runtime or configuration error, 2 usage error. Startup errors are
 printed to stderr as `error: <message>`. The personal daemon exits 2 on a configuration error, and the
-unit `personal install` writes does not restart it for that status (`RestartPreventExitStatus=2`).
+unit `personal install` writes does not restart it for that status (`RestartPreventExitStatus=2`). On a system
+without personal mode, `meta-mcp personal ...` prints `personal mode needs a Unix system` and exits 2.
 
 ## Configuration and precedence
 
@@ -141,8 +143,11 @@ unit `personal install` writes does not restart it for that status (`RestartPrev
   startup error that says so.
 - **Personal mode.** `META_MCP_PERSONAL_SOCKET` (the daemon socket) and `META_MCP_SIDECAR_DIR` (where the
   sidecar binaries are) are read by the personal code only; `META_MCP_PERSONAL_BACKOFF_MS` tunes the daemon's
-  reconnect delays. The daemon reads the rest of the configuration like any other command, and keeps its
-  files in `<META_MCP_HOME>/personal/`.
+  reconnect delays and `META_MCP_PERSONAL_STABLE_MS` (default 120000) how long a connection must last before they
+  start over; `META_MCP_PERSONAL_PING_MS` (30000) and `META_MCP_PERSONAL_PING_TIMEOUT_MS` (10000) set the sidecar
+  heartbeat; `META_MCP_PERSONAL_SEND_INTERVAL_MS` (2000) and `META_MCP_PERSONAL_SEND_BURST` (3) set the pacing of new
+  messages. `META_MCP_PERSONAL_HTTP=1` makes `meta-mcp http` register the personal tools. The daemon reads the rest
+  of the configuration like any other command, and keeps its files in `<META_MCP_HOME>/personal/`.
 - **Redaction.** `Config` prints `***` for every secret in its debug output.
 
 ## Graph client
@@ -289,9 +294,10 @@ CREATE INDEX IF NOT EXISTS idx_events_processed_received ON events (processed, r
 ## MCP layer and transports
 
 - **Handler.** `MetaMcp` holds the configuration, the Graph client, the inbox and a tool
-  router. The router is the sum of the core, Messenger, WhatsApp and personal routers (38 tools). In
-  read-only mode the write tools (11 business, 10 personal) are removed from the router, so they are
-  neither listed nor callable.
+  router. The router is the sum of the core, Messenger, WhatsApp and personal routers (38 tools on Unix over stdio).
+  The personal router is added for stdio, and for `meta-mcp http` only when `META_MCP_PERSONAL_HTTP=1`; without
+  personal mode compiled in (non-Unix) it is absent, leaving 20 tools. In read-only mode the write tools (11
+  business, 10 personal) are removed from the router, so they are neither listed nor callable.
 - **Results.** A successful call returns one text block holding compact JSON. The download
   tools may add an image block. Failures set `isError` and return the redacted error text.
   No structured content is returned.
@@ -300,7 +306,8 @@ CREATE INDEX IF NOT EXISTS idx_events_processed_received ON events (processed, r
 - **Server instructions.** Sent at initialisation: content from Meta is untrusted, sending
   tools reach real people, the Messenger and WhatsApp windows (and that `HUMAN_AGENT` is for a
   person replying by hand, not for generated replies), and that inbound WhatsApp messages
-  exist only in the local inbox.
+  exist only in the local inbox, and that the personal tools act as the owner on the owner's own accounts, reach real
+  people as the owner and are outside the platforms' terms, so sending needs confirmation.
 - **stdio.** MCP over stdin and stdout. Logs go to stderr (filter `META_MCP_LOG`, default
   `meta_mcp=info`). An environment-provided Page token without a Page ID is resolved with
   `GET /me` at startup, and a failure stops the server.
@@ -372,10 +379,10 @@ flowchart LR
 
 | Process | Started by | Lives | Role |
 |---|---|---|---|
-| `meta-mcp` (stdio, or `meta-mcp http`) | The MCP client, or the owner for HTTP | One assistant session, or until stopped | Serves the 18 personal tools (the HTTP server registers the same tools, so with a daemon under the same user every holder of one of its API keys reaches your accounts, see SECURITY.md). Holds one lazily connected socket client, shared by all calls, that reconnects when the daemon was restarted. Keeps no personal state |
+| `meta-mcp` (stdio, or `meta-mcp http`) | The MCP client, or the owner for HTTP | One assistant session, or until stopped | Serves the 18 personal tools over stdio. `meta-mcp http` registers them only with `META_MCP_PERSONAL_HTTP=1`; then, with a daemon under the same user, every holder of one of its API keys reaches your accounts (see SECURITY.md). Holds one lazily connected socket client, shared by all calls, that reconnects when the daemon was restarted and refuses a daemon that runs as another uid. Keeps no personal state |
 | `meta-mcp personal login`, `status`, `logout`, `restart` | The owner | One command | Short-lived socket clients. The login commands also subscribe to events (QR codes, passkey requests) |
 | `meta-mcp personal daemon` | systemd (`personal install`) or the owner | Until SIGTERM or SIGINT | Owns the socket, the sidecars, the session state, the audit log and the writes into the inbox. One per `META_MCP_HOME`: it takes an exclusive lock on `personal/daemon.lock`, so a second daemon on the same home exits with `another personal daemon already uses ...`, even on another socket |
-| `meta-messenger-sidecar`, `meta-whatsapp-sidecar` | The daemon | Until the daemon stops or replaces it (`restart`, a reconnect, shutdown); a `logout` leaves it running | One process per account and one connection set. No network listener. Started at daemon start for a platform that has a stored session, otherwise at its first `login_start` |
+| `meta-messenger-sidecar`, `meta-whatsapp-sidecar` | The daemon | Until the daemon stops or replaces it (`restart`, a reconnect, shutdown, or a heartbeat kill after two missed pings); a `logout` stops it too | One process per account and one connection set. No network listener. Started at daemon start for a platform that has a stored session, otherwise at its first `login_start` |
 
 ### The daemon socket
 
@@ -390,17 +397,24 @@ flowchart LR
   the daemon always resets to 0700), removes a stale socket, refuses a live one (`another personal daemon is already running on ...`) and a path that is not a socket, binds, sets
   mode 0600 and removes the file on exit.
   The units `personal install` writes use socket activation.
-- **Who may connect.** Only the daemon's own uid, checked on every connection with the peer credentials.
-  There are no tokens: the 0600 socket and the uid check are the whole gate (the folder is 0700 when the
+- **Who may connect.** Only the daemon's own uid, checked on every connection with the peer credentials; the daemon
+  learns its own uid from the peer credential of a socket pair, not from `/proc`. The clients check the other end:
+  before sending anything, the tool or command compares the daemon's uid with its own and refuses a socket served
+  by another user (`untrusted_daemon`). There are no tokens: the 0600 socket and the uid checks are the whole gate (the folder is 0700 when the
   daemon or a unit written by `personal install` created it, and for `personal/`; any other existing folder keeps its
   mode), so any process running as the same user can use it.
 - **Protocol.** The sidecar line protocol again: one JSON object per line, at most 16 MiB including the
   newline, requests `{"id", "op", "params"}`, replies `{"id", "ok", "result"}` or
   `{"id", "ok": false, "error": {"code", "message"}}`. A malformed or oversized client line closes the
   connection. Events (`{"event", "data"}`) are sent only after the client sent `subscribe`.
-- **Limits.** 64 connections at once (the 65th is dropped); 32 requests in flight and 16 `wait_for_message`
-  per connection (`too_many_requests`, `too_many_waiters`); a reply that would exceed 16 MiB becomes
-  `reply_too_large`. A subscribed client that is too slow loses events (a warning is logged).
+- **Limits.** 64 connections at once (the 65th is dropped); per connection 32 requests in flight, 16
+  `wait_for_message` and 64 replies outstanding at once (`too_many_requests`, `too_many_waiters`; a client that stops
+  reading, so that even a refusal cannot be queued, is disconnected); a reply that would exceed 16 MiB becomes
+  `reply_too_large`. Events for subscribers go through one ring capped at 16 MiB (and 1024 frames): a subscriber that
+  falls behind it receives one error event, `{"event":"error","data":{"code":"lagged","message":"lagged:
+  resubscribe"}}`, and no more events (its connection stays open; it must subscribe again). A warning is logged.
+- **Shutdown.** Once the daemon is stopping, the write ops answer `shutting_down`; writes already running may finish
+  (up to 5 seconds).
 - **Protected requests.** `send_text`, `send_media`, `send_reaction`, `login_start`, `login_finish`,
   `logout` and `restart` keep running when the client disconnects, so that an audit line gets its
   completion and a state change is finished. Everything else is aborted with the connection.
@@ -411,7 +425,7 @@ flowchart LR
 | `subscribe` | none | `{}`; events follow on this connection |
 | `wait_for_message` | `timeout_ms` 1 to 300000, optional `platform` | `{message, timed_out, lagged}` |
 | `recent` | `since_ts` (Unix seconds), optional `platform` | `{messages, truncated}` from the in-memory ring |
-| `login_start`, `login_finish`, `login_cancel`, `logout`, `restart` | login parameters of the sidecar | The sidecar's answer, or `{state_cleared, remote_error?}` for `logout`, or the platform status for `restart` |
+| `login_start`, `login_finish`, `login_cancel`, `logout`, `restart` | login parameters of the sidecar | The sidecar's answer, or `{state_cleared, data_wiped, remote_error?}` for `logout`, or the platform status for `restart` |
 | `list_threads`, `fetch_messages` | as the sidecar | The sidecar's answer, unchanged |
 | `download_attachment` | `thread_id`, `message_id`, `attachment_id` | The sidecar's answer plus `files_path` |
 | `send_text`, `send_media`, `send_reaction` | as the tools | `{message_id, ts, audit_id}` or `{audit_id}` |
@@ -439,6 +453,9 @@ flowchart LR
   if it outlives the deadline). Timeouts: connect 30 s; `login_start` 60 s; `login_finish` 120 s;
   `login_cancel` 30 s; `logout` 60 s; list 60 s; read 90 s; download 300 s; send 300 s; reaction 60 s;
   mark read and typing 30 s. A tool adds 10 seconds of slack on top of the daemon's timeout.
+- **Heartbeat.** The daemon pings a running sidecar every 30 seconds and waits 10 for the answer. Two misses in a
+  row make it kill the sidecar (`last_error` `sidecar_unresponsive`), which the crash path below then restarts.
+  A sidecar that answers with an error counts as alive.
 - **The wire protocol** (ops, events, shapes and error codes) is defined once for both sidecars, version 1,
   and described in `sidecars/messenger/docs/SIDECAR-MESSENGER.md` and
   `sidecars/whatsapp/docs/SIDECAR-WHATSAPP.md`. Stdout carries frames only; stderr carries the scrubbed log.
@@ -450,8 +467,8 @@ Events the daemon consumes from a sidecar:
 | `ready` | Ignored; not forwarded |
 | `state_updated` | Writes `state.json` atomically (a `null` state deletes it). Writes are accepted only while a login runs or a session exists; a late write after a logout is dropped. Never forwarded to clients |
 | `logged_in` | Marks the account logged in, wants it online, sends `connect`. Forwarded |
-| `logged_out` | The session ended: deletes `state.json`, stops reconnecting, empties the recent ring, keeps the reason in `status`. Forwarded |
-| `connection` | Updates `connection` and `reason`. `connected` resets the backoff. `fatal` with one of `temporary_ban`, `reachout_timelock`, `banned`, `device_removed`, `client_outdated`, `stream_replaced` blocks sends and stops reconnecting; any other `fatal` (for example a rate limit, or Messenger's `repeated_failures`) starts the reconnect loop. Forwarded |
+| `logged_out` | The session ended: marks the account logged out, stops reconnecting, empties the recent ring and keeps the reason in `status`, with the page to open (`reason_url`) when the sidecar gave an `http` or `https` link. Deletes `state.json` only for `device_removed`, `token_invalidated`, `banned` and `logged_out_by_user`; a Messenger checkpoint, challenge, consent or suspension keeps it (the owner resolves it in a browser, then runs `restart`), and any other reason leaves the file to a `state_updated` null from the sidecar. Forwarded |
+| `connection` | Updates `connection` and `reason`. A connection that stays `connected` for 120 seconds earns a fresh backoff; a shorter one does not. `fatal` with one of `temporary_ban`, `reachout_timelock`, `banned`, `device_removed`, `client_outdated`, `stream_replaced` blocks sends and stops reconnecting. Any other `fatal` follows the sidecar's `action`: `none` or `relogin` set `reconnect_halted` and stop reconnecting until `restart` or a login (Messenger's `repeated_failures` carries `relogin`), `wait` starts the reconnect loop with a first delay of at least 300 seconds, and anything else starts it with the normal backoff. Forwarded |
 | `message`, `history`, `reaction`, `receipt` | Mapped to inbox rows (below). `message` also feeds the ring and the waiters. Forwarded |
 | `error` | Keeps its `code` as `last_error`. Forwarded |
 | `qr`, `passkey_request`, `passkey_confirmation`, `thread` | Forwarded only. Every forwarded event gets a `platform` field |
@@ -506,8 +523,12 @@ reconnect timer. `connection` takes the values `stopped`, `starting`, `connectin
    until `login_start` spawns its sidecar.
 2. **Sidecar exits on its own.** The daemon reaps it and retries with a backoff of 10, 30, 60 and 300
    seconds, the last value repeating (`META_MCP_PERSONAL_BACKOFF_MS` overrides the list, in milliseconds).
-   Each attempt starts a fresh sidecar with the stored session. `connected` resets the backoff. `status`
-   shows `reconnect_in_s`.
+   Each attempt starts a fresh sidecar with the stored session. The backoff starts over only after a connection
+   has stayed up for 120 seconds (`META_MCP_PERSONAL_STABLE_MS`), so a connection that drops again at once keeps
+   climbing the list. A sidecar that is alive but silent is killed by the heartbeat (two missed pings, 30 seconds
+   apart) and takes the same path. A `fatal` connection event with the action `none` or `relogin` stops the loop
+   (`reconnect_halted`; `restart` or a login resumes it), and one with `wait` makes the next delay at least 300
+   seconds. `status` shows `reconnect_in_s`.
 3. **Fatal signal.** A blocking reason sets `sending_blocked` and stops the loop. Writes fail with
    `sending_blocked` and `login_start` is refused. After `temporary_ban`, `reachout_timelock`, `client_outdated` or
    `stream_replaced`, reads from the sidecar's store still work (the WhatsApp sidecar stops asking the phone for
@@ -523,48 +544,70 @@ reconnect timer. `connection` takes the values `stopped`, `starting`, `connectin
    stays stopped until the next restart, so reads (encrypted threads from the stored cache, unencrypted ones live) and
    downloads of unencrypted attachments keep working, a download of an encrypted attachment answers `not_connected`,
    and the session is not deleted. `meta-mcp personal restart <platform>` clears the block, and so does a daemon
-   restart (the flag lives in memory); on WhatsApp a `logout` clears only the daemon's flag, while on Messenger it
-   drops the sidecar's session and its block with it. The cause stays the owner's to fix.
-4. **Session ended** (`logged_out`): the state is deleted and nothing reconnects.
+   restart (the flag lives in memory), and so does a `logout`, which stops the sidecar that held the block (the next
+   login starts a fresh one). The cause stays the owner's to fix.
+4. **Session ended** (`logged_out`): the account is marked logged out and nothing reconnects. The state file is
+   deleted for `device_removed`, `token_invalidated`, `banned` and `logged_out_by_user`, and kept for a Messenger
+   checkpoint, challenge, consent or suspension, where the owner resolves the problem in a browser (`status` shows the
+   reason and the page the platform named) and runs `restart`.
 5. **`restart`.** Stops reconnecting, stops the sidecar (15 seconds), clears the block and the backoff, and
    starts a fresh sidecar from the binary on disk with the stored session. With no stored session it only
    clears the flags.
-6. **`logout`.** If a sidecar is running, asks it to log out (60 seconds): it deletes its own copies and, on
-   WhatsApp, unlinks the device on the service's side only while it is connected. Whatever the sidecar
-   answered, and even with no sidecar running, the daemon then tries to delete `state.json` (a failure is kept
-   as the last error `state_delete_failed`), clears the flags and the block and empties the ring. On WhatsApp the
-   sidecar keeps its own block through this, and only a restart of the sidecar clears it; the Messenger sidecar drops
-   its session on logout, and its block with it. A failed request to the sidecar is reported as `remote_error`.
+6. **`logout`.** Stops reconnecting and refuses further state writes, then asks the sidecar to log out (60 seconds).
+   When no sidecar runs and a state file exists, the daemon first starts one with that state, without connecting it,
+   for this purpose; if it cannot, that is the `remote_error`. The sidecar deletes its own copies and, on WhatsApp,
+   unlinks the device on the service's side only while it is connected, so a sidecar started for the logout does a
+   local delete only. Whatever the sidecar answered, the daemon then stops it (15 seconds), marks the account logged
+   out with the reason `logout`, deletes `state.json` (a failure is kept as the last error `state_delete_failed`),
+   empties the platform's `data/` folder (databases, thread cache, locks, outbox; a failure is `data_wipe_failed`),
+   clears the flags and the block and empties the ring. The reply is `{state_cleared, data_wiped, remote_error?}`;
+   a failed remote step is `remote_error` as `code: message`. The generation counter changed when the sidecar
+   stopped, so a late event of that sidecar is dropped and nothing is ingested after a logout. The next
+   `login_start` spawns a fresh sidecar with no state.
 7. **Shutdown.** On SIGTERM or SIGINT the daemon cancels waiters and loops, lets in-flight writes finish
    (up to 5 seconds), stops both sidecars (15 seconds in all) and removes a socket it bound.
 
 ### The write pipeline
 
-`send_text`, `send_media` and `send_reaction` run the same steps. A refusal at steps 1 to 5 is itself written to
+`send_text`, `send_media` and `send_reaction` run the same steps. A refusal at steps 1 to 6 is itself written to
 the audit log, as a `refused` or `invalid` line.
 
-1. **Read-only?** A daemon started with `META_MCP_READ_ONLY` answers `read_only`.
+1. **Shutting down?** A daemon that is stopping answers `shutting_down`. Then **read-only?** A daemon started with
+   `META_MCP_READ_ONLY` answers `read_only`.
 2. **Blocked?** A platform with a fatal signal answers `sending_blocked`.
-3. **Validate.** Text 1 to 4000 characters (trimmed, `\r\n` to `\n`, no control characters but newline),
-   caption up to 1024, emoji up to 10 characters with a symbol (or empty), ids 1 to 128 printable ASCII
-   characters without spaces. A failure is `bad_params` and never echoes the input.
-4. **Online?** `not_logged_in` or `sidecar_unavailable`.
-5. **Media only.** The daemon needs `META_MCP_FILES_DIR`, resolves the path in the jail, refuses anything under
-   `inbound/` unless `allow_inbound`, enforces `META_MCP_MAX_FILE_BYTES`, and copies the file into the
-   platform's `data/outbox/` (0600) while hashing it.
-6. **Write-ahead.** An `attempt` line is appended to `audit.jsonl` and fsynced. If that fails, nothing is sent
+3. **Validate.** Text 1 to 4000 characters (trimmed, `\r\n` to `\n`; newlines and tabs allowed, other control
+   characters, bidirectional overrides and isolates and tag characters refused), caption up to 1024 under the same
+   character rules, emoji (or empty) of at most 10 characters that form an emoji (emoji-block characters, joiners,
+   variation selectors, skin tones, flag tags and keycap sequences; letters, bare digits and other scripts are
+   refused), ids 1 to 128 printable ASCII characters without spaces. A failure is `bad_params` and never echoes
+   the input.
+4. **Online?** `not_logged_in` or `sidecar_unavailable`. For media, the daemon also needs `META_MCP_FILES_DIR`
+   (`no_files_dir`).
+5. **Paced?** One token from the platform's bucket: new messages (`send_text`, `send_media`) one per 2 seconds with a
+   burst of 3 (`META_MCP_PERSONAL_SEND_INTERVAL_MS`, `META_MCP_PERSONAL_SEND_BURST`), reactions, read marks and
+   typing one per second with a burst of 5. Without a token the call is refused with `rate_limited` and
+   `retry_after_ms`, and nothing else happens. A call refused before this step (read-only, blocked, invalid, not
+   online) takes no token.
+6. **Media only.** The daemon resolves the path in the jail, refuses anything under `inbound/` unless
+   `allow_inbound`, opens the file without following a final symlink or blocking, checks the open handle (a regular
+   file, whose real path from `/proc/self/fd` is still inside the jail and, unless `allow_inbound`, outside
+   `inbound/`), enforces `META_MCP_MAX_FILE_BYTES`, and copies from that handle into the platform's `data/outbox/`
+   (0600) while hashing it.
+7. **Write-ahead.** An `attempt` line is appended to `audit.jsonl` and fsynced. If that fails, nothing is sent
    (`audit_failed`).
-7. **Send.** The sidecar call runs with a 300 second timeout (60 for a reaction).
-8. **Completion line.** `sent` with the message id; `failed` with the sidecar's code; or `unknown` when the
+8. **Send.** The sidecar call runs with a 300 second timeout (60 for a reaction).
+9. **Completion line.** `sent` with the message id; `failed` with the sidecar's code; or `unknown` when the
    outcome is open (a timeout, a broken link or the sidecar's own `send_unknown`), which the caller sees as
    `send_unknown: the message may have been sent: read the thread before retrying`. The reply carries
-   `audit_id`, or `audit_warning` if the completion line itself could not be written.
-9. **Cleanup.** The outbox copy is removed whatever happened, and a crashed daemon's leftovers are removed at the
+   `audit_id`, or `audit_warning` if the completion line itself could not be written. A tool that loses the
+   connection to the daemon, or times out, after the request left cannot tell which case it is: it answers
+   `send_unknown: the message may have been sent: read the thread before sending again`, and the daemon
+   still finishes the write and its audit line.
+10. **Cleanup.** The outbox copy is removed whatever happened, and a crashed daemon's leftovers are removed at the
    next start.
 
-`mark_read` and `set_typing` go through steps 1, 2, 3 and 4 but are not audited. There is no limiter on sends,
-reactions, read marks or typing, in the daemon or in the sidecars (the sidecars pace only their own reads):
-nothing paces sends.
+`mark_read` and `set_typing` go through steps 1 to 5 (their tokens come from the second bucket) but are not audited. The
+daemon is the only limiter: the sidecars pace only their own reads.
 
 Audit lines are JSON objects, one per line: `id` (growing), `ts`, `platform`, `thread_id`, `kind` (`text`,
 `media` or `reaction`), `body_sha256` and `body_len` (the SHA-256 and the length in characters of the text,
@@ -587,7 +630,9 @@ caption or emoji; **never the text**), `outcome` (`attempt`, `sent`, `failed`, `
    messages from someone else wake a waiter; your own messages from another device are stored as `echo`
    rows and enter the ring as outgoing, and `history` batches are stored but neither enter the ring nor wake
    a waiter.
-4. Every forwarded event also goes to the subscribed connections (the login commands).
+4. Every forwarded event also goes to the subscribed connections (the login commands) through the byte-capped ring
+   (16 MiB, 1024 frames): a subscriber that falls behind gets one `lagged` error event and is dropped from further
+   events.
 
 ### Read-only, in two layers
 
@@ -679,7 +724,7 @@ sequenceDiagram
 
 ## Sequence: a Messenger login
 
-`meta-mcp personal login messenger`, with the cookies in a file (`--cookies-file`, or `--cookies-json`): the command
+`meta-mcp personal login messenger`, with the cookies in a file (`--cookies-file`): the command
 parses them before it contacts the daemon, so a bad file exits with status 2 and starts no sidecar. When you paste
 the cookies at the prompt instead, the command asks for them after it has printed the instructions. The sidecar is
 started by the first `login_start` when the platform has no stored session. The daemon writes the session state
@@ -824,7 +869,8 @@ sequenceDiagram
 ## Sequence: a personal send
 
 The write-ahead audit line is on disk before the sidecar is asked, and the completion line says what is
-known afterwards. A send that times out is recorded as `unknown`, not as failed.
+known afterwards. A send that times out is recorded as `unknown`, not as failed. A call that finds no token in the
+pace bucket is refused with `rate_limited` before any of that.
 
 ```mermaid
 sequenceDiagram
@@ -838,7 +884,7 @@ sequenceDiagram
 
     AI->>MCP: messenger_personal_send_text (if the client asks the user first)
     MCP->>D: send_text over the socket
-    D->>D: read-only? blocked? valid? sidecar online?
+    D->>D: stopping? read-only? blocked? valid? sidecar online? a token in the pace bucket?
     D->>Log: append attempt line (hash and length of the text), fsync
     alt the line cannot be written
         D-->>MCP: audit_failed, nothing was sent
@@ -868,7 +914,7 @@ sequenceDiagram
 | The operator to stored secrets | `credentials.json`, environment | 0600 file in a 0700 directory, environment alternatives |
 | Message senders to the assistant (personal) | Untrusted names, text and files from your own chats | Descriptions that mark them untrusted, read-only mode, no URL ever reaches a download tool |
 | The assistant to your contacts (personal) | Sends, reactions, read receipts and typing, as you | Confirm-intent wording and tool annotations, read-only in two layers, the write-ahead audit log |
-| The MCP server or a command to the daemon | JSON lines on a Unix socket | Socket mode 0600 (a folder that the daemon, or a socket unit written by `personal install`, creates is 0700), same-uid peer check, connection and request caps, 16 MiB line limit |
+| The MCP server or a command to the daemon | JSON lines on a Unix socket | Socket mode 0600 (a folder that the daemon, or a socket unit written by `personal install`, creates is 0700), same-uid peer check in both directions (the client refuses a daemon of another uid), connection, request and outstanding-reply caps, a byte-capped event ring, 16 MiB line limit, a sandboxed service unit, paced writes |
 | The daemon to a sidecar | JSON lines on pipes | Empty environment but `HOME`, line limit, a malformed line kills the sidecar, error codes reduced to plain words, `state_updated` and `ready` never forwarded |
 | A sidecar to Messenger or WhatsApp | An unofficial client speaking the platform's own protocol | Pinned libraries, scrubbed logs, one connection set per account, presence unavailable on WhatsApp, each sidecar sends only into a conversation it already holds. The account itself is at risk: outside the platforms' terms |
 | The daemon to the local disk (personal) | Session state, databases, audit log, downloads | 0600 files in 0700 folders, atomic writes, downloads confined to the files directory, files directory may not contain the home |
@@ -885,8 +931,8 @@ limits of each control and the reporting process are in [SECURITY.md](../SECURIT
 Personal mode changes the stake: it holds a copy of your logged-in session (Messenger cookies, WhatsApp
 linked-device keys), it speaks protocols the platforms do not offer to third parties, and what it sends
 carries your name. Its defences are a local-only socket, private files, an audit log that stores hashes
-and never text, and a read-only mode that works in the tool router and again in the daemon. Nothing
-paces sends. The limit that no control removes is the platforms' own: an unofficial client can get the
+and never text, a read-only mode that works in the tool router and again in the daemon, and a token-bucket
+pacing of writes in the daemon. The personal tools are not served over HTTP unless you opt in. The limit that no control removes is the platforms' own: an unofficial client can get the
 account restricted or banned. See [SECURITY.md](../SECURITY.md#personal-mode).
 
 ## Testing and the local gate

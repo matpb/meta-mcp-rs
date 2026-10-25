@@ -15,8 +15,40 @@ download, file and send paths, and the setup wizard as built.
 - Personal mode keeps a copy of your logged-in sessions, so its files live in `META_MCP_HOME/personal/` (folders
   0700, files 0600), its socket is 0600 (a folder that the daemon or a unit from `personal install` creates for it is 0700) and
   serves only the daemon's own uid, its sidecars start with an empty environment (only `HOME`), each holds a lock on its
-  data folder, their logs pass an allowlist scrubber, and its send audit log holds hashes and ids, never the text. `meta-mcp http` serves the personal tools too. `META_MCP_FILES_DIR`
+  data folder, their logs pass an allowlist scrubber, and its send audit log holds hashes and ids, never the text. `META_MCP_FILES_DIR`
   may not contain `META_MCP_HOME`; keep it outside the home so that the session files stay out of the file tools' reach.
+- `meta-mcp http` does not register the personal tools unless `META_MCP_PERSONAL_HTTP=1` is set (it then logs a warning
+  that every API key holder can read and send as you). `inbox_list` and `inbox_wait` leave the `messenger_personal` and
+  `whatsapp_personal` rows out unless `platform` names one or the new `include_personal` flag is true.
+- `messenger_personal_send_media` and `whatsapp_personal_send_media` verify the open file handle, not the name: after the jail
+  check the daemon opens the file with `O_NOFOLLOW` and `O_NONBLOCK`, requires a regular file, and requires the real path
+  of the handle to lie inside the files directory and outside `inbound/` unless `allow_inbound` is true, then copies from
+  that handle. A symlink swapped in after the check can no longer send another file.
+- `meta-mcp personal logout` always empties the platform's `data/` folder after stopping the sidecar, whether or not the
+  remote logout worked, and reports `state_cleared`, `data_wiped` and `remote_error`; the daemon starts the sidecar for
+  the logout when a session is stored and none runs, and ingests no event after a logout. The command prints what
+  happened and exits 1 on any failure.
+- The daemon paces writes per platform with a token bucket (new messages one per 2 s with a burst of 3; reactions, read
+  marks and typing one per second with a burst of 5) and refuses an excess with `rate_limited` and a `retry_after_ms`
+  value, auditing the refusal. `META_MCP_PERSONAL_SEND_INTERVAL_MS` and `META_MCP_PERSONAL_SEND_BURST` tune the first bucket.
+- A connection to the daemon is bounded: 64 outstanding replies (`too_many_requests`), and the event ring is capped at
+  16 MiB, a subscriber that falls behind getting one `lagged` error event and no more. During shutdown the write ops
+  answer `shutting_down`.
+- The tool and command client checks that the daemon behind the socket runs as the same user and sends nothing otherwise
+  (`untrusted_daemon`). The daemon's own uid comes from a socket pair peer credential, not from `/proc`, and file
+  descriptor 3 is checked to be a socket before systemd socket activation adopts it.
+- The unit written by `meta-mcp personal install` is sandboxed (`ProtectSystem=strict`, `ProtectHome=read-only`,
+  `PrivateTmp=yes`, `LimitCORE=0`, `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`, `RestrictNamespaces=yes`,
+  `SystemCallArchitectures=native`, on top of `NoNewPrivileges=yes` and `UMask=0077`) and writes only where
+  `ReadWritePaths=` says: the home, the inbox folder and the files directory. `install` pins `META_MCP_INBOX_DB` in the
+  unit, creates the home and the inbox folder, and refuses a configured files directory that does not exist.
+- Validation of personal writes: tabs are allowed in text and captions; bidirectional overrides and isolates and tag
+  characters are refused; an `emoji` must be built from emoji characters only (letters, bare digits, other scripts and
+  spaces are refused).
+- A Messenger checkpoint, challenge, consent or suspension keeps `state.json` and shows the reason and the page to open
+  in `status`; the state is deleted for `device_removed`, `token_invalidated`, `banned` and a logout by the user.
+- `meta-mcp personal login messenger` no longer has `--cookies-json`: cookies in an argument showed in the process list. Use
+  `--cookies-file` or the hidden prompt.
 - Downloads never fetch the Graph API host. The host of `META_GRAPH_BASE_URL` is refused on every redirect
   hop, whether or not a token would be attached and even when `META_MCP_DOWNLOAD_HOSTS` names it.
   `*.facebook.com` and `*.messenger.com` leave the default download allowlist, which is now
@@ -48,9 +80,23 @@ download, file and send paths, and the setup wizard as built.
 - `inbox_list` and `inbox_wait` accept `messenger_personal` and `whatsapp_personal` as `platform`, and the
   unknown-platform error names them. Read-only mode now removes 21 tools instead of 11 (the 10 personal write tools
   join the 11 business ones) and keeps 17.
-- The personal module needs Linux: the daemon reads its own user id from `/proc`, and it and the CLI use Unix-only APIs
-  (`std::os::unix`) without a platform guard, so the crate is not expected to build on Windows (not tried; the older modules keep fallbacks for non-Unix systems,
-  this one does not).
+- Personal mode is compiled on Unix only (`#[cfg(unix)]`). On another system the crate is meant to build without it
+  (not tried on Windows): the server has the 20 business tools and `meta-mcp personal` prints `personal mode needs a
+  Unix system`. Only Linux was exercised. The daemon reads its own user id from a socket pair, no longer from `/proc`.
+- A write tool (`*_personal_send_text`, `*_personal_send_media`, `*_personal_react`) that loses the connection to the daemon
+  or times out after the request left answers `send_unknown: the message may have been sent: read the thread before
+  sending again`.
+- The daemon's reconnect loop follows the sidecar's action hint: `none` and `relogin` stop it until `restart` or a login
+  (`status` shows `reconnect: stopped`), `wait` makes the next delay at least 300 seconds. The backoff starts over only
+  after a connection stayed up for 120 seconds. A sidecar that misses two pings in a row (every 30 seconds) is killed and
+  restarted.
+- `personal_status` reports `reason_url` and `reconnect_halted`. After a `logout` the platform shows `stopped` with the
+  reason `logout` and no sidecar, and a login needs no `restart`.
+- `meta-mcp personal login whatsapp` says `no QR code was shown: the sidecar could not reach WhatsApp` when the connection
+  never came up, instead of `The QR codes expired`.
+- The server instructions, the crate description and the command line help now mention both modes. The `inbox_list` and
+  `inbox_wait` descriptions say that personal rows are left out unless asked for.
+- New dependency: `libc` 0.2 (open flags and error numbers; no `unsafe` was added).
 - Documentation: the README scope box and FAQ and the guide's Part 0.1 no longer say that meta-mcp cannot reach
   personal accounts. They separate business mode (the official Graph API: Page inboxes and business numbers only)
   from personal mode (unofficial clients, outside the platforms' terms).
@@ -99,8 +145,7 @@ download, file and send paths, and the setup wizard as built.
   the passkey step, and no new chats (each sidecar sends only into a conversation it already holds). Both speak version 1 of one JSON-lines sidecar protocol. Licences: mautrix-meta is
   AGPL-3.0 (so the combined Messenger sidecar binary is AGPL-3.0), `whatsmeow` is MPL-2.0, and both sidecars link
   `go.mau.fi/libsignal` (GPL-3.0).
-- The `meta-mcp personal` command group: `daemon [--socket PATH]`, `login messenger [--cookies-file PATH |
-  --cookies-json JSON]`, `login whatsapp [--pair-code PHONE] [--full-history] [--device-name NAME]`, `status [--json]`,
+- The `meta-mcp personal` command group: `daemon [--socket PATH]`, `login messenger [--cookies-file PATH]`, `login whatsapp [--pair-code PHONE] [--full-history] [--device-name NAME]`, `status [--json]`,
   `logout PLATFORM`, `restart PLATFORM`, `install [--dry-run]` and `uninstall [--dry-run]`. `install` writes the
   systemd user units `meta-mcp-personal.socket` and `meta-mcp-personal.service`.
 - Eighteen MCP tools, 38 in all: `personal_status`, `personal_wait_for_message`, and for each platform the list tool
@@ -114,7 +159,10 @@ download, file and send paths, and the setup wizard as built.
 - Inbox platforms `messenger_personal` and `whatsapp_personal`. Message and echo IDs are
   `<platform>:<thread_id>:<message_id>`; reactions and receipts have their own shapes.
 - Session state and sidecar data under `META_MCP_HOME/personal/` (`<platform>/state.json` 0600, `<platform>/data/` 0700).
-- Environment variables `META_MCP_PERSONAL_SOCKET`, `META_MCP_SIDECAR_DIR` and `META_MCP_PERSONAL_BACKOFF_MS`.
+- Environment variables `META_MCP_PERSONAL_SOCKET`, `META_MCP_SIDECAR_DIR`, `META_MCP_PERSONAL_BACKOFF_MS`,
+  `META_MCP_PERSONAL_HTTP`, `META_MCP_PERSONAL_SEND_INTERVAL_MS`, `META_MCP_PERSONAL_SEND_BURST`,
+  `META_MCP_PERSONAL_STABLE_MS`, `META_MCP_PERSONAL_PING_MS` and `META_MCP_PERSONAL_PING_TIMEOUT_MS`.
+- `include_personal` on `inbox_list` and `inbox_wait`.
 - `scripts/build-all.sh`: builds `meta-mcp` and both sidecars into `dist/`.
 - Documentation: the guide's Part 10 (install, Messenger and WhatsApp login, use, operations, troubleshooting), the personal
   tools in `docs/TOOLS.md`, the personal mode and its sequence diagrams in `docs/ARCHITECTURE.md`, a Personal mode section

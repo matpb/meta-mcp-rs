@@ -65,7 +65,7 @@ Instagram scopes with `--instagram`.
 **personal mode** that reaches your own Messenger and WhatsApp accounts through unofficial clients (a
 re-implemented Messenger web client and a re-implemented WhatsApp linked device). It needs no Meta developer
 account, app or token, it is outside Facebook's and WhatsApp's terms for personal accounts, and it can get the
-account restricted or banned. It is Part 10, and 10.0 comes first. The Meta account, app, token and webhook steps of
+account restricted or banned. It is compiled on Unix systems only. It is Part 10, and 10.0 comes first. The Meta account, app, token and webhook steps of
 Parts 1 to 9 do not apply to it.
 
 ### 0.2 Three personas
@@ -2090,9 +2090,13 @@ precaution whose effect is unproven. None of it brings the risk to zero, and no 
 - **A human can approve each send, through your MCP client.** The personal send tools are marked as not read-only
   and their descriptions say they reach real people as you and to confirm intent first. meta-mcp has no approval
   step of its own: whether your client asks you depends on its settings.
-- **Nothing paces sends.** The daemon and the sidecars do not limit the rate of sends, reactions, read marks or typing.
-  The figures that circulate (at least 500 ms between messages, about 20 per minute per account) are folklore:
-  neither is a threshold WhatsApp published.
+- **The daemon paces writes.** Per platform, a token bucket lets a new message (text or media) through once every 2
+  seconds with a burst of 3, and a reaction, read mark or typing indicator once a second with a burst of 5. A call
+  without a token is refused with `rate_limited` and a `retry_after_ms` value, and nothing is sent
+  (`META_MCP_PERSONAL_SEND_INTERVAL_MS` and `META_MCP_PERSONAL_SEND_BURST` change the first bucket). The sidecars limit
+  nothing themselves. The limiter is a courtesy, not a protection: the figures that circulate (at least 500 ms between
+  messages, about 20 per minute per account) are folklore, neither is a threshold WhatsApp published, and no source
+  shows what rate the platforms tolerate.
 - **A fatal signal stops sending** until you act (Part 10.5).
 - **Read-only mode** (Part 10.4) removes every tool that sends.
 
@@ -2110,10 +2114,11 @@ lose. A separate number limits the damage to that number, but it is then not you
 4. Plan to open WhatsApp on your phone at least every 14 days (10.3).
 5. Treat the files meta-mcp keeps like passwords (10.5 and [SECURITY.md](../SECURITY.md#session-files)).
 
-**Platform and licence.** Personal mode needs Linux. The daemon speaks over a Unix socket and reads its own user id
-from `/proc`, and `personal install` writes systemd user units. Only Linux was exercised. The personal module uses
-Unix-only APIs without a platform guard, so the crate is not expected to build on Windows (not tried; the older modules keep fallbacks for non-Unix systems,
-this one does not). The
+**Platform and licence.** Personal mode needs a Unix system. The daemon speaks over a Unix socket and learns its own
+user id from the peer credential of a socket pair, and `personal install` writes systemd user units (socket
+activation is Linux only). Only Linux was exercised. The whole module is compiled only on Unix (`#[cfg(unix)]`): on
+another system the crate is meant to build without it (not tried on Windows), the server then has the 20 business
+tools, and `meta-mcp personal` prints `personal mode needs a Unix system` and exits 2. The
 Messenger sidecar links mautrix-meta, which is AGPL-3.0, so the sidecar documentation states that the combined
 `meta-messenger-sidecar` binary is AGPL-3.0 and that distributing it carries the AGPL source obligations. Both
 sidecars also link `go.mau.fi/libsignal` (the Messenger sidecar through mautrix-meta and `whatsmeow`), which is
@@ -2160,7 +2165,10 @@ The `meta-mcp` binary stays MIT. Not legal advice.
    meta-mcp personal status
    ```
 
-   `install` refuses to run (and says which file it could not find) when a sidecar binary cannot be located. It
+   `install` refuses to run (and says which file it could not find) when a sidecar binary cannot be located, and when
+   `META_MCP_FILES_DIR` is set in your shell to a folder that does not exist (create it first: the service may only
+   write where a folder already is). It creates the meta-mcp home and the inbox folder with mode 0700, because the
+   sandboxed service can only write to folders that exist when it starts. It
    writes `meta-mcp-personal.socket` and `meta-mcp-personal.service` into `$XDG_CONFIG_HOME/systemd/user`
    (else `~/.config/systemd/user`), runs `systemctl --user daemon-reload` and
    `systemctl --user enable --now meta-mcp-personal.socket meta-mcp-personal.service`, and ends with
@@ -2194,12 +2202,21 @@ The `meta-mcp` binary stays MIT. Not legal advice.
    Type=simple
    ExecStart=/home/USER/.local/bin/meta-mcp personal daemon
    Environment="META_MCP_HOME=/home/USER/.config/meta-mcp"
+   Environment="META_MCP_INBOX_DB=/home/USER/.local/share/meta-mcp/inbox.db"
    Restart=on-failure
    RestartSec=5
    RestartPreventExitStatus=2
    UMask=0077
-   NoNewPrivileges=yes
    TimeoutStopSec=20
+   NoNewPrivileges=yes
+   ProtectSystem=strict
+   ProtectHome=read-only
+   PrivateTmp=yes
+   LimitCORE=0
+   RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+   RestrictNamespaces=yes
+   SystemCallArchitectures=native
+   ReadWritePaths=/home/USER/.config/meta-mcp /home/USER/.local/share/meta-mcp
 
    [Install]
    WantedBy=default.target
@@ -2208,11 +2225,21 @@ The `meta-mcp` binary stays MIT. Not legal advice.
    - `ExecStart` is the canonical path of the binary that ran `install`. If you move the binary, run `install`
      again.
    - **The service does not inherit your shell.** `install` copies `META_MCP_HOME` (always) and, when your shell
-     sets them, `META_MCP_INBOX_DB`, `META_MCP_FILES_DIR`, `META_MCP_SIDECAR_DIR` (paths are made absolute),
-     `META_MCP_READ_ONLY` and `META_MCP_LOG` into `Environment=` lines. Set them **before** you run `install`, or
+     sets them, `META_MCP_FILES_DIR`, `META_MCP_SIDECAR_DIR` (paths are made absolute), `META_MCP_READ_ONLY` and
+     `META_MCP_LOG` into `Environment=` lines. It always pins `META_MCP_INBOX_DB`: your value, or the default path
+     (`inbox.db` in the platform data folder) when your shell sets none, because that default lies outside the home
+     and the sandbox has to name it. Set the variables **before** you run `install`, or
      edit the unit and run `systemctl --user daemon-reload` and `systemctl --user restart
-     meta-mcp-personal.service`. Nothing else is copied (`META_MCP_MAX_FILE_BYTES` and `META_MCP_PERSONAL_BACKOFF_MS` are
-     not, so set those in the unit yourself): no Meta token is needed.
+     meta-mcp-personal.service`. Nothing else is copied (`META_MCP_MAX_FILE_BYTES`, `META_MCP_PERSONAL_BACKOFF_MS` and
+     the other `META_MCP_PERSONAL_*` tuning variables, such as the two pacing ones in 10.4, are not, so set those in the
+     unit yourself): no Meta token is needed.
+   - **The unit is sandboxed.** Besides `UMask=0077` and `NoNewPrivileges=yes` it sets `ProtectSystem=strict`,
+     `ProtectHome=read-only`, `PrivateTmp=yes`, `LimitCORE=0`, `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`,
+     `RestrictNamespaces=yes` and `SystemCallArchitectures=native`. With `ProtectSystem=strict` the whole file
+     system is read-only to the service except the folders in `ReadWritePaths=`: the meta-mcp home, the folder of the
+     inbox database and the files directory (when set). If you edit the unit to point at another home, inbox or files
+     folder, edit `ReadWritePaths=` to match, or the daemon cannot write there. The sandbox limits what a
+     compromised daemon or sidecar can change on disk; it does not make anything unreadable.
    - A systemd user service starts when you log in and stops with your last session. To keep the daemon up
      without a login, enable lingering: `loginctl enable-linger`.
    - The daemon logs to stderr, so under systemd it is in the journal:
@@ -2252,10 +2279,14 @@ The `meta-mcp` binary stays MIT. Not legal advice.
      `META_MCP_PERSONAL_SOCKET`.
    - **A client started without `XDG_RUNTIME_DIR`** falls back to `META_MCP_HOME/personal/personal.sock`, which is
      not where systemd put the socket. Set `META_MCP_PERSONAL_SOCKET` in that client's environment.
-   - **`meta-mcp http` serves the personal tools too.** It registers the same tools as the stdio server, so when a
-     daemon runs under the same user and the HTTP server finds its socket, every holder of one of the server's API keys
-     can read your chats and send as you. Use stdio for the assistant that should have personal mode, or start the HTTP
-     server read-only and give its keys only to people you would give the session files.
+   - **`meta-mcp http` leaves the personal tools out by default.** They are served over stdio. If you set
+     `META_MCP_PERSONAL_HTTP=1` for the HTTP server, it registers them too (and logs a warning), so with a daemon under
+     the same user whose socket the HTTP server finds, every holder of one of the server's API keys can read your chats
+     and send as you. Use stdio for the assistant that should have personal mode, or, if you turn the variable on,
+     start the HTTP server read-only and give its keys only to people you would give the session files.
+   - **The client checks the daemon.** Before a tool or a `meta-mcp personal` command sends anything, it compares the
+     uid of the process behind the socket with its own and refuses a socket served by another user
+     (`untrusted_daemon`).
 
 8. **Connect your assistant.** Personal mode is part of the normal MCP server, so the command is the one from Part 4.8:
 
@@ -2265,7 +2296,8 @@ The `meta-mcp` binary stays MIT. Not legal advice.
    ```
 
    Without `meta-mcp setup` the business tools simply report that no Page or number is configured; the 18 personal
-   tools work. Their tool descriptions are in [TOOLS.md](TOOLS.md#personal-tools).
+   tools work. Their tool descriptions are in [TOOLS.md](TOOLS.md#personal-tools). (An HTTP server lists them only
+   with `META_MCP_PERSONAL_HTTP=1`.)
 
 9. **Update or remove.** After a new build, replace the three files; `meta-mcp personal restart messenger` or `whatsapp`
    starts a fresh sidecar from the file on disk (for a platform that has a stored session), and
@@ -2311,8 +2343,8 @@ applied.
 
    Without a flag the command prints the sidecar's instructions and asks you to paste the cURL command or the
    JSON, with nothing echoed ("a terminal cuts a pasted line at 4096 characters, so for a longer paste use
-   `--cookies-file`"). `--cookies-json JSON` takes the same input as an argument, which is visible in the process
-   list and in your shell history: prefer the file or the prompt. The two flags exclude each other.
+   `--cookies-file`"). There is no flag that takes the cookies as an argument (an argument shows in the process list
+   and in your shell history): use the file or the prompt.
 
    When you pass the cookies with a flag, the command checks them before it contacts the daemon:
    `error: missing cookies: c_user, xs, datr` (exit status 2) names what is missing and never prints a value.
@@ -2351,10 +2383,14 @@ second, WhatsApp-protocol client inside it). Four things to know:
 - Encrypted chats take images only when sending, and no captions (Part 10.4).
 
 **Checkpoints and re-login.** Meta can interrupt a session: a redirect to a checkpoint, a challenge, a consent screen
-or a suspended-account page. The sidecar fails closed: it stops, reports the reason (`checkpoint_required`,
-`challenge_required`, `consent_required`, `account_suspended`), and the daemon forgets the stored session.
-Clear the problem on facebook.com yourself (Meta may ask for a captcha, a phone number or a password reset, as
-quoted in 10.0), then log in again with fresh cookies. The same applies when the cookies simply die
+or a suspended-account page. The sidecar fails closed: it stops and reports the reason (`checkpoint_required`,
+`challenge_required`, `consent_required`, `account_suspended`). For these four the stored session file
+(`state.json`) is **kept**: `meta-mcp personal status` shows the reason and, when Meta named one, the page to open
+("resolve it in a browser, then run meta-mcp personal restart messenger" followed by the link). Clear the problem
+on facebook.com yourself (Meta may ask for a captcha, a phone number or a password reset, as quoted in 10.0), then
+run `meta-mcp personal restart messenger`, which starts a fresh sidecar on the stored cookies. If Meta no longer
+accepts them, the platform shows as logged out and you log in again with fresh cookies. The stored session is
+dropped instead, and fresh cookies are the way back, when the cookies simply die
 (`token_invalidated`, `user_id_is_zero` or `dgw_unauthorized`), when the cookies belong to another account
 (`account_mismatch`), or when Meta reports the account itself as disabled (`account_disabled`, Lightspeed error 1357053:
 fresh cookies will not help, the account does). Cookie lifetime is undocumented. User reports in the mautrix-meta tracker
@@ -2392,8 +2428,9 @@ meta-mcp personal login whatsapp
 3. The command ends with `Logged in to WhatsApp as Sam Example (15555550100@s.whatsapp.net)`. The sidecar waits for
    the connection and for the pre-key upload before it says so, because stopping it earlier can lose the login.
 4. If nobody scanned in time, the codes run out and the command stops with `The QR codes expired: run the command
-   again.` The same message appeared when the connection to WhatsApp never came up (an end-to-end check run without a
-   network): run the login again once you have one. The command also gives up after 5 minutes. Ctrl-C cancels it.
+   again.` If the connection to WhatsApp never came up, so that no code was ever drawn, it says instead `no QR code was
+   shown: the sidecar could not reach WhatsApp; check the network and run the command again`. Run the login again
+   once you have a network. The command also gives up after 5 minutes. Ctrl-C cancels it.
 
 **By code**, when you cannot scan a QR code on screen (the phone and the machine are apart, for example):
 
@@ -2460,8 +2497,9 @@ phone; the sidecar takes one slot. A phone left unused for more than 14 days log
 documentation expects that to arrive as `device_removed`, but which cause maps to which code is not documented.
 
 **Do not call `logout` casually.** When the sidecar is running and connected it removes the linked device on
-WhatsApp's side, and it wipes the sidecar's message store and the leftovers in `session.db`; linking again needs the phone, and WhatsApp may refuse a
-re-link right after an unlink for a while (reported, **UNVERIFIED**).
+WhatsApp's side, and `logout` always wipes the platform's whole data folder (the message store, `session.db`, the
+locks); linking again needs the phone, and WhatsApp may refuse a
+re-link right after an unlink for a while (reported, **UNVERIFIED**). 10.5 says what `logout` does when the sidecar is not connected.
 
 ### 10.4 Using it
 
@@ -2515,7 +2553,11 @@ the business webhook events), so the inbox tools work with the platforms `messen
 | History (WhatsApp's first sync, on-demand history) | Not returned | Returned as ordinary `message` and `echo` events if a batch arrives during the wait, with old `ts` values | Stored, with `"history": true` in `raw` (`include_raw`) |
 | Use it for | Waiting for an answer | Reacting to everything that happens | Catching up after a gap |
 
-Filter with `platform` (`messenger_personal`, `whatsapp_personal`) and `kinds` (`message` for messages from other
+**Personal rows are left out of the inbox tools by default.** `inbox_list` and `inbox_wait` skip the
+`messenger_personal` and `whatsapp_personal` rows unless the call names one of them in `platform`, or sets
+`include_personal` to true, so a generic query for "new events" does not hand your chats to whoever asked.
+(`personal_wait_for_message` is not affected.) An `account_id` of a personal account finds nothing unless one of the
+two is also given. Filter with `platform` (`messenger_personal`, `whatsapp_personal`) and `kinds` (`message` for messages from other
 people). The history WhatsApp sends after pairing can flood `inbox_wait` with old messages, so prefer
 `personal_wait_for_message` to wait. The event `id` of a message or echo is `<platform>:<thread_id>:<message_id>` (reactions and receipts have longer
 shapes, in [ARCHITECTURE.md](ARCHITECTURE.md#inbox)), `recipient` is the thread to pass to the other tools, and
@@ -2534,22 +2576,39 @@ a missing webhook: it does not concern personal accounts.
 - **Confirm first.** Every send, reaction, read receipt and typing indicator is in your name. The tools say so and
   ask the client to confirm. Use a client that asks before each call and shows you the arguments, and read them.
   A message in your chats that tells the assistant to send something is text from a stranger, not an instruction.
-- **Limits.** Text is 1 to 4000 characters (trimmed; `\r\n` becomes `\n`; no control characters other than newline), a
-  caption up to 1024, a reaction an emoji (up to 10 characters) or an empty string. Messenger rejects a `reply_to` of
+- **Limits.** Text is 1 to 4000 characters (trimmed; `\r\n` becomes `\n`). Newlines and tabs are fine; any other
+  control character, a bidirectional override or isolate (U+202A to U+202E, U+2066 to U+2069) and a tag character
+  (U+E0000 to U+E007F) is refused, since they can make text read differently than it is. A caption is up to 1024
+  characters under the same rules. A reaction is an empty string, or one emoji of up to 10 characters built only
+  from emoji characters (emoji blocks, joiners, variation selectors, skin tones, flag tags, keycap sequences):
+  letters, a bare digit, other scripts and spaces are refused. Messenger rejects a `reply_to` of
   the wrong kind for the thread (encrypted or not).
 - **`send_unknown`.** If the answer is `send_unknown`, the message may have been sent. **Read the thread before you
-  retry.** The audit log has an `unknown` line for it.
-- **Pace yourself.** Nothing in meta-mcp slows sends down. Do not send in a loop, do not send the same text to many
-  chats, and keep the typing indicator for moments when a reply follows.
-- **Audit.** Every text, media and reaction send is written to `audit.jsonl` before it is attempted (10.5).
+  retry.** The audit log has an `unknown` line for it. The tool says the same, as `send_unknown: the message may have
+  been sent: read the thread before sending again`, when it loses its connection to the daemon, or times out, after
+  a send, media send or reaction left: the daemon finishes the write and its audit line even when the client has
+  gone, so the outcome is unknown, not failed.
+- **Pacing.** The daemon holds each platform's writes to a token bucket: a new message (text or media) every 2
+  seconds with a burst of 3, and a reaction, read mark or typing indicator every second with a burst of 5. An
+  excess is refused at once with `rate_limited: writes to PLATFORM are paced: retry_after_ms=N`: nothing was sent, so
+  wait N milliseconds and call again. `META_MCP_PERSONAL_SEND_INTERVAL_MS` (milliseconds per token, default 2000) and
+  `META_MCP_PERSONAL_SEND_BURST` (default 3) tune the first bucket in the daemon's environment (`install` does not copy
+  them: put them in the unit). The limiter is a courtesy, not a promise about what the platforms tolerate. Do not send
+  in a loop, do not send the same text to many chats, and keep the typing indicator for moments when a reply follows.
+- **Shutdown.** While the daemon stops, the write tools answer `shutting_down`; writes already running finish.
+- **Audit.** Every text, media and reaction send is written to `audit.jsonl` before it is attempted (10.5). A refusal
+  (including `rate_limited`) is logged too.
 
 **Attachments and inline pictures.** The daemon downloads by message and attachment id, never by URL, into
 `inbound/messenger_personal/` or `inbound/whatsapp_personal/` of `META_MCP_FILES_DIR` (the daemon's). It needs that
 variable: without it the call fails with `no_files_dir`. With `inline: true` a small, well-formed PNG, JPEG, GIF or
 WEBP picture of at most 2 MiB also comes back to the model, read by the assistant's own `meta-mcp`, which therefore
 needs the same `META_MCP_FILES_DIR`. A file under `inbound/` came from another person, so sending it on needs
-`allow_inbound: true`, as in Part 5.1. To send a file, put it in the files directory and pass its path; the daemon
-copies it into a private outbox for the send and removes the copy afterwards.
+`allow_inbound: true`, as in Part 5.1. To send a file, put it in the files directory and pass its path. The daemon
+opens the file without following a final symlink, checks the open handle (a regular file whose real path is still
+inside the files directory and, without `allow_inbound`, outside `inbound/`; otherwise `file_refused`), and copies
+from that handle into a private outbox, so replacing the path with a symlink after the check cannot send a
+different file. It removes the copy after the send.
 
 **Read-only mode.** `META_MCP_READ_ONLY=true` removes the 10 personal write tools from the MCP server (Part 8.3). The
 daemon checks the same variable for itself and refuses `send_text`, `send_media`, `send_reaction`, `mark_read` and
@@ -2603,13 +2662,15 @@ WhatsApp
 | `sending` | `ok`, or `BLOCKED` with the reason (below) |
 | `last event` | When the sidecar last said anything |
 | `sidecar` | Running, with the sidecar version and the library it was built on, or `not running` |
-| `reconnect` | Seconds until the daemon tries to start a stopped sidecar again |
-| `last error` | The last failure as a short code (`sidecar_spawn_failed`, `sidecar_not_ready`, `connect_failed`, `sidecar_exited`, ...) |
+| `resolve it in a browser, ...` | Only when the platform named a page to open for a checkpoint, challenge, consent or suspension (`reason_url` in `--json`): open the link, then run the `restart` it names |
+| `reconnect` | `in Ns`: seconds until the daemon tries to start a stopped sidecar again. `stopped (the account needs attention)`: the sidecar reported a fatal signal whose action is `none` or `relogin`, and the daemon waits for `restart` or a login (`reconnect_halted` in `--json`) |
+| `last error` | The last failure as a short code (`sidecar_spawn_failed`, `sidecar_not_ready`, `connect_failed`, `sidecar_exited`, `sidecar_unresponsive`, `state_delete_failed`, `data_wipe_failed`, ...) |
 
 Before the first login, and after a daemon restart without a session, a platform shows `connection: stopped` and
 `sidecar: not running`: its sidecar starts at the first login, and again at daemon start once a session exists. After
-a `logout` or a `logged_out` event the sidecar keeps running: the platform shows `connection: disconnected` with the
-reason (for example `logout`) and `sidecar: running`. In the text form a code of 20 or more characters, such as
+a `logout` the sidecar is stopped too: the platform shows `connection: stopped (logout)` and `sidecar: not running`, and
+a login starts a fresh one. After a `logged_out` event from the service the sidecar keeps running: the platform
+shows `connection: disconnected` with the service's reason and `sidecar: running`. In the text form a code of 20 or more characters, such as
 `sidecar_spawn_failed`, is printed as `[redacted]`, because the command scrubs long token-like runs; `--json` has
 the real value.
 
@@ -2628,11 +2689,12 @@ daemon restarts it, and the daemon stops reconnecting. These are the WhatsApp re
 Then:
 
 1. Fix the cause. **`meta-mcp personal restart whatsapp` clears the block but not the cause**, so do not restart in
-   a loop. A daemon restart clears the block too. On WhatsApp a `logout` clears only the daemon's flag: the
-   sidecar keeps refusing `connect` and sends, so run `restart` before you log in again.
+   a loop. A daemon restart clears the block too, and so does a `logout`, which stops the sidecar that held the
+   block (the next login starts a fresh one), but it does not clear the cause either.
 2. `restart` stops the sidecar, clears the block and the reconnect backoff, and starts a fresh sidecar with the stored
    session. For `device_removed` and `banned` the session was already deleted, so after `restart` you log in again.
-3. `meta-mcp personal login ...` is refused while sending is blocked (`sending_blocked`), so `restart` first.
+3. `meta-mcp personal login ...` is refused while sending is blocked (`sending_blocked`), so `restart` first (or
+   `logout`, which also clears the block, if you mean to start over).
 
 The Messenger sidecar raises four of the same reasons from its encrypted-chat client: `temporary_ban`,
 `stream_replaced`, `client_outdated` and `device_removed` (a removed encrypted-chat device; unlike WhatsApp, the
@@ -2641,35 +2703,60 @@ next restart: reads and downloads of unencrypted attachments keep working, while
 encrypted thread answers `not_connected`. The steps above apply, except that the Messenger session (cookies, `state.json`) was not deleted: after `restart` you
 do not need to log in again.
 
-Other Messenger signals: a rate limit is a `fatal` connection with a wait, which the daemon retries with its backoff;
-`repeated_failures` (six page loads in a row failed without a verdict, which a network outage can also cause; action
-`relogin`) is not a block either: the daemon restarts the sidecar after its backoff, and if it keeps failing while
-your network is fine, the session may be dead, so log in again;
-and a checkpoint, challenge, consent or suspension is a logout (10.2).
+Other fatal signals follow the action the sidecar names, and are not blocks. A rate limit is a `fatal` connection
+with the action `wait`: the daemon retries with its backoff, and the delay is at least 300 seconds. `repeated_failures`
+(Messenger: six page loads in a row failed without a verdict, which a network outage can also cause) carries the action
+`relogin`, as does any fatal signal with `none`: the daemon then stops reconnecting, `status` shows `reconnect: stopped
+(the account needs attention)`, and `meta-mcp personal restart` (or a new login) resumes. If it keeps failing while
+your network is fine, the session may be dead, so log in again. A checkpoint, challenge, consent or suspension is a
+logout that keeps the session file (10.2).
 
 **Reconnects.** If a sidecar exits on its own, the daemon restarts it after 10, 30, 60 and 300 seconds, the last delay
-repeating, and resets the delay once it is connected. `status` shows `reconnect: in Ns`. A Messenger sidecar can also
+repeating. The delays start over only after a connection has stayed up for 120 seconds, so a connection that drops
+again at once keeps climbing the list (`META_MCP_PERSONAL_STABLE_MS` changes the 120 seconds). `status` shows
+`reconnect: in Ns`. The sidecar's own action hints are honoured: `none` and `relogin` stop the reconnecting until you
+`restart` or log in again, and `wait` makes the next delay at least 300 seconds. The daemon also pings each running
+sidecar every 30 seconds; two missed answers in a row (10 seconds each) kill it, which `status` shows as
+`sidecar_unresponsive`, and the normal restart follows. A Messenger sidecar can also
 end with status 1 or 2 when its library fails hard (it exits on a malformed protocol step, and a panic in a library
 goroutine ends the process); the daemon treats that like any other exit.
 
-**Logout.** `meta-mcp personal logout messenger` or `whatsapp` asks the sidecar (if one is running) to log out, then
-**tries** to delete the stored state and empties the daemon's memory of the account, and prints `Logged out of
-Messenger: the stored session is cleared.` The command prints that line even when the delete failed (the failure shows
-in `meta-mcp personal status` as `last error: state_delete_failed`). If the daemon's request to the sidecar failed, it
-adds a line telling you to remove the device or session by hand in the account's linked devices or active sessions.
+**Logout.** `meta-mcp personal logout messenger` or `whatsapp` does four things, in this order. It asks the sidecar to
+log out; when none is running and a session is stored, the daemon first starts one for the purpose, without
+connecting it. It then stops that sidecar. It deletes the stored `state.json`. And it **always empties the
+platform's whole `data/` folder** (databases, thread cache, locks, outbox; the folder stays), whether or not the
+remote logout worked, so a failed logout never leaves the chat history and keys behind. After it, the daemon ingests
+no further event from that sidecar, the sending block is cleared, and a later login starts a fresh sidecar with no
+state. The command prints exactly what happened and exits 1 when any part failed:
 
-- **WhatsApp:** when the sidecar is running and connected, the device is removed on WhatsApp's side, so it is
-  unlinked on your phone, and the sidecar wipes its message store and the leftovers in `session.db` (a failed wipe is
-  reported as `io`). If the sidecar is offline, or its unlink call
-  fails, only the local copy is deleted and **the device stays linked on the phone, with no warning**: check the
-  Linked devices list. If no sidecar is running, the daemon can only delete its own state file and leaves the data
-  folder as it is. Linking again needs the phone, and WhatsApp may refuse a re-link right after an unlink for a
-  while (reported, **UNVERIFIED**).
-- **Messenger:** a running sidecar deletes its cookies, thread map and encrypted-chat device store, also when its
-  session had already ended; a failed deletion is reported as `io` (the command prints it in its "could not be told"
-  line) and the files stay. If no sidecar is running, only `state.json` is deleted and `data/e2ee.db` and
-  `data/threads.json` stay. The sidecar
-  documentation lists no call to Facebook: check your account's active sessions if you want that session gone.
+```
+Logged out of WhatsApp.
+  stored session: cleared
+  local data (databases, thread cache): wiped
+  service: the device was unlinked
+```
+
+When something failed, the first line reads `Logout of WhatsApp is incomplete:` and the failing line says what to do
+by hand: `NOT cleared (delete personal/<platform>/state.json under the meta-mcp home by hand)`, `NOT fully wiped
+(empty personal/<platform>/data under the meta-mcp home by hand)`, or, for the remote step, `could not be told to
+forget this device (<code>: <message>): remove it from the account's linked devices or active sessions by hand`.
+(`--json` is not offered for logout; the daemon's reply has `state_cleared`, `data_wiped` and `remote_error`.) The
+`service:` line only reflects whether the sidecar's logout call failed. It does not prove the platform dropped the
+session, so read the platform notes below.
+
+- **WhatsApp:** only a sidecar that is running **and connected** removes the device on WhatsApp's side, which unlinks
+  it on your phone. A sidecar the daemon starts just for the logout is not connected, and a sidecar that is running but
+  reconnecting is not either: in those cases the device is deleted from the local store only, the sidecar still
+  answers success, so the `service:` line reads that the device was unlinked, and **the device stays linked on the
+  phone, with no warning**. Check the Linked devices list and remove it there. If the unlink call itself fails, you get
+  the `remote_error` line and the same advice. Linking again needs the phone, and WhatsApp may refuse a re-link right
+  after an unlink for a while (reported, **UNVERIFIED**).
+- **Messenger:** the sidecar deletes its cookies, thread map and encrypted-chat device store, also when its session had
+  already ended, and the daemon's wipe empties the rest of the folder. The sidecar documentation lists no call to
+  Facebook: check your account's active sessions if you want that session gone.
+- **When the state or the data cannot be removed** (permissions, a disk fault) the line says `NOT cleared` or `NOT
+  fully wiped`, `meta-mcp personal status` shows `last error: state_delete_failed` or `data_wipe_failed`, and the
+  files stay until you delete them by hand.
 
 Never log out as a way to stop: stopping the daemon (both units, 10.1, or SIGTERM) leaves the sessions in place
 and the WhatsApp device linked.
@@ -2734,8 +2821,9 @@ Read the error text first: a personal tool error is `<code>: <message>`, and the
 | `error: missing cookies: ...` (exit status 2) | The pasted cookies lack `c_user`, `xs` or `datr` | Copy them again from DevTools (10.2) |
 | `Login failed: login_failed ...` (the reason, `token_invalidated`, `user_id_is_zero`, `dgw_unauthorized` or `account_mismatch`, shows in `meta-mcp personal status`) | Meta refused the cookies: they expired, you logged out of that session, or they belong to another account | Log in to Facebook in Chrome, copy fresh cookies, and do not log out of that window |
 | `account_disabled` (in `meta-mcp personal status`, after `Login failed: login_failed ...`) | Meta reports the account itself as disabled (Lightspeed error 1357053) | Fresh cookies will not help: resolve it with Meta |
-| `checkpoint_required`, `challenge_required`, `consent_required`, `account_suspended` | Meta redirected the session to a checkpoint, challenge, consent or suspended-account page. The mautrix-meta documentation names suspicious activity as one cause, and users report the message "We suspect automated behaviour on your account" (10.0) | Open facebook.com, complete what Meta asks (a captcha, a phone number, a password reset), then log in again with fresh cookies |
-| `The QR codes expired: run the command again.` (`qr_timeout`) | Nobody scanned in time, or the connection to WhatsApp never came up (seen with no network) | Run `meta-mcp personal login whatsapp` again, with a network, and scan within the code's lifetime |
+| `checkpoint_required`, `challenge_required`, `consent_required`, `account_suspended` | Meta redirected the session to a checkpoint, challenge, consent or suspended-account page. The mautrix-meta documentation names suspicious activity as one cause, and users report the message "We suspect automated behaviour on your account" (10.0). The session file is kept and `status` shows the reason and, when Meta gave one, the link | Open the link or facebook.com, complete what Meta asks (a captcha, a phone number, a password reset), then run `meta-mcp personal restart messenger`. If the platform then shows as logged out, log in again with fresh cookies |
+| `The QR codes expired: run the command again.` (`qr_timeout`) | Nobody scanned in time | Run `meta-mcp personal login whatsapp` again and scan within the code's lifetime |
+| `no QR code was shown: the sidecar could not reach WhatsApp; check the network and run the command again` | The connection to WhatsApp never came up, so no code was drawn (seen with no network) | Check the network and run `meta-mcp personal login whatsapp` again |
 | The login prints a passkey request | WhatsApp requires a passkey for this account | Follow the passkey steps in 10.3 in a Chrome-based browser |
 | `error: --pair-code needs the phone number in international form, digits only` (exit status 2) | The number is not 6 to 15 digits once `+`, spaces, dashes, dots and brackets are removed | Give your own number with its country code |
 | `bad_params: phone must be 7 to 15 digits in international form without a leading 0` | The sidecar refuses a number with fewer than 7 digits or a leading 0 that the command let through | Give your own number with its country code and no leading 0 |
@@ -2744,17 +2832,23 @@ Read the error text first: a personal tool error is `<code>: <message>`, and the
 | `sending_blocked: sending is blocked on whatsapp (REASON): ...` (or `messenger`) | A fatal signal (10.5) | Fix the cause, then `meta-mcp personal restart whatsapp` (or `messenger`) |
 | `stream_replaced` | Another process uses the same keys (WhatsApp reports a rejected client user agent, 409, the same way, and the sidecar documentation gives no fix for that) | Stop the other process (an old sidecar, a copy of the data folder), then `restart` |
 | `client_outdated` | The sidecar's library is too old for WhatsApp (on Messenger, for its encrypted-chat client) | Update the pin and rebuild (10.5) |
-| `send_unknown: the message may have been sent: read the thread before retrying` | A timeout or a broken link after the send was written | Read the thread with the read tool. Send again only if the message is not there. The audit log has the `unknown` line |
+| `send_unknown: the message may have been sent: read the thread before retrying` (or `... before sending again`) | A timeout or a broken link after the send was written, at the sidecar (`retrying`) or between the tool and the daemon (`sending again`: the tool lost the connection or timed out, and the daemon finishes the write anyway) | Read the thread with the read tool. Send again only if the message is not there. The audit log has the `unknown` line |
+| `rate_limited: writes to PLATFORM are paced: retry_after_ms=N` | The daemon's pacing found no token for this platform (10.4). Nothing was sent | Wait N milliseconds and call again, or send less often. `META_MCP_PERSONAL_SEND_INTERVAL_MS` and `META_MCP_PERSONAL_SEND_BURST` change the new-message bucket |
+| `shutting_down: the daemon is shutting down and takes no new writes` | A write arrived while the daemon was stopping | Wait for it to come back (`systemctl --user status meta-mcp-personal.service`) and send again |
+| `untrusted_daemon: ...` | The process behind the socket runs as another user, or its user could not be read | Check `META_MCP_PERSONAL_SOCKET` and who owns the daemon. Nothing was sent to it |
 | `send_failed` | The platform rejected the message (Messenger: "facebook rejected the message") | Read the message text; check the thread is one you can write to |
 | `not_logged_in: not logged in to PLATFORM ...` | No session, or the service ended it | `meta-mcp personal login PLATFORM` |
 | `read_only: the daemon runs read-only (META_MCP_READ_ONLY)` | The daemon was started read-only | Restart it without the variable (edit the unit, reload, restart) if you want sends |
 | `no_files_dir: set META_MCP_FILES_DIR to download attachments` (or `to send files`) | The daemon has no files directory | Set `META_MCP_FILES_DIR` in the daemon's environment, restart it, and point the assistant's `meta-mcp` at the same directory |
-| `file_refused: ...` | The path is outside the files directory, is not a file, is over `META_MCP_MAX_FILE_BYTES`, or is under `inbound/` without `allow_inbound` | Fix the path or the flag. The message says which |
+| `file_refused: ...` | The path is outside the files directory, is not a file, is over `META_MCP_MAX_FILE_BYTES`, is under `inbound/` without `allow_inbound`, or changed while it was being checked (a symlink swapped in, a file that grew) | Fix the path or the flag. The message says which |
 | `audit_failed: the audit log could not be written, so nothing was sent` | `personal/audit.jsonl` cannot be appended to (disk full, permissions) | Fix the disk or the permissions, then send again |
 | `thread_not_found` | WhatsApp: the chat is not in the sidecar's store. Messenger: a send, reaction, read mark or typing indicator needs a thread in the sidecar's thread list (a bare contact id is refused) | WhatsApp: open the chat on your phone and let a message or history arrive. Messenger: page through `messenger_personal_list_threads` (the `cursor` or a larger `limit`), or let a message arrive in an encrypted thread. Take ids from the list tools or from an event's `recipient` |
 | `attachment_expired` | The platform refused the media even after a refresh | WhatsApp needs the phone online to re-upload expired media and does not ask after a fatal signal. Ask for the file to be sent again |
-| `too_many_requests`, `too_many_waiters` | More than 32 requests or 16 waits in flight on one connection | Wait for earlier calls to finish |
-| `inbox_list` shows no personal events | The daemon and the assistant's `meta-mcp` use different inbox files, or the daemon is not connected | Compare `META_MCP_INBOX_DB` in both (10.1, step 7) and check `meta-mcp personal status` |
+| `too_many_requests`, `too_many_waiters` | More than 32 requests, 16 waits or 64 replies outstanding on one connection | Wait for earlier calls to finish |
+| `inbox_list` or `inbox_wait` shows no personal events | The call did not ask for them: personal rows are left out unless `platform` names `messenger_personal` or `whatsapp_personal`, or `include_personal` is true. Or the daemon and the assistant's `meta-mcp` use different inbox files, or the daemon is not connected | Pass `platform` or `include_personal`. Compare `META_MCP_INBOX_DB` in both (10.1, step 7) and check `meta-mcp personal status` |
+| The personal tools are missing from an HTTP server | `meta-mcp http` registers them only with `META_MCP_PERSONAL_HTTP=1`. A system that is not Unix has no personal mode at all | Use stdio, or set the variable knowing what it exposes (10.1, step 7) |
+| `meta-mcp personal install` says the files directory does not exist | `META_MCP_FILES_DIR` names a folder that is not there, and the sandboxed service may only write where a folder already is | Create the folder, then run `install` again |
+| The daemon under systemd cannot write its state, audit log or inbox after you moved a folder | `ReadWritePaths=` in the unit still names the old home, inbox or files folder | Edit the unit to match, `systemctl --user daemon-reload`, then restart the service (10.1) |
 | WhatsApp logs out about two weeks after the last time you opened it on the phone | The 14-day rule (it may show as `device_removed`) | Open WhatsApp on the phone at least every 14 days (10.3) |
 
 ### 10.7 Command reference and sources
@@ -2763,13 +2857,13 @@ Every personal command, with its flags (`-h` and `--help` print the same on each
 
 | Command | What it does | Flags and arguments |
 |---|---|---|
-| `meta-mcp personal install` | Writes and starts the systemd user units | `--dry-run`: print the units and the commands, write and run nothing |
+| `meta-mcp personal install` | Writes and starts the sandboxed systemd user units, creating the home and inbox folders and refusing a files directory that does not exist | `--dry-run`: print the units and the commands, write and run nothing |
 | `meta-mcp personal uninstall` | Stops the daemon and removes the units. Sessions, state and the audit log stay | `--dry-run`: print what would happen |
 | `meta-mcp personal daemon` | Runs the daemon in the foreground | `--socket PATH`: the Unix socket to listen on. Default: `META_MCP_PERSONAL_SOCKET`, else `$XDG_RUNTIME_DIR/meta-mcp/personal.sock`, else `META_MCP_HOME/personal/personal.sock` |
-| `meta-mcp personal login messenger` | Logs in with browser cookies | `--cookies-file PATH`: a cURL command, a JSON object of cookies or a JSON array of `{name, value}`. `--cookies-json JSON`: the same as a string (visible in the process list). The two exclude each other. With neither, it prompts |
+| `meta-mcp personal login messenger` | Logs in with browser cookies | `--cookies-file PATH`: a cURL command, a JSON object of cookies or a JSON array of `{name, value}`. Without it, the command prompts (nothing is echoed). There is no flag that takes the cookies as an argument |
 | `meta-mcp personal login whatsapp` | Links the machine as a companion device | `--pair-code PHONE`: link with a code typed on the phone instead of a QR code. `--full-history`: ask the phone for the full history (first link only). `--device-name NAME`: the name in the Linked devices list (default `meta-mcp`) |
 | `meta-mcp personal status` | Shows both accounts | `--json`: print the daemon's answer as JSON |
-| `meta-mcp personal logout PLATFORM` | Forgets a session | `PLATFORM` is `messenger` or `whatsapp` |
+| `meta-mcp personal logout PLATFORM` | Logs out remotely if it can, stops the sidecar, deletes the stored session and always empties the platform's data folder (the `--help` text says only "Forget the stored session of an account") | `PLATFORM` is `messenger` or `whatsapp`. Exit status 1 when the session, the data or the remote step failed (10.5) |
 | `meta-mcp personal restart PLATFORM` | Restarts a sidecar and clears a sending block | `PLATFORM` is `messenger` or `whatsapp` |
 
 Exit codes: 0 success, 1 failure (a daemon or login error, or a daemon that is not running), 2 usage error (bad
