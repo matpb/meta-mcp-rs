@@ -52,6 +52,9 @@ Changed below: all 39 tools are available on all three systems.
 
 ### Security
 
+- rmcp 3.7 to 3.11 and `cargo update` within semver clear every `cargo audit` advisory (rmcp RUSTSEC-2026-0462, url
+  RUSTSEC-2026-0592, rustix RUSTSEC-2026-0486). The server now answers `resources/list`, `resources/templates/list` and
+  `prompts/list` with "method not found" (-32601) instead of an empty list, since it never advertised them.
 - Personal mode keeps a copy of your logged-in sessions, so its files live in `META_MCP_HOME/personal/` (folders
   0700, files 0600), its socket is 0600 (a folder that the daemon or a unit from `personal install` creates for it is 0700) and
   serves only the daemon's own uid, its sidecars start with an empty environment (only `HOME`), each holds a lock on its
